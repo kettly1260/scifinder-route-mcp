@@ -1,10 +1,16 @@
 server:
   async_jobs: true
   max_workers: 1
+  storage_backend: sqlite
+
+queue:
+  backend: sqlite
+  redis_url: null
 
 security:
   allow_external_paths: false
   token: null
+  users: []
 
 ingest:
   scan_extensions:
@@ -16,6 +22,7 @@ ingest:
     - .txt
 
 integrations:
+  llm_enabled: false
   llm_endpoint: null
   llm_model: null
   embedding_endpoint: null
@@ -24,7 +31,19 @@ integrations:
   ocr_model: null
   document_parser_endpoint: null
   document_parser_model: null
+  document_parser_fallback: true
+  structure_recognition_endpoint: null
+  structure_recognition_model: null
   postgres_url: null
+
+extraction:
+  llm_schema_version: reaction_step.v1
+  llm_prompt_profile: strict-reaction-json
+  llm_cost_limit_usd: 0
 
 thresholds:
   verification_confidence_threshold: 0.65
+
+retention:
+  evidence_retention_days: 90
+  cache_retention_days: 30

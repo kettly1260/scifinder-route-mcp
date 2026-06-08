@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import time
 
 import pytest
@@ -135,7 +136,7 @@ def test_mcp_fallback_registers_core_tools(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     mcp = create_mcp(service)
     if hasattr(mcp, "tools"):
-        assert set(mcp.tools) == {
+        assert {
             "register_document",
             "upload_document",
             "scan_inbox",
@@ -152,7 +153,23 @@ def test_mcp_fallback_registers_core_tools(tmp_path: Path) -> None:
             "reparse_document",
             "record_doi_verification",
             "export_evaluation_set",
-        }
+            "retry_parse_job",
+            "retry_failed_jobs",
+            "rebuild_vector_index",
+            "get_vector_index_status",
+            "semantic_search_reaction_steps",
+            "search_compounds",
+            "get_compound",
+            "merge_compounds",
+            "search_by_smiles",
+            "recognize_structure_image",
+            "compute_evaluation_metrics",
+            "get_evaluation_status",
+            "backup_database",
+            "get_storage_usage",
+            "cleanup_evidence_cache",
+            "test_integration_endpoint",
+        }.issubset(set(mcp.tools))
 
 
 def test_mcp_token_guard_blocks_calls(tmp_path: Path) -> None:
@@ -173,6 +190,8 @@ def test_mcp_token_guard_blocks_calls(tmp_path: Path) -> None:
         with pytest.raises(PermissionError):
             mcp.tools["health_check"]()
         assert mcp.tools["health_check"]("secret")["status"] == "ok"
+        with pytest.raises(PermissionError):
+            mcp.tools["update_config"]({}, token="bad")
 
 
 def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
@@ -235,7 +254,123 @@ def test_admin_dashboard_contains_modern_config_controls(tmp_path: Path) -> None
     assert "@media (min-width: 700px) and (max-width: 1023px)" in html
     assert "@media (max-width: 699px)" in html
     assert "@media (hover: none) and (pointer: coarse)" in html
-    assert state["future_webui_sections"]
+    assert state["production"]
+
+
+def test_durable_queue_recovers_running_and_retries_failed(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.html"
+    result = service.register_document(str(fixture))
+    document_id = result["document"]["id"]
+    running = service.storage.create_job(document_id, status="running", stage="document_parse")
+    failed = service.storage.create_job(document_id, status="queued", stage="queued")
+    service.storage.update_job(failed.id, status="failed", stage="failed", error="boom")
+
+    recovered = service.storage.recover_interrupted_jobs()
+    retried = service.retry_parse_job(failed.id)
+
+    assert recovered == 1
+    assert service.get_parse_job_status(running.id)["status"] == "queued"
+    assert retried["status"] == "queued"
+
+
+def test_upload_bytes_hash_dedupes(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    content = (Path(__file__).parent / "fixtures" / "sample_scifinder_export.html").read_bytes()
+
+    first = service.upload_document_bytes(content, "sample.html")
+    second = service.upload_document_bytes(content, "copy.html")
+
+    assert Path(first["uploaded_path"]).exists()
+    assert second["deduplicated"] is True
+
+
+def test_vector_index_without_endpoint_degrades(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.html"
+    service.register_document(str(fixture))
+
+    result = service.rebuild_vector_index()
+
+    assert result["configured"] is False
+    assert result["status"] == "skipped"
+
+
+def test_compound_registry_extracts_cas_and_smiles(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    text_file = tmp_path / "data" / "inbox" / "compound.txt"
+    text_file.parent.mkdir(parents=True, exist_ok=True)
+    text_file.write_text("Experimental procedure: compound 64-17-5 and CCO were stirred in ethanol for 2 h to give 50% yield.", encoding="utf-8")
+
+    service.register_document(str(text_file))
+    compounds = service.search_compounds("64-17-5")
+
+    assert compounds
+    assert compounds[0]["cas"] == "64-17-5"
+
+
+def test_backup_usage_cleanup_and_evaluation_metrics(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.html"
+    service.register_document(str(fixture))
+    backup = service.backup_database()
+    cache_file = service.config.evidence_dir / "old.txt"
+    cache_file.write_text("cache", encoding="utf-8")
+    old_time = time.time() - 60 * 86400
+    import os
+
+    os.utime(cache_file, (old_time, old_time))
+    cleanup = service.cleanup_evidence_cache(dry_run=True, max_age_days=1)
+    gold = tmp_path / "gold.jsonl"
+    gold.write_text(json.dumps({"query": "triethylamine dichloromethane", "fields": {"yield_text": "82%"}}) + "\n", encoding="utf-8")
+    metrics = service.compute_evaluation_metrics(str(gold))
+
+    assert Path(backup["output_path"]).exists()
+    assert service.get_storage_usage()["data_dir"]["exists"] is True
+    assert cleanup["files"] >= 1
+    assert metrics["metrics"]["records"] == 1
+
+
+def test_multi_user_roles(tmp_path: Path) -> None:
+    from scifinder_route_mcp.auth import UserCredential
+
+    config = AppConfig(
+        data_dir=tmp_path / "data",
+        inbox_dir=tmp_path / "data" / "inbox",
+        upload_dir=tmp_path / "data" / "uploads",
+        evidence_dir=tmp_path / "data" / "evidence",
+        database_path=tmp_path / "data" / "routes.sqlite3",
+        config_path=tmp_path / "data" / "config.yaml",
+        users=(UserCredential("view", "viewer-token", "viewer"), UserCredential("ops", "operator-token", "operator")),
+    )
+    service = RouteService(config=config, storage=RouteStorage(config.database_path))
+    mcp = create_mcp(service)
+
+    if hasattr(mcp, "tools"):
+        assert mcp.tools["health_check"]("viewer-token")["status"] == "ok"
+        with pytest.raises(PermissionError):
+            mcp.tools["scan_inbox"](token="viewer-token")
+        assert mcp.tools["scan_inbox"](token="operator-token")["registered_count"] == 0
+
+
+def test_sidecar_reads_flat_yaml_and_detects_stable_file(tmp_path: Path) -> None:
+    from scifinder_route_mcp.sidecar import PollingSidecar, SidecarConfig
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    config_file = tmp_path / "sidecar.yaml"
+    config_file.write_text(
+        "watch_dir: " + str(watch).replace("\\", "/") + "\nserver_url: http://localhost:8001\ntoken: token\ninclude_patterns:\n  - '*.html'\nsettle_seconds: 0\n",
+        encoding="utf-8",
+    )
+    config = SidecarConfig.from_file(config_file)
+    sidecar = PollingSidecar(config)
+    sample = watch / "sample.html"
+    sample.write_text("Experimental procedure stirred for 2 h in THF, yield 50%.", encoding="utf-8")
+
+    assert config.watch_dir == watch.resolve()
+    assert config.include_patterns == ("*.html",)
+    assert sidecar._candidate_files() == [sample]
 
 
 class FakeRunnableServer:

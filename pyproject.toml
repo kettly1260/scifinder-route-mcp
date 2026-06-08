@@ -16,6 +16,7 @@ dev = [
 
 [project.scripts]
 scifinder-route-mcp = "scifinder_route_mcp.server:main"
+scifinder-route-sidecar = "scifinder_route_mcp.sidecar:main"
 
 [build-system]
 requires = ["hatchling"]

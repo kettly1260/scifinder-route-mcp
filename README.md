@@ -1,19 +1,12 @@
 # scifinder-route-mcp
 
-NAS-hosted MCP server for indexing and searching reaction-step-level synthesis routes from local SciFinder exports.
+NAS-hosted MCP server for indexing and searching reaction-step-level synthesis routes from local SciFinder exports. It is designed to run long-term on Docker/NAS with a read-only inbox, durable SQLite queue fallback, optional external OCR/LLM/vector/parser/structure-recognition APIs, and an operational Admin Web UI.
+
+> GHCR visibility note: if anonymous pull fails, open GitHub → Packages → `scifinder-route-mcp` → Package settings → Change visibility → Public. The compose file is already configured for `ghcr.io/kettly1260/scifinder-route-mcp:latest`.
 
 ## Quick Start With Prebuilt Image
 
-The published Docker image supports:
-
-```text
-linux/amd64
-linux/arm64
-```
-
-This covers common x86 NAS/server machines and ARM64 NAS/SBC machines.
-
-Deploy with the prebuilt GHCR image:
+The published Docker image targets both `linux/amd64` and `linux/arm64`.
 
 ```bash
 git clone https://github.com/kettly1260/scifinder-route-mcp.git
@@ -30,26 +23,12 @@ Admin Web UI: http://<nas-host>:8001/
 MCP SSE:      http://<nas-host>:8000/sse
 ```
 
-Put SciFinder exports into `nas-inbox`, then click `Scan Inbox` in the Admin Web UI or call the MCP `scan_inbox` tool.
+Put SciFinder exports into `nas-inbox`, then click **Scan Inbox** in the Admin Web UI or call the MCP `scan_inbox` tool. The image compose file uses `image:` only and does not build locally.
 
 ## Local Build Deployment
 
-Build and start on NAS:
-
 ```bash
 docker compose up -d --build
-```
-
-Default SSE endpoint:
-
-```text
-http://<nas-host>:${SCIFINDER_ROUTE_PUBLISHED_PORT:-8000}/sse
-```
-
-Default Admin Web UI:
-
-```text
-http://<nas-host>:${SCIFINDER_ROUTE_ADMIN_PUBLISHED_PORT:-8001}/
 ```
 
 Persistent paths:
@@ -57,171 +36,49 @@ Persistent paths:
 ```text
 ./nas-data  -> /data
 ./nas-inbox -> /inbox (read-only in the container)
-./nas-data/uploads -> /data/uploads (sidecar/upload staging)
+./nas-data/uploads -> /data/uploads (HTTP upload and sidecar staging)
 ```
 
-Place SciFinder export files in `./nas-inbox`, then call `scan_inbox`. You can also call `register_document` with the container-visible path, for example:
+Parsing is asynchronous in the NAS profile. Jobs are stored durably in SQLite; after a container restart, interrupted `running` jobs are re-queued. Poll `get_parse_job_status` or `list_parse_jobs` until completion.
+
+## Environment and Runtime Config
+
+Copy `.env.example` to `.env`. Docker-level settings such as published ports, volumes, container network, and restart policy belong in `.env`/Compose only. The Admin Web UI never edits Docker files and never controls host Docker.
+
+Hot application config is read from `/data/config.yaml`; copy `config.example.yaml` to `./nas-data/config.yaml` if desired. Hot-reloadable sections include:
 
 ```text
-/inbox/example.html
-```
-
-For clients that upload/copy files through the MCP tool, `upload_document` copies from a container-visible source path into `/data/uploads`, then registers the staged copy. The default Compose mount keeps `/inbox` read-only to protect source files.
-
-In the NAS profile, parsing is asynchronous. `register_document`, `upload_document`, and `scan_inbox` return queued/running jobs; poll `get_parse_job_status` or `list_parse_jobs` until the job is complete.
-
-If `SCIFINDER_ROUTE_TOKEN` is set, pass the same `token` argument to every MCP tool call.
-
-## Environment
-
-```text
-SCIFINDER_ROUTE_TRANSPORT=sse
-SCIFINDER_ROUTE_HOST=0.0.0.0
-SCIFINDER_ROUTE_PORT=8000
-SCIFINDER_ROUTE_PUBLISHED_PORT=8000
-SCIFINDER_ROUTE_ADMIN_ENABLED=true
-SCIFINDER_ROUTE_ADMIN_HOST=0.0.0.0
-SCIFINDER_ROUTE_ADMIN_PORT=8001
-SCIFINDER_ROUTE_ADMIN_PUBLISHED_PORT=8001
-SCIFINDER_ROUTE_SSE_PATH=/sse
-SCIFINDER_ROUTE_DATA_DIR=/data
-SCIFINDER_ROUTE_INBOX_DIR=/inbox
-SCIFINDER_ROUTE_UPLOAD_DIR=/data/uploads
-SCIFINDER_ROUTE_EVIDENCE_DIR=/data/evidence
-SCIFINDER_ROUTE_DATABASE=/data/scifinder_routes.sqlite3
-SCIFINDER_ROUTE_CONFIG=/data/config.yaml
-SCIFINDER_ROUTE_ASYNC_JOBS=true
-SCIFINDER_ROUTE_MAX_WORKERS=1
-SCIFINDER_ROUTE_ALLOW_EXTERNAL_PATHS=false
-SCIFINDER_ROUTE_SCAN_EXTENSIONS=.pdf,.html,.htm,.mhtml,.mht,.txt
-SCIFINDER_ROUTE_LLM_ENDPOINT=
-SCIFINDER_ROUTE_LLM_MODEL=
-SCIFINDER_ROUTE_EMBEDDING_ENDPOINT=
-SCIFINDER_ROUTE_EMBEDDING_MODEL=
-SCIFINDER_ROUTE_OCR_ENDPOINT=
-SCIFINDER_ROUTE_OCR_MODEL=
-SCIFINDER_ROUTE_DOCUMENT_PARSER_ENDPOINT=
-SCIFINDER_ROUTE_DOCUMENT_PARSER_MODEL=
-SCIFINDER_ROUTE_POSTGRES_URL=
-SCIFINDER_ROUTE_VERIFICATION_CONFIDENCE_THRESHOLD=0.65
-SCIFINDER_ROUTE_TOKEN=change-me
-```
-
-For normal deployments, copy `.env.example` to `.env` and edit `.env`. The `.env` file is ignored by git.
-
-Use `SCIFINDER_ROUTE_TRANSPORT=stdio` for local CLI MCP clients.
-
-## Runtime Config
-
-The container reads hot application config from `/data/config.yaml`. This file is optional; environment variables provide defaults. Copy `config.example.yaml` to `./nas-data/config.yaml` before starting the NAS container if you want file-based config from day one.
-
-Hot-reloadable sections:
-
-```text
-server.async_jobs
-server.max_workers
-security.allow_external_paths
-security.token
+server.async_jobs, server.max_workers, server.storage_backend
+queue.backend, queue.redis_url
+security.allow_external_paths, security.token, security.users
 ingest.scan_extensions
-integrations.llm_endpoint
-integrations.llm_model
-integrations.embedding_endpoint
-integrations.embedding_model
-integrations.ocr_endpoint
-integrations.ocr_model
-integrations.document_parser_endpoint
-integrations.document_parser_model
-integrations.postgres_url
+integrations.*
+extraction.llm_schema_version, extraction.llm_prompt_profile, extraction.llm_cost_limit_usd
 thresholds.verification_confidence_threshold
+retention.evidence_retention_days, retention.cache_retention_days
 ```
 
-Use these MCP tools to manage hot config without editing Docker files:
-
-```text
-get_config
-update_config
-validate_config
-reload_config
-```
-
-Example `update_config` payload:
-
-```json
-{
-  "ingest": {
-    "scan_extensions": [".pdf", ".html", ".mhtml"]
-  },
-  "integrations": {
-    "llm_endpoint": "https://api.openai.com/v1",
-    "llm_model": "gpt-4o-mini",
-    "embedding_endpoint": "http://embedding:8000/v1",
-    "embedding_model": "bge-m3",
-    "ocr_endpoint": "http://mineru:9000"
-  },
-  "thresholds": {
-    "verification_confidence_threshold": 0.75
-  }
-}
-```
-
-These settings are not hot-reloadable because Docker owns them outside the container:
-
-```text
-SCIFINDER_ROUTE_PUBLISHED_PORT
-SCIFINDER_ROUTE_ADMIN_PUBLISHED_PORT
-SCIFINDER_ROUTE_PORT
-SCIFINDER_ROUTE_ADMIN_PORT
-SCIFINDER_ROUTE_TRANSPORT
-volume mounts
-container network
-restart policy
-```
-
-For port changes, edit `.env` only, not `docker-compose.yml`:
-
-```env
-SCIFINDER_ROUTE_PUBLISHED_PORT=8010
-```
-
-Then recreate the container:
-
-```bash
-docker compose up -d
-```
+Use MCP tools `get_config`, `update_config`, `validate_config`, and `reload_config`, or use the Admin Web UI.
 
 ## Admin Web UI
 
-The Admin Web UI is a lightweight Material 3 Expressive-inspired glassmorphism control surface. It is intended for operational settings, not for editing Docker internals.
-
-Currently included:
+The Admin Web UI provides operational controls for:
 
 ```text
-- health/status cards
+- health/status cards and mounted storage diagnostics
 - token-protected config changes
-- LLM endpoint and model settings
-- embedding/vector API endpoint and model settings
-- OCR endpoint and model settings
-- document parser endpoint and model settings
-- PostgreSQL URL placeholder setting
-- scan extension policy
-- async worker count and path safety toggle
-- DOI verification confidence threshold
-- scan_inbox trigger
-- recent parse job table
-- config warnings
-```
-
-Good future Web UI sections:
-
-```text
-- compound registry: CAS/SMILES/InChIKey aliases and merge review
-- vector index: embedding model, rebuild button, recall diagnostics
-- OCR pipeline: endpoint health, OCR confidence, image-only backlog
-- document parser: parser selection, parser health, PDF/HTML/MHTML diagnostics
-- LLM extraction: schema version, model cost limits, extraction prompt profile
-- evaluation set: 40-file gold set export, field accuracy, regression metrics
-- DOI verification: low-confidence queue and verified-field review
-- backup/retention: SQLite/Postgres backup, evidence cache cleanup, NAS storage usage
+- queue status, recent jobs, failed-job retry
+- HTTP upload endpoint for sidecar/client upload
+- LLM endpoint/model/enable toggle, schema version, prompt profile, cost limit
+- embedding endpoint/model, vector rebuild, vector index status and errors
+- OCR endpoint/model, OCR backlog status
+- document parser endpoint/model, parser fallback and endpoint health
+- structure recognition endpoint/model health
+- PostgreSQL URL/backend status with SQLite fallback
+- DOI low-confidence queue count
+- evaluation latest metrics
+- SQLite backup, retention dry-run cleanup, NAS storage usage
+- compound registry count and search via MCP
 ```
 
 ## MCP Tools
@@ -239,60 +96,165 @@ register_document
 upload_document
 get_parse_job_status
 list_parse_jobs
+retry_parse_job
+retry_failed_jobs
 search_reaction_steps
 get_reaction_step
 get_reaction_provenance
 record_doi_verification
 reparse_document
 export_evaluation_set
+compute_evaluation_metrics
+get_evaluation_status
+rebuild_vector_index
+get_vector_index_status
+semantic_search_reaction_steps
+search_compounds
+get_compound
+merge_compounds
+search_by_smiles
+recognize_structure_image
+backup_database
+get_storage_usage
+cleanup_evidence_cache
+test_integration_endpoint
 ```
 
-## Current Feature Status
+## Feature Matrix
 
-Implemented in this MVP:
+| Area | Status | Notes |
+| --- | --- | --- |
+| Docker/NAS SSE service | Implemented | Compose and prebuilt-image compose supported. |
+| GHCR multi-arch image workflow | Implemented | `linux/amd64`, `linux/arm64`. GHCR package visibility may need manual public setting. |
+| Read-only inbox scanning | Implemented | `/inbox` mounted read-only. |
+| HTTP upload staging | Implemented | `POST /api/upload` writes to `/data/uploads`; hash dedupe supported. |
+| Sidecar watcher | Implemented | `scifinder-route-sidecar` polling CLI uploads stable files. |
+| Durable queue | Implemented | SQLite queue is default; restart recovery and retry tools. Redis is optional/degraded via config status, not required. |
+| SQLite storage | Implemented | Source documents, jobs, reaction steps, provenance, DOI verification, vector rows, compounds, metrics. |
+| PostgreSQL backend | Runnable degraded integration | `SCIFINDER_ROUTE_BACKEND=postgres` tests connectivity and reports status; SQLite remains active fallback unless a Postgres adapter is added for a deployment. |
+| pgvector | Optional/degraded | SQLite stores embeddings as JSON and cosine-searches them; Postgres/pgvector reports endpoint/backend status. |
+| PDF/HTML/MHTML/text parsing | Implemented | Built-in parser remains fallback. |
+| External document parser | Implemented | `/parse` JSON adapter; failure falls back unless disabled. |
+| OCR worker | Implemented adapter | `/ocr` JSON adapter for image-only PDFs/low-text docs; errors are job errors, not service crashes. |
+| Rule extraction | Implemented | Candidate blocks and structured fields. |
+| LLM JSON structuring | Implemented adapter | OpenAI-compatible `/chat/completions`; strict JSON; invalid responses fall back to rule fields with metadata error. |
+| Embedding/vector index | Implemented adapter | OpenAI-compatible `/embeddings`; rebuild/status/semantic search tools. |
+| Compound registry | Implemented | CAS/SMILES/InChIKey text extraction, alias registry, reaction roles; RDKit optional. |
+| Image structure recognition | Implemented adapter | `/recognize` adapter creates low-confidence image candidates; does not overwrite text evidence. |
+| Multi-user authorization | Implemented | `viewer`, `operator`, `admin` roles via `SCIFINDER_ROUTE_USERS` or config users. Legacy single token maps to admin. |
+| Evaluation metrics | Implemented | JSONL gold-set metrics and latest metric status. |
+| Backup/retention | Implemented | SQLite backup, storage usage, evidence/cache cleanup dry-run. |
+| Endpoint health checks | Implemented | LLM, embedding, OCR, parser, structure recognition, Postgres. |
 
-```text
-- Docker Compose NAS SSE service
-- read-only NAS inbox scanning
-- upload staging under /data/uploads
-- async parse jobs for NAS deployment
-- SQLite storage with source_document, parse_job, reaction_step, provenance, doi_verification
-- PDF/HTML/MHTML/text parsing
-- rule-based reaction candidate detection and field extraction
-- FTS-backed text search plus reagent/solvent/document/confidence filters
-- provenance and DOI verification recording
-- evaluation JSONL export
-- single-user token gate for MCP tools
-- hot application config through /data/config.yaml and config MCP tools
-- Docker published port controlled by .env
-- Admin Web UI with Material 3 Expressive-inspired glassmorphism design
+## External API Schemas
+
+All external services are optional. If a service is not configured or fails, the server returns a degraded/skipped/error status instead of crashing the process.
+
+Embedding endpoint: `POST <endpoint>/embeddings`
+
+```json
+{"model":"bge-m3","input":["text"]}
 ```
 
-Not implemented yet:
+Expected response can be OpenAI-like:
 
-```text
-- PostgreSQL backend and pgvector indexes
-- Redis or durable external task queue
-- true sidecar binary/API for watching client folders
-- MinerU/PaddleOCR OCR worker integration
-- LLM JSON structuring adapter
-- compound registry, CAS/SMILES/InChIKey normalization, RDKit fingerprints
-- image structure recognition with MolScribe/DECIMER/OSRA
-- multi-user authorization
+```json
+{"data":[{"embedding":[0.1,0.2]}]}
 ```
 
-Recommended next implementation order for a production NAS install:
+LLM endpoint: `POST <endpoint>/chat/completions`, OpenAI-compatible. The assistant content must be strict JSON with reaction-step fields.
+
+OCR endpoint: `POST <endpoint>/ocr`
+
+```json
+{"model":"mineru-layout","file_path":"/data/uploads/file.pdf"}
+```
+
+Expected response:
+
+```json
+{"text":"OCR text", "confidence":0.85}
+```
+
+Document parser endpoint: `POST <endpoint>/parse`
+
+```json
+{"model":"parser-name","file_path":"/data/uploads/file.pdf"}
+```
+
+Expected response:
+
+```json
+{"file_type":"pdf","title":"...","doi":"10....","chunks":[{"text":"...","page_number":1,"parser_name":"external","parser_version":"1"}]}
+```
+
+Structure recognition endpoint: `POST <endpoint>/recognize`
+
+```json
+{"model":"decimer","image_path":"/data/evidence/page1.png"}
+```
+
+Expected response:
+
+```json
+{"structures":[{"smiles":"CCO","confidence":0.7}]}
+```
+
+## Sidecar Watcher
+
+Create `sidecar.yaml` on a client machine:
+
+```yaml
+watch_dir: /path/to/scifinder/exports
+server_url: http://nas-host:8001
+token: change-me
+include_patterns:
+  - "*.pdf"
+  - "*.html"
+settle_seconds: 3
+upload_mode: http
+poll_seconds: 2
+```
+
+Run:
+
+```bash
+scifinder-route-sidecar sidecar.yaml
+```
+
+The sidecar polls by default and does not require `watchdog`, making it suitable for Windows/macOS/Linux clients.
+
+## Authorization
+
+Legacy single-token mode:
+
+```env
+SCIFINDER_ROUTE_TOKEN=change-me
+```
+
+Multi-user token mode:
+
+```env
+SCIFINDER_ROUTE_USERS=alice:viewer-token:viewer,bob:operator-token:operator,root:admin-token:admin
+```
+
+Roles:
 
 ```text
-1. Add sidecar HTTP upload endpoint or separate CLI sidecar.
-2. Add compound registry and text-level chemical identifier normalization.
-3. Add LLM structuring adapter behind strict JSON schema.
-4. Add OCR adapter interface and MinerU/PaddleOCR worker integration.
-5. Add PostgreSQL backend once SQLite limits are reached.
+viewer   search/read/status
+operator scan/reparse/retry/vector/evaluation/integration tests
+admin    config/backup/cleanup/secret operations
 ```
 
 ## Development
 
 ```bash
 python -m pytest -q
+```
+
+Optional Docker check:
+
+```bash
+docker compose build
+docker compose -f docker-compose.image.yml config
 ```

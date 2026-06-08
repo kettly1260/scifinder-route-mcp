@@ -56,6 +56,10 @@ class ReactionStep:
     confidence: float
     verification_status: str
     needs_ocr: bool
+    extraction_method: str = "rules"
+    schema_version: str = "reaction_step.v1"
+    llm_confidence: float | None = None
+    metadata: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -89,6 +93,24 @@ class DoiVerification:
     verification_confidence: float
     verifier_agent: str | None
     created_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class Compound:
+    id: str
+    primary_name: str
+    cas: str | None
+    smiles: str | None
+    canonical_smiles: str | None
+    inchikey: str | None
+    fingerprint: str | None
+    source: str
+    confidence: float
+    created_at: str
+    updated_at: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

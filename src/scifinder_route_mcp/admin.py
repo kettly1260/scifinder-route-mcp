@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .auth import authenticate_token, role_allows
 from .service import RouteService
 
 
@@ -51,17 +52,44 @@ class AdminHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path == "/api/config":
-                self._require_token()
+                self._require_role("admin")
                 payload = self._read_json()
                 self._send_json(self.server.service.update_config(payload))
                 return
             if parsed.path == "/api/scan":
-                self._require_token()
+                self._require_role("operator")
                 self._send_json(self.server.service.scan_inbox())
                 return
             if parsed.path == "/api/reload":
-                self._require_token()
+                self._require_role("admin")
                 self._send_json(self.server.service.reload_config())
+                return
+            if parsed.path == "/api/upload":
+                self._require_role("operator")
+                filename, content = self._read_upload()
+                self._send_json(self.server.service.upload_document_bytes(content, filename))
+                return
+            if parsed.path == "/api/retry-failed":
+                self._require_role("operator")
+                self._send_json(self.server.service.retry_failed_jobs())
+                return
+            if parsed.path == "/api/vector/rebuild":
+                self._require_role("operator")
+                self._send_json(self.server.service.rebuild_vector_index())
+                return
+            if parsed.path == "/api/backup":
+                self._require_role("admin")
+                self._send_json(self.server.service.backup_database())
+                return
+            if parsed.path == "/api/cleanup":
+                self._require_role("admin")
+                payload = self._read_json()
+                self._send_json(self.server.service.cleanup_evidence_cache(dry_run=bool(payload.get("dry_run", True))))
+                return
+            if parsed.path == "/api/integration/test":
+                self._require_role("operator")
+                payload = self._read_json()
+                self._send_json(self.server.service.test_integration_endpoint(str(payload.get("kind") or "")))
                 return
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -71,19 +99,31 @@ class AdminHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
 
-    def _require_token(self) -> None:
-        configured = self.server.service.config.auth_token
-        if not configured:
+    def _require_role(self, role: str) -> None:
+        config = self.server.service.config
+        if not config.auth_token and not config.users:
             return
         token = self.headers.get("X-Scifinder-Route-Token") or ""
-        if token != configured:
+        user = authenticate_token(config.users, config.auth_token, token)
+        if not user:
             raise PermissionError("Invalid or missing admin token")
+        if not role_allows(user.role, role):
+            raise PermissionError(f"Token role '{user.role}' cannot perform '{role}' operations")
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0:
             return {}
         return json.loads(self.rfile.read(length).decode("utf-8"))
+
+    def _read_upload(self) -> tuple[str, bytes]:
+        content_type = self.headers.get("Content-Type", "")
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        if "multipart/form-data" in content_type:
+            return parse_multipart_upload(content_type, body)
+        filename = safe_upload_name(self.headers.get("X-Filename") or "upload.bin")
+        return filename, body
 
     def _send_json(self, payload: Any, *, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -120,36 +160,24 @@ def admin_state(service: RouteService) -> dict[str, Any]:
         "config": service.get_config(),
         "validation": service.validate_config(),
         "jobs": service.list_parse_jobs(limit=20),
-        "future_webui_sections": future_webui_sections(),
+        "production": service.get_production_status(),
     }
-
-
-def future_webui_sections() -> list[dict[str, str]]:
-    return [
-        {"name": "Compound registry", "status": "planned", "why": "CAS/SMILES/InChIKey normalization and alias review"},
-        {"name": "Vector index", "status": "planned", "why": "Embedding model, vector API, index rebuild, and recall diagnostics"},
-        {"name": "OCR pipeline", "status": "planned", "why": "MinerU/PaddleOCR endpoint checks, queue routing, and OCR confidence review"},
-        {"name": "Document parser", "status": "planned", "why": "PDF/HTML/MHTML parser selection and parser health tests"},
-        {"name": "LLM extraction", "status": "planned", "why": "Strict JSON extraction model, schema version, and cost controls"},
-        {"name": "Evaluation set", "status": "planned", "why": "40-file gold set export, annotation coverage, and regression metrics"},
-        {"name": "DOI verification", "status": "planned", "why": "Low-confidence trigger threshold and verified-field review"},
-        {"name": "Backup and retention", "status": "planned", "why": "SQLite/Postgres backups, evidence cache retention, and NAS storage limits"},
-    ]
 
 
 def render_dashboard(service: RouteService) -> str:
     state = admin_state(service)
     config_json = json.dumps(state["config"], ensure_ascii=False)
-    future_cards = "".join(
-        f"<article class='mini-card'><span>{escape(item['status'])}</span><h3>{escape(item['name'])}</h3><p>{escape(item['why'])}</p></article>"
-        for item in state["future_webui_sections"]
-    )
+    production_json = json.dumps(state["production"], ensure_ascii=False, indent=2)
     jobs_rows = "".join(
         f"<tr><td>{escape(job['id'])}</td><td>{escape(job['status'])}</td><td>{escape(job['stage'])}</td><td>{escape(job.get('error') or '')}</td></tr>"
         for job in state["jobs"]
     ) or "<tr><td colspan='4'>No parse jobs yet</td></tr>"
     health = state["health"]
     validation = state["validation"]
+    production = state["production"]
+    vector = production["vector_index"]
+    usage_rows = "".join(f"<tr><td>{escape(name)}</td><td>{escape(item['files'])}</td><td>{escape(item['bytes'])}</td></tr>" for name, item in production["storage_usage"].items())
+    endpoint_buttons = "".join(f"<button type='button' onclick=\"testEndpoint('{kind}')\">Test {label}</button>" for kind, label in [("llm", "LLM"), ("embedding", "Embedding"), ("ocr", "OCR"), ("document_parser", "Parser"), ("structure_recognition", "Structure"), ("postgres", "Postgres")])
     warnings = "".join(f"<li>{escape(item)}</li>" for item in validation["warnings"]) or "<li>No config warnings</li>"
     return f"""<!doctype html>
 <html lang="en">
@@ -198,6 +226,8 @@ def render_dashboard(service: RouteService) -> str:
           <label>Document parser endpoint <input name="document_parser_endpoint" data-section="integrations" placeholder="http://parser:9100"></label>
           <label>Document parser model <input name="document_parser_model" data-section="integrations" placeholder="pymupdf|mineru"></label>
           <label>PostgreSQL URL <input name="postgres_url" data-section="integrations" placeholder="postgresql://user:pass@host/db"></label>
+          <label>Structure recognition endpoint <input name="structure_recognition_endpoint" data-section="integrations" placeholder="http://decimer:9300"></label>
+          <label>LLM enabled <select name="llm_enabled" data-section="integrations"><option value="false">false</option><option value="true">true</option></select></label>
         </div>
       </form>
 
@@ -210,8 +240,25 @@ def render_dashboard(service: RouteService) -> str:
           <label>Allow external paths <select name="allow_external_paths" data-section="security"><option value="false">false</option><option value="true">true</option></select></label>
           <label>Config token <input name="token" data-section="security" type="password" placeholder="Leave blank to clear"></label>
           <label>Verification threshold <input name="verification_confidence_threshold" data-section="thresholds" type="number" min="0" max="1" step="0.01"></label>
+          <label>Queue backend <select name="backend" data-section="queue"><option value="sqlite">sqlite</option><option value="redis">redis</option></select></label>
+          <label>Storage backend <select name="storage_backend" data-section="server"><option value="sqlite">sqlite</option><option value="postgres">postgres</option></select></label>
         </div>
       </form>
+    </section>
+
+    <section class="grid two">
+      <section class="panel glass"><div class="panel-title"><div><p class="eyebrow">Vector Index</p><h2>Embedding Recall</h2></div><button onclick="rebuildVector()">Rebuild</button></div><pre>{escape(json.dumps(vector, indent=2))}</pre></section>
+      <section class="panel glass"><div class="panel-title"><div><p class="eyebrow">Endpoint Health</p><h2>External APIs</h2></div></div><div class="button-row">{endpoint_buttons}</div><pre>{escape(json.dumps(health.get('integrations', []), indent=2))}</pre></section>
+    </section>
+
+    <section class="grid two">
+      <section class="panel glass"><p class="eyebrow">OCR / DOI Review</p><h2>Backlogs</h2><pre>OCR backlog: {escape(health['ocr_backlog'])}\nLow-confidence DOI queue: {escape(len(production['doi_low_confidence_queue']))}</pre></section>
+      <section class="panel glass"><p class="eyebrow">Evaluation</p><h2>Latest Metrics</h2><pre>{escape(json.dumps(production['evaluation'], indent=2))}</pre></section>
+    </section>
+
+    <section class="grid two">
+      <section class="panel glass"><div class="panel-title"><div><p class="eyebrow">Backup & Retention</p><h2>NAS Storage</h2></div><button onclick="backupDb()">Backup DB</button></div><div class="table-wrap"><table><thead><tr><th>Path</th><th>Files</th><th>Bytes</th></tr></thead><tbody>{usage_rows}</tbody></table></div><button onclick="cleanupDryRun()">Cleanup Dry Run</button></section>
+      <section class="panel glass"><p class="eyebrow">Compound Registry</p><h2>Review Queue</h2><pre>Indexed compounds: {escape(production['compound_count'])}</pre></section>
     </section>
 
     <section class="grid two">
@@ -221,7 +268,7 @@ def render_dashboard(service: RouteService) -> str:
 
     <section class="panel glass"><p class="eyebrow">Jobs</p><h2>Recent Parse Jobs</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>Status</th><th>Stage</th><th>Error</th></tr></thead><tbody>{jobs_rows}</tbody></table></div></section>
 
-    <section class="panel glass"><p class="eyebrow">Roadmap</p><h2>Good Web UI Candidates</h2><div class="future-grid">{future_cards}</div></section>
+    <section class="panel glass"><p class="eyebrow">Production State</p><h2>Diagnostics Snapshot</h2><pre>{escape(production_json)}</pre></section>
   </main>
   <script>window.__CONFIG__ = {config_json};{ADMIN_JS}</script>
 </body>
@@ -235,6 +282,33 @@ def escape(value: Any) -> str:
 def short_path(value: str) -> str:
     parts = value.replace("\\", "/").split("/")
     return "/".join(parts[-2:]) if len(parts) >= 2 else value
+
+
+def safe_upload_name(value: str) -> str:
+    return "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in os.path.basename(value)) or "upload.bin"
+
+
+def parse_multipart_upload(content_type: str, body: bytes) -> tuple[str, bytes]:
+    marker = "boundary="
+    if marker not in content_type:
+        raise ValueError("multipart upload is missing boundary")
+    boundary = content_type.split(marker, 1)[1].split(";", 1)[0].strip().strip('"')
+    delimiter = ("--" + boundary).encode("utf-8")
+    for part in body.split(delimiter):
+        part = part.strip(b"\r\n")
+        if not part or part == b"--" or b"\r\n\r\n" not in part:
+            continue
+        raw_headers, content = part.split(b"\r\n\r\n", 1)
+        headers = raw_headers.decode("utf-8", errors="ignore")
+        if 'name="file"' not in headers:
+            continue
+        filename = "upload.bin"
+        if "filename=" in headers:
+            filename = headers.split("filename=", 1)[1].split(";", 1)[0].split("\r\n", 1)[0].strip().strip('"')
+        if content.endswith(b"\r\n--"):
+            content = content[:-4]
+        return safe_upload_name(filename), content.rstrip(b"\r\n")
+    raise ValueError("multipart upload requires a file field")
 
 
 ADMIN_CSS = r"""
@@ -277,4 +351,8 @@ function coerce(el){if(el.name==='scan_extensions')return el.value.split(',').ma
 async function post(url,payload={}){const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Scifinder-Route-Token':token()},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok||data.error)throw new Error(data.error||res.statusText);return data}
 async function saveConfig(event){event.preventDefault();const payload={};event.target.querySelectorAll('[data-section]').forEach(el=>{payload[el.dataset.section] ||= {};payload[el.dataset.section][el.name]=coerce(el)});try{await post('/api/config',payload);location.reload()}catch(err){alert(err.message)}}
 async function scanInbox(){try{const data=await post('/api/scan',{});alert(`Registered ${data.registered_count}, skipped ${data.skipped_count}`);location.reload()}catch(err){alert(err.message)}}
+async function rebuildVector(){try{const data=await post('/api/vector/rebuild',{});alert(JSON.stringify(data,null,2));location.reload()}catch(err){alert(err.message)}}
+async function backupDb(){try{const data=await post('/api/backup',{});alert(JSON.stringify(data,null,2));location.reload()}catch(err){alert(err.message)}}
+async function cleanupDryRun(){try{const data=await post('/api/cleanup',{dry_run:true});alert(JSON.stringify(data,null,2))}catch(err){alert(err.message)}}
+async function testEndpoint(kind){try{const data=await post('/api/integration/test',{kind});alert(JSON.stringify(data,null,2));location.reload()}catch(err){alert(err.message)}}
 """

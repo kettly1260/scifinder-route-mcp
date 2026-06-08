@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import math
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .models import ParseJob, Provenance, ReactionStep, SourceDocument
+from .models import Compound, ParseJob, Provenance, ReactionStep, SourceDocument
 
 
 def utc_now() -> str:
@@ -79,6 +81,10 @@ class RouteStorage:
                     confidence REAL NOT NULL,
                     verification_status TEXT NOT NULL,
                     needs_ocr INTEGER NOT NULL DEFAULT 0,
+                    extraction_method TEXT NOT NULL DEFAULT 'rules',
+                    schema_version TEXT NOT NULL DEFAULT 'reaction_step.v1',
+                    llm_confidence REAL,
+                    metadata TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
                 );
 
@@ -111,8 +117,124 @@ class RouteStorage:
                     reaction_step_id UNINDEXED,
                     content
                 );
+
+                CREATE TABLE IF NOT EXISTS vector_index (
+                    reaction_step_id TEXT PRIMARY KEY REFERENCES reaction_step(id) ON DELETE CASCADE,
+                    model TEXT NOT NULL,
+                    embedding TEXT NOT NULL,
+                    dimensions INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    error TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS integration_status (
+                    kind TEXT PRIMARY KEY,
+                    configured INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    detail TEXT,
+                    checked_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS evaluation_metric (
+                    id TEXT PRIMARY KEY,
+                    gold_set_path TEXT NOT NULL,
+                    metrics TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS compound (
+                    id TEXT PRIMARY KEY,
+                    primary_name TEXT NOT NULL,
+                    cas TEXT,
+                    smiles TEXT,
+                    canonical_smiles TEXT,
+                    inchikey TEXT,
+                    fingerprint TEXT,
+                    source TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS compound_alias (
+                    id TEXT PRIMARY KEY,
+                    compound_id TEXT NOT NULL REFERENCES compound(id) ON DELETE CASCADE,
+                    alias TEXT NOT NULL,
+                    alias_type TEXT NOT NULL,
+                    UNIQUE(compound_id, alias, alias_type)
+                );
+
+                CREATE TABLE IF NOT EXISTS reaction_compound_role (
+                    id TEXT PRIMARY KEY,
+                    reaction_step_id TEXT NOT NULL REFERENCES reaction_step(id) ON DELETE CASCADE,
+                    compound_id TEXT NOT NULL REFERENCES compound(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    source TEXT NOT NULL
+                );
                 """
             )
+            self._migrate_schema(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(reaction_step)")}
+        migrations = {
+            "extraction_method": "ALTER TABLE reaction_step ADD COLUMN extraction_method TEXT NOT NULL DEFAULT 'rules'",
+            "schema_version": "ALTER TABLE reaction_step ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'reaction_step.v1'",
+            "llm_confidence": "ALTER TABLE reaction_step ADD COLUMN llm_confidence REAL",
+            "metadata": "ALTER TABLE reaction_step ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                conn.execute(statement)
+
+    def recover_interrupted_jobs(self, *, mode: str = "queued") -> int:
+        status = "queued" if mode == "queued" else "failed"
+        error = None if status == "queued" else "Job was interrupted by service shutdown"
+        with self.connect() as conn:
+            rows = conn.execute("SELECT id FROM parse_job WHERE status = 'running'").fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE parse_job SET status = ?, stage = ?, error = ?, finished_at = NULL WHERE id = ?",
+                    (status, "queued" if status == "queued" else "failed", error, row["id"]),
+                )
+            return len(rows)
+
+    def claim_next_job(self) -> ParseJob | None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM parse_job WHERE status = 'queued' ORDER BY COALESCE(started_at, ''), id LIMIT 1"
+            ).fetchone()
+            if not row:
+                conn.commit()
+                return None
+            conn.execute(
+                "UPDATE parse_job SET status = 'running', stage = 'document_parse', error = NULL, started_at = ?, finished_at = NULL WHERE id = ?",
+                (utc_now(), row["id"]),
+            )
+            conn.commit()
+            claimed = conn.execute("SELECT * FROM parse_job WHERE id = ?", (row["id"],)).fetchone()
+        return self._job_from_row(claimed)
+
+    def retry_job(self, job_id: str) -> ParseJob:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM parse_job WHERE id = ?", (job_id,)).fetchone()
+            if not row:
+                raise KeyError(f"Parse job not found: {job_id}")
+            if row["status"] not in {"failed", "completed"}:
+                raise ValueError(f"Only failed/completed jobs can be retried; current status is {row['status']}")
+            conn.execute(
+                "UPDATE parse_job SET status = 'queued', stage = 'queued', error = NULL, finished_at = NULL WHERE id = ?",
+                (job_id,),
+            )
+            updated = conn.execute("SELECT * FROM parse_job WHERE id = ?", (job_id,)).fetchone()
+        return self._job_from_row(updated)
+
+    def retry_failed_jobs(self, limit: int = 100) -> list[ParseJob]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT id FROM parse_job WHERE status = 'failed' ORDER BY COALESCE(finished_at, '') DESC LIMIT ?", (limit,)).fetchall()
+        return [self.retry_job(row["id"]) for row in rows]
 
     def upsert_document(
         self,
@@ -247,6 +369,14 @@ class RouteStorage:
             ).fetchone()
         return self._document_from_row(row) if row else None
 
+    def get_document_by_hash(self, file_hash: str) -> SourceDocument | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM source_document WHERE file_hash = ? ORDER BY created_at ASC LIMIT 1",
+                (file_hash,),
+            ).fetchone()
+        return self._document_from_row(row) if row else None
+
     def count_documents(self) -> int:
         with self.connect() as conn:
             row = conn.execute("SELECT COUNT(*) AS total FROM source_document").fetchone()
@@ -293,9 +423,10 @@ class RouteStorage:
                 INSERT INTO reaction_step
                 (id, source_document_id, step_index, reaction_name, substrate_text, product_text,
                  reagent_text, catalyst_text, solvent_text, temperature, time, atmosphere, yield_text,
-                 scale, workup, purification, original_text, confidence, verification_status, needs_ocr, created_at)
-                VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 scale, workup, purification, original_text, confidence, verification_status, needs_ocr,
+                 extraction_method, schema_version, llm_confidence, metadata, created_at)
+                 VALUES
+                 (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     values["id"],
@@ -318,6 +449,10 @@ class RouteStorage:
                     values["confidence"],
                     values["verification_status"],
                     1 if values["needs_ocr"] else 0,
+                    values.get("extraction_method", "rules"),
+                    values.get("schema_version", "reaction_step.v1"),
+                    values.get("llm_confidence"),
+                    json.dumps(values.get("metadata") or {}, ensure_ascii=False, sort_keys=True),
                     created_at,
                 ),
             )
@@ -423,6 +558,19 @@ class RouteStorage:
             ).fetchall()
         return [self._provenance_from_row(row) for row in rows]
 
+    def add_provenance(self, reaction_step_id: str, source_document_id: str, *, text_span: str, parser_name: str, parser_version: str = "external", page_number: int | None = None, image_region_path: str | None = None, ocr_output: str | None = None, confidence: float = 0.0) -> Provenance:
+        provenance_id = new_id("prov")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO provenance (id, reaction_step_id, source_document_id, page_number, text_span, image_region_path, ocr_output, parser_name, parser_version, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (provenance_id, reaction_step_id, source_document_id, page_number, text_span, image_region_path, ocr_output, parser_name, parser_version, confidence),
+            )
+            row = conn.execute("SELECT * FROM provenance WHERE id = ?", (provenance_id,)).fetchone()
+        return self._provenance_from_row(row)
+
     def record_doi_verification(
         self,
         *,
@@ -487,6 +635,204 @@ class RouteStorage:
             for row in rows:
                 yield {key: row[key] for key in row.keys()}
 
+    def list_reaction_steps_for_index(self, limit: int = 10000) -> list[ReactionStep]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM reaction_step ORDER BY created_at ASC LIMIT ?", (limit,)).fetchall()
+        return [self._reaction_from_row(row) for row in rows]
+
+    def upsert_embedding(self, reaction_step_id: str, *, model: str, embedding: list[float], error: str | None = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO vector_index (reaction_step_id, model, embedding, dimensions, updated_at, error)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(reaction_step_id) DO UPDATE SET
+                  model = excluded.model, embedding = excluded.embedding, dimensions = excluded.dimensions,
+                  updated_at = excluded.updated_at, error = excluded.error
+                """,
+                (reaction_step_id, model, json.dumps(embedding), len(embedding), utc_now(), error),
+            )
+
+    def vector_index_status(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            total = conn.execute("SELECT COUNT(*) AS total FROM reaction_step").fetchone()["total"]
+            indexed = conn.execute("SELECT COUNT(*) AS total FROM vector_index WHERE error IS NULL").fetchone()["total"]
+            last = conn.execute("SELECT * FROM vector_index ORDER BY updated_at DESC LIMIT 1").fetchone()
+            errors = conn.execute("SELECT COUNT(*) AS total FROM vector_index WHERE error IS NOT NULL").fetchone()["total"]
+        return {
+            "total_steps": int(total),
+            "indexed_steps": int(indexed),
+            "error_count": int(errors),
+            "last_updated_at": last["updated_at"] if last else None,
+            "last_error": last["error"] if last and last["error"] else None,
+            "model": last["model"] if last else None,
+        }
+
+    def semantic_search(self, embedding: list[float], *, limit: int = 10) -> list[tuple[ReactionStep, float]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT reaction_step_id, embedding FROM vector_index WHERE error IS NULL").fetchall()
+        scored: list[tuple[ReactionStep, float]] = []
+        for row in rows:
+            try:
+                candidate = [float(item) for item in json.loads(row["embedding"])]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            score = cosine_similarity(embedding, candidate)
+            step = self.get_reaction_step(row["reaction_step_id"])
+            if step:
+                scored.append((step, score))
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored[:limit]
+
+    def record_integration_status(self, kind: str, *, configured: bool, status: str, detail: str | None = None) -> dict[str, Any]:
+        checked_at = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO integration_status (kind, configured, status, detail, checked_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(kind) DO UPDATE SET configured = excluded.configured, status = excluded.status,
+                  detail = excluded.detail, checked_at = excluded.checked_at
+                """,
+                (kind, 1 if configured else 0, status, detail, checked_at),
+            )
+        return {"kind": kind, "configured": configured, "status": status, "detail": detail, "checked_at": checked_at}
+
+    def list_integration_statuses(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM integration_status ORDER BY kind").fetchall()
+        return [
+            {"kind": row["kind"], "configured": bool(row["configured"]), "status": row["status"], "detail": row["detail"], "checked_at": row["checked_at"]}
+            for row in rows
+        ]
+
+    def count_ocr_backlog(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) AS total FROM reaction_step WHERE needs_ocr = 1").fetchone()["total"])
+
+    def low_confidence_doi_queue(self, threshold: float, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM reaction_step WHERE confidence < ? OR verification_status != 'doi_verified' ORDER BY confidence ASC LIMIT ?",
+                (threshold, limit),
+            ).fetchall()
+        return [self._reaction_from_row(row).to_dict() for row in rows]
+
+    def record_evaluation_metrics(self, gold_set_path: str, metrics: dict[str, Any]) -> dict[str, Any]:
+        metric_id = new_id("metric")
+        created_at = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO evaluation_metric (id, gold_set_path, metrics, created_at) VALUES (?, ?, ?, ?)",
+                (metric_id, gold_set_path, json.dumps(metrics, ensure_ascii=False, sort_keys=True), created_at),
+            )
+        return {"id": metric_id, "gold_set_path": gold_set_path, "metrics": metrics, "created_at": created_at}
+
+    def latest_evaluation_metrics(self) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM evaluation_metric ORDER BY created_at DESC LIMIT 1").fetchone()
+        if not row:
+            return None
+        return {"id": row["id"], "gold_set_path": row["gold_set_path"], "metrics": json.loads(row["metrics"]), "created_at": row["created_at"]}
+
+    def backup_sqlite(self, output_path: Path) -> dict[str, Any]:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.database_path, output_path)
+        return {"output_path": str(output_path), "bytes": output_path.stat().st_size}
+
+    def upsert_compound(
+        self,
+        *,
+        primary_name: str,
+        cas: str | None = None,
+        smiles: str | None = None,
+        canonical_smiles: str | None = None,
+        inchikey: str | None = None,
+        fingerprint: str | None = None,
+        source: str = "text",
+        confidence: float = 0.5,
+        aliases: list[tuple[str, str]] | None = None,
+    ) -> Compound:
+        now = utc_now()
+        with self.connect() as conn:
+            row = None
+            if cas:
+                row = conn.execute("SELECT * FROM compound WHERE cas = ?", (cas,)).fetchone()
+            if not row and inchikey:
+                row = conn.execute("SELECT * FROM compound WHERE inchikey = ?", (inchikey,)).fetchone()
+            if not row:
+                row = conn.execute("SELECT c.* FROM compound c JOIN compound_alias a ON a.compound_id = c.id WHERE LOWER(a.alias) = LOWER(?) LIMIT 1", (primary_name,)).fetchone()
+            if row:
+                compound_id = row["id"]
+                conn.execute(
+                    """
+                    UPDATE compound SET primary_name = COALESCE(?, primary_name), cas = COALESCE(?, cas), smiles = COALESCE(?, smiles),
+                      canonical_smiles = COALESCE(?, canonical_smiles), inchikey = COALESCE(?, inchikey), fingerprint = COALESCE(?, fingerprint),
+                      confidence = MAX(confidence, ?), updated_at = ? WHERE id = ?
+                    """,
+                    (primary_name, cas, smiles, canonical_smiles, inchikey, fingerprint, confidence, now, compound_id),
+                )
+            else:
+                compound_id = new_id("cmpd")
+                conn.execute(
+                    """
+                    INSERT INTO compound (id, primary_name, cas, smiles, canonical_smiles, inchikey, fingerprint, source, confidence, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (compound_id, primary_name, cas, smiles, canonical_smiles, inchikey, fingerprint, source, confidence, now, now),
+                )
+            for alias, alias_type in aliases or [(primary_name, "name")]:
+                conn.execute(
+                    "INSERT OR IGNORE INTO compound_alias (id, compound_id, alias, alias_type) VALUES (?, ?, ?, ?)",
+                    (new_id("alias"), compound_id, alias, alias_type),
+                )
+            updated = conn.execute("SELECT * FROM compound WHERE id = ?", (compound_id,)).fetchone()
+        return self._compound_from_row(updated)
+
+    def link_compound_to_reaction(self, reaction_step_id: str, compound_id: str, *, role: str, confidence: float, source: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO reaction_compound_role (id, reaction_step_id, compound_id, role, confidence, source) VALUES (?, ?, ?, ?, ?, ?)",
+                (new_id("role"), reaction_step_id, compound_id, role, confidence, source),
+            )
+
+    def search_compounds(self, query: str = "", limit: int = 20) -> list[Compound]:
+        with self.connect() as conn:
+            if query:
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT c.* FROM compound c LEFT JOIN compound_alias a ON a.compound_id = c.id
+                    WHERE LOWER(c.primary_name) LIKE ? OR LOWER(COALESCE(c.cas,'')) LIKE ? OR LOWER(COALESCE(c.smiles,'')) LIKE ? OR LOWER(COALESCE(c.inchikey,'')) LIKE ? OR LOWER(COALESCE(a.alias,'')) LIKE ?
+                    ORDER BY c.updated_at DESC LIMIT ?
+                    """,
+                    tuple([f"%{query.lower()}%"] * 5 + [limit]),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM compound ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+        return [self._compound_from_row(row) for row in rows]
+
+    def get_compound(self, compound_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM compound WHERE id = ?", (compound_id,)).fetchone()
+            if not row:
+                return None
+            aliases = conn.execute("SELECT alias, alias_type FROM compound_alias WHERE compound_id = ? ORDER BY alias", (compound_id,)).fetchall()
+            reactions = conn.execute("SELECT reaction_step_id, role, confidence, source FROM reaction_compound_role WHERE compound_id = ?", (compound_id,)).fetchall()
+        data = self._compound_from_row(row).to_dict()
+        data["aliases"] = [{key: item[key] for key in item.keys()} for item in aliases]
+        data["reaction_roles"] = [{key: item[key] for key in item.keys()} for item in reactions]
+        return data
+
+    def merge_compounds(self, source_compound_id: str, target_compound_id: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("UPDATE compound_alias SET compound_id = ? WHERE compound_id = ?", (target_compound_id, source_compound_id))
+            conn.execute("UPDATE reaction_compound_role SET compound_id = ? WHERE compound_id = ?", (target_compound_id, source_compound_id))
+            conn.execute("DELETE FROM compound WHERE id = ?", (source_compound_id,))
+        target = self.get_compound(target_compound_id)
+        if not target:
+            raise KeyError(f"Target compound not found: {target_compound_id}")
+        return target
+
     def _fts_query(self, query: str) -> str:
         terms = [term.strip().replace('"', "") for term in query.split() if term.strip()]
         return " OR ".join(f'"{term}"' for term in terms) if terms else '""'
@@ -537,6 +883,10 @@ class RouteStorage:
             confidence=row["confidence"],
             verification_status=row["verification_status"],
             needs_ocr=bool(row["needs_ocr"]),
+            extraction_method=row["extraction_method"] if "extraction_method" in row.keys() else "rules",
+            schema_version=row["schema_version"] if "schema_version" in row.keys() else "reaction_step.v1",
+            llm_confidence=row["llm_confidence"] if "llm_confidence" in row.keys() else None,
+            metadata=json.loads(row["metadata"]) if "metadata" in row.keys() and row["metadata"] else {},
         )
 
     def _provenance_from_row(self, row: sqlite3.Row) -> Provenance:
@@ -552,3 +902,29 @@ class RouteStorage:
             parser_version=row["parser_version"],
             confidence=row["confidence"],
         )
+
+    def _compound_from_row(self, row: sqlite3.Row) -> Compound:
+        return Compound(
+            id=row["id"],
+            primary_name=row["primary_name"],
+            cas=row["cas"],
+            smiles=row["smiles"],
+            canonical_smiles=row["canonical_smiles"],
+            inchikey=row["inchikey"],
+            fingerprint=row["fingerprint"],
+            source=row["source"],
+            confidence=row["confidence"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)

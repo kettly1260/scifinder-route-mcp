@@ -5,9 +5,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .auth import UserCredential, mask_secret, parse_users
+
 
 DEFAULT_SCAN_EXTENSIONS = (".pdf", ".html", ".htm", ".mhtml", ".mht", ".txt")
-HOT_CONFIG_SECTIONS = {"server", "security", "ingest", "integrations", "thresholds"}
+HOT_CONFIG_SECTIONS = {"server", "security", "ingest", "integrations", "thresholds", "queue", "extraction", "retention"}
 
 
 @dataclass(frozen=True)
@@ -23,17 +25,30 @@ class AppConfig:
     max_workers: int = 1
     allow_external_paths: bool = True
     auth_token: str | None = None
+    users: tuple[UserCredential, ...] = ()
     scan_extensions: tuple[str, ...] = DEFAULT_SCAN_EXTENSIONS
+    storage_backend: str = "sqlite"
+    queue_backend: str = "sqlite"
     llm_endpoint: str | None = None
     llm_model: str | None = None
+    llm_enabled: bool = False
+    llm_schema_version: str = "reaction_step.v1"
+    llm_prompt_profile: str = "strict-reaction-json"
+    llm_cost_limit_usd: float = 0.0
     embedding_endpoint: str | None = None
     embedding_model: str | None = None
     ocr_endpoint: str | None = None
     ocr_model: str | None = None
     document_parser_endpoint: str | None = None
     document_parser_model: str | None = None
+    parser_fallback: bool = True
+    structure_recognition_endpoint: str | None = None
+    structure_recognition_model: str | None = None
     postgres_url: str | None = None
+    redis_url: str | None = None
     verification_confidence_threshold: float = 0.65
+    evidence_retention_days: int = 90
+    cache_retention_days: int = 30
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -57,17 +72,30 @@ class AppConfig:
             max_workers=max(1, int(os.getenv("SCIFINDER_ROUTE_MAX_WORKERS", "1"))),
             allow_external_paths=parse_bool(os.getenv("SCIFINDER_ROUTE_ALLOW_EXTERNAL_PATHS"), default=True),
             auth_token=os.getenv("SCIFINDER_ROUTE_TOKEN") or None,
+            users=parse_users(os.getenv("SCIFINDER_ROUTE_USERS")),
             scan_extensions=parse_extensions(os.getenv("SCIFINDER_ROUTE_SCAN_EXTENSIONS"), DEFAULT_SCAN_EXTENSIONS),
+            storage_backend=os.getenv("SCIFINDER_ROUTE_BACKEND", "sqlite").strip().lower() or "sqlite",
+            queue_backend=os.getenv("SCIFINDER_ROUTE_QUEUE_BACKEND", "sqlite").strip().lower() or "sqlite",
             llm_endpoint=os.getenv("SCIFINDER_ROUTE_LLM_ENDPOINT") or None,
             llm_model=os.getenv("SCIFINDER_ROUTE_LLM_MODEL") or None,
+            llm_enabled=parse_bool(os.getenv("SCIFINDER_ROUTE_LLM_ENABLED"), default=False),
+            llm_schema_version=os.getenv("SCIFINDER_ROUTE_LLM_SCHEMA_VERSION", "reaction_step.v1"),
+            llm_prompt_profile=os.getenv("SCIFINDER_ROUTE_LLM_PROMPT_PROFILE", "strict-reaction-json"),
+            llm_cost_limit_usd=float(os.getenv("SCIFINDER_ROUTE_LLM_COST_LIMIT_USD", "0")),
             embedding_endpoint=os.getenv("SCIFINDER_ROUTE_EMBEDDING_ENDPOINT") or None,
             embedding_model=os.getenv("SCIFINDER_ROUTE_EMBEDDING_MODEL") or None,
             ocr_endpoint=os.getenv("SCIFINDER_ROUTE_OCR_ENDPOINT") or None,
             ocr_model=os.getenv("SCIFINDER_ROUTE_OCR_MODEL") or None,
             document_parser_endpoint=os.getenv("SCIFINDER_ROUTE_DOCUMENT_PARSER_ENDPOINT") or None,
             document_parser_model=os.getenv("SCIFINDER_ROUTE_DOCUMENT_PARSER_MODEL") or None,
+            parser_fallback=parse_bool(os.getenv("SCIFINDER_ROUTE_DOCUMENT_PARSER_FALLBACK"), default=True),
+            structure_recognition_endpoint=os.getenv("SCIFINDER_ROUTE_STRUCTURE_RECOGNITION_ENDPOINT") or None,
+            structure_recognition_model=os.getenv("SCIFINDER_ROUTE_STRUCTURE_RECOGNITION_MODEL") or None,
             postgres_url=os.getenv("SCIFINDER_ROUTE_POSTGRES_URL") or None,
+            redis_url=os.getenv("SCIFINDER_ROUTE_REDIS_URL") or None,
             verification_confidence_threshold=float(os.getenv("SCIFINDER_ROUTE_VERIFICATION_CONFIDENCE_THRESHOLD", "0.65")),
+            evidence_retention_days=int(os.getenv("SCIFINDER_ROUTE_EVIDENCE_RETENTION_DAYS", "90")),
+            cache_retention_days=int(os.getenv("SCIFINDER_ROUTE_CACHE_RETENTION_DAYS", "30")),
         )
         return config.apply_file_overrides()
 
@@ -88,6 +116,7 @@ class AppConfig:
     def effective_config(self, *, include_secrets: bool = False) -> dict[str, Any]:
         token = self.auth_token if include_secrets else mask_secret(self.auth_token)
         postgres_url = self.postgres_url if include_secrets else mask_secret(self.postgres_url)
+        redis_url = self.redis_url if include_secrets else mask_secret(self.redis_url)
         return {
             "paths": {
                 "data_dir": str(self.data_dir),
@@ -100,27 +129,46 @@ class AppConfig:
             "server": {
                 "async_jobs": self.async_jobs,
                 "max_workers": self.max_workers,
+                "storage_backend": self.storage_backend,
             },
             "security": {
                 "allow_external_paths": self.allow_external_paths,
                 "token": token,
+                "users": [user.__dict__ if include_secrets else user.masked() for user in self.users],
             },
             "ingest": {
                 "scan_extensions": list(self.scan_extensions),
             },
+            "queue": {
+                "backend": self.queue_backend,
+                "redis_url": redis_url,
+            },
             "integrations": {
                 "llm_endpoint": self.llm_endpoint,
                 "llm_model": self.llm_model,
+                "llm_enabled": self.llm_enabled,
                 "embedding_endpoint": self.embedding_endpoint,
                 "embedding_model": self.embedding_model,
                 "ocr_endpoint": self.ocr_endpoint,
                 "ocr_model": self.ocr_model,
                 "document_parser_endpoint": self.document_parser_endpoint,
                 "document_parser_model": self.document_parser_model,
+                "document_parser_fallback": self.parser_fallback,
+                "structure_recognition_endpoint": self.structure_recognition_endpoint,
+                "structure_recognition_model": self.structure_recognition_model,
                 "postgres_url": postgres_url,
+            },
+            "extraction": {
+                "llm_schema_version": self.llm_schema_version,
+                "llm_prompt_profile": self.llm_prompt_profile,
+                "llm_cost_limit_usd": self.llm_cost_limit_usd,
             },
             "thresholds": {
                 "verification_confidence_threshold": self.verification_confidence_threshold,
+            },
+            "retention": {
+                "evidence_retention_days": self.evidence_retention_days,
+                "cache_retention_days": self.cache_retention_days,
             },
         }
 
@@ -137,6 +185,14 @@ class AppConfig:
         warnings: list[str] = []
         if self.max_workers < 1:
             warnings.append("server.max_workers must be >= 1")
+        if self.storage_backend not in {"sqlite", "postgres"}:
+            warnings.append("server.storage_backend must be sqlite or postgres")
+        if self.storage_backend == "postgres" and not self.postgres_url:
+            warnings.append("server.storage_backend=postgres requires integrations.postgres_url")
+        if self.queue_backend not in {"sqlite", "redis"}:
+            warnings.append("queue.backend must be sqlite or redis")
+        if self.queue_backend == "redis" and not self.redis_url:
+            warnings.append("queue.backend=redis requires queue.redis_url; sqlite queue remains the safe fallback")
         if not self.scan_extensions:
             warnings.append("ingest.scan_extensions is empty; scan_inbox will skip every file")
         for extension in self.scan_extensions:
@@ -149,6 +205,7 @@ class AppConfig:
             "integrations.embedding_endpoint": self.embedding_endpoint,
             "integrations.ocr_endpoint": self.ocr_endpoint,
             "integrations.document_parser_endpoint": self.document_parser_endpoint,
+            "integrations.structure_recognition_endpoint": self.structure_recognition_endpoint,
         }.items():
             if endpoint and not endpoint.startswith(("http://", "https://")):
                 warnings.append(f"{name} should start with http:// or https://")
@@ -161,6 +218,12 @@ class AppConfig:
                 "integrations.document_parser_endpoint",
                 self.document_parser_model,
                 self.document_parser_endpoint,
+            ),
+            (
+                "integrations.structure_recognition_model",
+                "integrations.structure_recognition_endpoint",
+                self.structure_recognition_model,
+                self.structure_recognition_endpoint,
             ),
         ]:
             if model and not endpoint:
@@ -192,6 +255,9 @@ def apply_config_overrides(config: AppConfig, raw: dict[str, Any]) -> AppConfig:
     ingest = section(raw, "ingest")
     integrations = section(raw, "integrations")
     thresholds = section(raw, "thresholds")
+    queue = section(raw, "queue")
+    extraction = section(raw, "extraction")
+    retention = section(raw, "retention")
     scan_extensions = ingest.get("scan_extensions", config.scan_extensions)
     if isinstance(scan_extensions, str):
         scan_extensions = parse_extensions(scan_extensions, config.scan_extensions)
@@ -201,24 +267,41 @@ def apply_config_overrides(config: AppConfig, raw: dict[str, Any]) -> AppConfig:
         config,
         async_jobs=coerce_bool(server.get("async_jobs"), config.async_jobs),
         max_workers=max(1, int(server.get("max_workers", config.max_workers))),
+        storage_backend=str(server.get("storage_backend", config.storage_backend)).strip().lower() or "sqlite",
         allow_external_paths=coerce_bool(security.get("allow_external_paths"), config.allow_external_paths),
         auth_token=none_if_empty(security.get("token", config.auth_token)),
+        users=parse_users(jsonish(security.get("users"))) if "users" in security else config.users,
         scan_extensions=scan_extensions,
+        queue_backend=str(queue.get("backend", config.queue_backend)).strip().lower() or "sqlite",
+        redis_url=none_if_empty(queue.get("redis_url", config.redis_url)),
         llm_endpoint=none_if_empty(integrations.get("llm_endpoint", config.llm_endpoint)),
         llm_model=none_if_empty(integrations.get("llm_model", config.llm_model)),
+        llm_enabled=coerce_bool(integrations.get("llm_enabled"), config.llm_enabled),
         embedding_endpoint=none_if_empty(integrations.get("embedding_endpoint", config.embedding_endpoint)),
         embedding_model=none_if_empty(integrations.get("embedding_model", config.embedding_model)),
         ocr_endpoint=none_if_empty(integrations.get("ocr_endpoint", config.ocr_endpoint)),
         ocr_model=none_if_empty(integrations.get("ocr_model", config.ocr_model)),
-        document_parser_endpoint=none_if_empty(
-            integrations.get("document_parser_endpoint", config.document_parser_endpoint)
-        ),
+        document_parser_endpoint=none_if_empty(integrations.get("document_parser_endpoint", config.document_parser_endpoint)),
         document_parser_model=none_if_empty(integrations.get("document_parser_model", config.document_parser_model)),
+        parser_fallback=coerce_bool(integrations.get("document_parser_fallback"), config.parser_fallback),
+        structure_recognition_endpoint=none_if_empty(integrations.get("structure_recognition_endpoint", config.structure_recognition_endpoint)),
+        structure_recognition_model=none_if_empty(integrations.get("structure_recognition_model", config.structure_recognition_model)),
         postgres_url=none_if_empty(integrations.get("postgres_url", config.postgres_url)),
-        verification_confidence_threshold=float(
-            thresholds.get("verification_confidence_threshold", config.verification_confidence_threshold)
-        ),
+        llm_schema_version=str(extraction.get("llm_schema_version", config.llm_schema_version)),
+        llm_prompt_profile=str(extraction.get("llm_prompt_profile", config.llm_prompt_profile)),
+        llm_cost_limit_usd=float(extraction.get("llm_cost_limit_usd", config.llm_cost_limit_usd)),
+        verification_confidence_threshold=float(thresholds.get("verification_confidence_threshold", config.verification_confidence_threshold)),
+        evidence_retention_days=int(retention.get("evidence_retention_days", config.evidence_retention_days)),
+        cache_retention_days=int(retention.get("cache_retention_days", config.cache_retention_days)),
     )
+
+
+def jsonish(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return __import__("json").dumps(value)
 
 
 def section(raw: dict[str, Any], key: str) -> dict[str, Any]:
