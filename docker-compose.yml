@@ -1,0 +1,37 @@
+services:
+  scifinder-route-mcp:
+    build: .
+    container_name: scifinder-route-mcp
+    restart: unless-stopped
+    env_file:
+      - .env.example
+    environment:
+      SCIFINDER_ROUTE_TRANSPORT: sse
+      SCIFINDER_ROUTE_HOST: 0.0.0.0
+      SCIFINDER_ROUTE_PORT: 8000
+      SCIFINDER_ROUTE_ADMIN_ENABLED: ${SCIFINDER_ROUTE_ADMIN_ENABLED:-true}
+      SCIFINDER_ROUTE_ADMIN_HOST: 0.0.0.0
+      SCIFINDER_ROUTE_ADMIN_PORT: 8001
+      SCIFINDER_ROUTE_SSE_PATH: /sse
+      SCIFINDER_ROUTE_DATA_DIR: /data
+      SCIFINDER_ROUTE_INBOX_DIR: /inbox
+      SCIFINDER_ROUTE_UPLOAD_DIR: /data/uploads
+      SCIFINDER_ROUTE_EVIDENCE_DIR: /data/evidence
+      SCIFINDER_ROUTE_DATABASE: /data/scifinder_routes.sqlite3
+      SCIFINDER_ROUTE_CONFIG: /data/config.yaml
+      SCIFINDER_ROUTE_ASYNC_JOBS: "true"
+      SCIFINDER_ROUTE_MAX_WORKERS: "1"
+      SCIFINDER_ROUTE_ALLOW_EXTERNAL_PATHS: "false"
+      SCIFINDER_ROUTE_TOKEN: ${SCIFINDER_ROUTE_TOKEN:-}
+    ports:
+      - "${SCIFINDER_ROUTE_PUBLISHED_PORT:-8000}:8000"
+      - "${SCIFINDER_ROUTE_ADMIN_PUBLISHED_PORT:-8001}:8001"
+    volumes:
+      - ./nas-data:/data
+      - ./nas-inbox:/inbox:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 8000)); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

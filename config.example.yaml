@@ -1,0 +1,30 @@
+server:
+  async_jobs: true
+  max_workers: 1
+
+security:
+  allow_external_paths: false
+  token: null
+
+ingest:
+  scan_extensions:
+    - .pdf
+    - .html
+    - .htm
+    - .mhtml
+    - .mht
+    - .txt
+
+integrations:
+  llm_endpoint: null
+  llm_model: null
+  embedding_endpoint: null
+  embedding_model: null
+  ocr_endpoint: null
+  ocr_model: null
+  document_parser_endpoint: null
+  document_parser_model: null
+  postgres_url: null
+
+thresholds:
+  verification_confidence_threshold: 0.65
