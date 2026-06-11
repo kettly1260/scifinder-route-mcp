@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,31 @@ from .auth import UserCredential, mask_secret, parse_users
 
 DEFAULT_SCAN_EXTENSIONS = (".pdf", ".html", ".htm", ".mhtml", ".mht", ".txt")
 HOT_CONFIG_SECTIONS = {"server", "security", "ingest", "integrations", "thresholds", "queue", "extraction", "retention"}
+HOT_CONFIG_KEYS = {
+    "server": {"async_jobs", "max_workers", "storage_backend"},
+    "security": {"allow_external_paths", "token", "users"},
+    "ingest": {"scan_extensions"},
+    "queue": {"backend", "redis_url"},
+    "integrations": {
+        "llm_endpoint",
+        "llm_model",
+        "llm_enabled",
+        "embedding_endpoint",
+        "embedding_model",
+        "ocr_endpoint",
+        "ocr_model",
+        "document_parser_endpoint",
+        "document_parser_model",
+        "document_parser_fallback",
+        "structure_recognition_endpoint",
+        "structure_recognition_model",
+        "postgres_url",
+    },
+    "extraction": {"llm_schema_version", "llm_prompt_profile", "llm_cost_limit_usd"},
+    "thresholds": {"verification_confidence_threshold"},
+    "retention": {"evidence_retention_days", "cache_retention_days"},
+}
+CONFIG_WRITE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -177,9 +203,10 @@ class AppConfig:
         return {key: effective[key] for key in HOT_CONFIG_SECTIONS}
 
     def write_hot_config(self, updates: dict[str, Any]) -> None:
-        current = read_config_yaml(self.config_path) if self.config_path.exists() else self.hot_config(include_secrets=True)
-        merged = merge_hot_config(current, updates)
-        write_config_yaml(self.config_path, merged)
+        with CONFIG_WRITE_LOCK:
+            current = read_config_yaml(self.config_path) if self.config_path.exists() else self.hot_config(include_secrets=True)
+            merged = merge_hot_config(current, updates)
+            write_config_yaml(self.config_path, merged)
 
     def validate(self) -> list[str]:
         warnings: list[str] = []
@@ -342,6 +369,9 @@ def merge_hot_config(current: dict[str, Any], updates: dict[str, Any]) -> dict[s
     for key, value in updates.items():
         if not isinstance(value, dict):
             raise ValueError(f"Config section must be an object: {key}")
+        rejected_keys = sorted(set(value) - HOT_CONFIG_KEYS[key])
+        if rejected_keys:
+            raise ValueError(f"Unsupported config keys in {key}: {', '.join(rejected_keys)}")
         existing = merged.get(key, {})
         if not isinstance(existing, dict):
             existing = {}
@@ -402,7 +432,9 @@ def write_config_yaml(path: Path, config: dict[str, Any]) -> None:
             else:
                 lines.append(f"  {key}: {format_scalar(value)}")
         lines.append("")
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 def parse_scalar(value: str) -> Any:

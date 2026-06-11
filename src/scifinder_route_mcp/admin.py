@@ -17,14 +17,14 @@ from .service import RouteService
 @dataclass(frozen=True)
 class AdminRunConfig:
     enabled: bool = True
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8001
 
     @classmethod
     def from_env(cls) -> "AdminRunConfig":
         return cls(
             enabled=os.getenv("SCIFINDER_ROUTE_ADMIN_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
-            host=os.getenv("SCIFINDER_ROUTE_ADMIN_HOST", "0.0.0.0"),
+            host=os.getenv("SCIFINDER_ROUTE_ADMIN_HOST", "127.0.0.1"),
             port=int(os.getenv("SCIFINDER_ROUTE_ADMIN_PORT", "8001")),
         )
 
@@ -44,6 +44,11 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._send_html(render_dashboard(self.server.service))
             return
         if parsed.path == "/api/state":
+            try:
+                self._require_role("viewer")
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+                return
             self._send_json(admin_state(self.server.service))
             return
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -91,6 +96,9 @@ class AdminHandler(BaseHTTPRequestHandler):
                 payload = self._read_json()
                 self._send_json(self.server.service.test_integration_endpoint(str(payload.get("kind") or "")))
                 return
+        except PermissionError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            return
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -225,23 +233,31 @@ def render_dashboard(service: RouteService) -> str:
           <label>OCR model <input name="ocr_model" data-section="integrations" placeholder="mineru-layout"></label>
           <label>Document parser endpoint <input name="document_parser_endpoint" data-section="integrations" placeholder="http://parser:9100"></label>
           <label>Document parser model <input name="document_parser_model" data-section="integrations" placeholder="pymupdf|mineru"></label>
-          <label>PostgreSQL URL <input name="postgres_url" data-section="integrations" placeholder="postgresql://user:pass@host/db"></label>
+          <label>Parser fallback <select name="document_parser_fallback" data-section="integrations" data-type="bool"><option value="true">true</option><option value="false">false</option></select></label>
+          <label>PostgreSQL URL <input name="postgres_url" data-section="integrations" data-secret="true" placeholder="Unchanged when blank"></label>
           <label>Structure recognition endpoint <input name="structure_recognition_endpoint" data-section="integrations" placeholder="http://decimer:9300"></label>
-          <label>LLM enabled <select name="llm_enabled" data-section="integrations"><option value="false">false</option><option value="true">true</option></select></label>
+          <label>Structure recognition model <input name="structure_recognition_model" data-section="integrations" placeholder="decimer|molscribe|osra"></label>
+          <label>LLM enabled <select name="llm_enabled" data-section="integrations" data-type="bool"><option value="false">false</option><option value="true">true</option></select></label>
         </div>
       </form>
 
       <form class="panel glass" onsubmit="saveConfig(event)">
         <div class="panel-title"><div><p class="eyebrow">Runtime</p><h2>Scan & Thresholds</h2></div><button type="submit">Save & Reload</button></div>
         <div class="form-grid">
-          <label>Scan extensions <input name="scan_extensions" data-section="ingest" placeholder=".pdf,.html,.mhtml"></label>
+          <label>Scan extensions <input name="scan_extensions" data-section="ingest" data-type="list" placeholder=".pdf,.html,.mhtml"></label>
           <label>Max workers <input name="max_workers" data-section="server" type="number" min="1"></label>
-          <label>Async jobs <select name="async_jobs" data-section="server"><option value="true">true</option><option value="false">false</option></select></label>
-          <label>Allow external paths <select name="allow_external_paths" data-section="security"><option value="false">false</option><option value="true">true</option></select></label>
-          <label>Config token <input name="token" data-section="security" type="password" placeholder="Leave blank to clear"></label>
+          <label>Async jobs <select name="async_jobs" data-section="server" data-type="bool"><option value="true">true</option><option value="false">false</option></select></label>
+          <label>Allow external paths <select name="allow_external_paths" data-section="security" data-type="bool"><option value="false">false</option><option value="true">true</option></select></label>
+          <label>Config token <input name="token" data-section="security" data-secret="true" type="password" placeholder="Unchanged when blank"></label>
           <label>Verification threshold <input name="verification_confidence_threshold" data-section="thresholds" type="number" min="0" max="1" step="0.01"></label>
-          <label>Queue backend <select name="backend" data-section="queue"><option value="sqlite">sqlite</option><option value="redis">redis</option></select></label>
-          <label>Storage backend <select name="storage_backend" data-section="server"><option value="sqlite">sqlite</option><option value="postgres">postgres</option></select></label>
+          <label>Queue backend <select name="backend" data-section="queue" data-type="enum"><option value="sqlite">sqlite</option><option value="redis">redis</option></select></label>
+          <label>Redis URL <input name="redis_url" data-section="queue" data-secret="true" placeholder="Unchanged when blank"></label>
+          <label>Storage backend <select name="storage_backend" data-section="server" data-type="enum"><option value="sqlite">sqlite</option><option value="postgres">postgres</option></select></label>
+          <label>LLM schema version <input name="llm_schema_version" data-section="extraction" placeholder="reaction_step.v1"></label>
+          <label>LLM prompt profile <input name="llm_prompt_profile" data-section="extraction" placeholder="strict-reaction-json"></label>
+          <label>LLM cost limit USD <input name="llm_cost_limit_usd" data-section="extraction" type="number" min="0" step="0.01"></label>
+          <label>Evidence retention days <input name="evidence_retention_days" data-section="retention" type="number" min="1"></label>
+          <label>Cache retention days <input name="cache_retention_days" data-section="retention" type="number" min="1"></label>
         </div>
       </form>
     </section>
@@ -345,11 +361,11 @@ RESPONSIVE_CSS = r"""
 ADMIN_JS = r"""
 const config = window.__CONFIG__ || {};
 function valueFor(section, name){const value=(config[section]||{})[name];return Array.isArray(value)?value.join(','):value ?? ''}
-document.querySelectorAll('[data-section]').forEach(el=>{el.value=valueFor(el.dataset.section,el.name)});
+document.querySelectorAll('[data-section]').forEach(el=>{if(el.dataset.secret==='true')return;el.value=valueFor(el.dataset.section,el.name)});
 function token(){return document.getElementById('token').value}
-function coerce(el){if(el.name==='scan_extensions')return el.value.split(',').map(v=>v.trim()).filter(Boolean);if(el.type==='number')return Number(el.value);if(el.tagName==='SELECT')return el.value==='true';return el.value.trim() || null}
+function coerce(el){const text=el.value.trim();if(el.dataset.secret==='true'&&!text)return undefined;if(el.dataset.type==='list')return text.split(',').map(v=>v.trim()).filter(Boolean);if(el.type==='number')return text===''?undefined:Number(text);if(el.dataset.type==='bool')return el.value==='true';if(el.tagName==='SELECT')return el.value;return text || null}
 async function post(url,payload={}){const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Scifinder-Route-Token':token()},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok||data.error)throw new Error(data.error||res.statusText);return data}
-async function saveConfig(event){event.preventDefault();const payload={};event.target.querySelectorAll('[data-section]').forEach(el=>{payload[el.dataset.section] ||= {};payload[el.dataset.section][el.name]=coerce(el)});try{await post('/api/config',payload);location.reload()}catch(err){alert(err.message)}}
+async function saveConfig(event){event.preventDefault();const payload={};event.target.querySelectorAll('[data-section]').forEach(el=>{const value=coerce(el);if(value===undefined)return;payload[el.dataset.section] ||= {};payload[el.dataset.section][el.name]=value});try{await post('/api/config',payload);location.reload()}catch(err){alert(err.message)}}
 async function scanInbox(){try{const data=await post('/api/scan',{});alert(`Registered ${data.registered_count}, skipped ${data.skipped_count}`);location.reload()}catch(err){alert(err.message)}}
 async function rebuildVector(){try{const data=await post('/api/vector/rebuild',{});alert(JSON.stringify(data,null,2));location.reload()}catch(err){alert(err.message)}}
 async function backupDb(){try{const data=await post('/api/backup',{});alert(JSON.stringify(data,null,2));location.reload()}catch(err){alert(err.message)}}

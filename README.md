@@ -1,6 +1,6 @@
 # scifinder-route-mcp
 
-NAS-hosted MCP server for indexing and searching reaction-step-level synthesis routes from local SciFinder exports. It is designed to run long-term on Docker/NAS with a read-only inbox, durable SQLite queue fallback, optional external OCR/LLM/vector/parser/structure-recognition APIs, and an operational Admin Web UI.
+NAS-hosted MCP server for indexing and searching reaction-step-level synthesis routes from local SciFinder exports. It is designed to run long-term on Docker/NAS with a read-only inbox, durable SQLite queue fallback, optional external OCR/LLM/vector/parser/structure-recognition APIs, and an operational Admin Web UI for trusted LAN/VPN deployments.
 
 > GHCR visibility note: if anonymous pull fails, open GitHub → Packages → `scifinder-route-mcp` → Package settings → Change visibility → Public. The compose file is already configured for `ghcr.io/kettly1260/scifinder-route-mcp:latest`.
 
@@ -24,6 +24,8 @@ MCP SSE:      http://<nas-host>:8000/sse
 ```
 
 Put SciFinder exports into `nas-inbox`, then click **Scan Inbox** in the Admin Web UI or call the MCP `scan_inbox` tool. The image compose file uses `image:` only and does not build locally.
+
+Do not expose the Admin Web UI directly to the public internet. Use a trusted LAN/VPN or a reverse proxy with TLS and authentication. The Python default Admin bind address is `127.0.0.1`; the Docker compose profiles explicitly bind `0.0.0.0` for NAS access.
 
 ## Local Build Deployment
 
@@ -80,6 +82,8 @@ The Admin Web UI provides operational controls for:
 - SQLite backup, retention dry-run cleanup, NAS storage usage
 - compound registry count and search via MCP
 ```
+
+Secret fields in the UI are not prefilled. Leaving token, Redis URL, or PostgreSQL URL blank preserves the current value; entering a value replaces it. Docker-owned settings such as published ports, volume mounts, and container networks remain in `.env`/Compose.
 
 ## MCP Tools
 

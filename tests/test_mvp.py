@@ -6,8 +6,8 @@ import time
 
 import pytest
 
-from scifinder_route_mcp.admin import admin_state, render_dashboard
-from scifinder_route_mcp.config import AppConfig
+from scifinder_route_mcp.admin import AdminRunConfig, admin_state, render_dashboard
+from scifinder_route_mcp.config import AppConfig, merge_hot_config, read_config_yaml
 from scifinder_route_mcp.server import ServerRunConfig, create_mcp, run_mcp_server
 from scifinder_route_mcp.service import RouteService
 from scifinder_route_mcp.storage import RouteStorage
@@ -199,23 +199,40 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
 
     updated = service.update_config(
         {
+            "server": {"storage_backend": "sqlite"},
+            "queue": {"backend": "redis", "redis_url": "redis://queue:6379/0"},
             "ingest": {"scan_extensions": [".html"]},
             "integrations": {
                 "embedding_endpoint": "http://embedding:8000/v1",
                 "embedding_model": "bge-m3",
                 "ocr_endpoint": "http://ocr-worker:9000",
                 "document_parser_endpoint": "http://parser:9100",
+                "document_parser_fallback": True,
+                "structure_recognition_model": "decimer",
             },
+            "extraction": {"llm_schema_version": "reaction_step.v2", "llm_prompt_profile": "strict", "llm_cost_limit_usd": 1.25},
             "thresholds": {"verification_confidence_threshold": 0.75},
+            "retention": {"evidence_retention_days": 120, "cache_retention_days": 14},
         }
     )
 
+    assert updated["server"]["storage_backend"] == "sqlite"
+    assert updated["queue"]["backend"] == "redis"
+    assert updated["queue"]["redis_url"] == "re***/0"
     assert updated["ingest"]["scan_extensions"] == [".html"]
     assert updated["integrations"]["embedding_model"] == "bge-m3"
     assert updated["integrations"]["ocr_endpoint"] == "http://ocr-worker:9000"
     assert updated["integrations"]["document_parser_endpoint"] == "http://parser:9100"
+    assert updated["integrations"]["document_parser_fallback"] is True
+    assert updated["integrations"]["structure_recognition_model"] == "decimer"
+    assert updated["extraction"]["llm_schema_version"] == "reaction_step.v2"
+    assert updated["extraction"]["llm_cost_limit_usd"] == 1.25
     assert updated["thresholds"]["verification_confidence_threshold"] == 0.75
+    assert updated["retention"]["cache_retention_days"] == 14
     assert service.config.config_path.exists()
+    raw_config = read_config_yaml(service.config.config_path)
+    assert raw_config["queue"]["backend"] == "redis"
+    assert raw_config["queue"]["redis_url"] == "redis://queue:6379/0"
 
     fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.html"
     html_target = service.config.inbox_dir / "sample.html"
@@ -227,6 +244,23 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
 
     assert result["registered_count"] == 1
     assert result["registered"][0]["document"]["file_path"].endswith("sample.html")
+
+
+def test_update_config_preserves_secret_when_section_omits_it(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+
+    service.update_config({"security": {"token": "secret-token"}, "queue": {"redis_url": "redis://queue:6379/0"}})
+    updated = service.update_config({"security": {"allow_external_paths": False}, "queue": {"backend": "redis"}})
+    raw_config = read_config_yaml(service.config.config_path)
+
+    assert updated["security"]["token"] == "se***en"
+    assert raw_config["security"]["token"] == "secret-token"
+    assert raw_config["queue"]["redis_url"] == "redis://queue:6379/0"
+
+
+def test_merge_hot_config_rejects_unknown_keys() -> None:
+    with pytest.raises(ValueError, match="Unsupported config keys"):
+        merge_hot_config({"server": {}}, {"server": {"published_port": 8001}})
 
 
 def test_validate_config_reports_invalid_threshold(tmp_path: Path) -> None:
@@ -249,12 +283,23 @@ def test_admin_dashboard_contains_modern_config_controls(tmp_path: Path) -> None
     assert "Embedding endpoint" in html
     assert "OCR endpoint" in html
     assert "Document parser endpoint" in html
+    assert "Queue backend" in html
+    assert "data-type=\"enum\"" in html
+    assert "LLM cost limit USD" in html
+    assert "Parser fallback" in html
+    assert "Unchanged when blank" in html
     assert "backdrop-filter" in html
     assert "@media (min-width: 1440px)" in html
     assert "@media (min-width: 700px) and (max-width: 1023px)" in html
     assert "@media (max-width: 699px)" in html
     assert "@media (hover: none) and (pointer: coarse)" in html
     assert state["production"]
+
+
+def test_admin_run_config_defaults_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SCIFINDER_ROUTE_ADMIN_HOST", raising=False)
+
+    assert AdminRunConfig.from_env().host == "127.0.0.1"
 
 
 def test_durable_queue_recovers_running_and_retries_failed(tmp_path: Path) -> None:
@@ -283,6 +328,25 @@ def test_upload_bytes_hash_dedupes(tmp_path: Path) -> None:
 
     assert Path(first["uploaded_path"]).exists()
     assert second["deduplicated"] is True
+
+
+def test_upload_document_rejects_external_source_when_disabled(tmp_path: Path) -> None:
+    config = AppConfig(
+        data_dir=tmp_path / "data",
+        inbox_dir=tmp_path / "data" / "inbox",
+        upload_dir=tmp_path / "data" / "uploads",
+        evidence_dir=tmp_path / "data" / "evidence",
+        database_path=tmp_path / "data" / "routes.sqlite3",
+        config_path=tmp_path / "data" / "config.yaml",
+        sample_dir=None,
+        allow_external_paths=False,
+    )
+    service = RouteService(config=config, storage=RouteStorage(config.database_path))
+    external = tmp_path / "external.html"
+    external.write_text("Experimental procedure stirred for 2 h in THF, yield 50%.", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside allowed NAS roots"):
+        service.upload_document(str(external))
 
 
 def test_vector_index_without_endpoint_degrades(tmp_path: Path) -> None:

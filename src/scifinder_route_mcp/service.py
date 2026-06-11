@@ -87,6 +87,7 @@ class RouteService:
         source = Path(source_path).resolve()
         if not source.exists():
             raise FileNotFoundError(f"Upload source does not exist: {source}")
+        self._assert_allowed_path(source)
         safe_name = safe_filename(filename or source.name)
         source_hash = hash_file(source)
         existing = self.storage.get_document_by_hash(source_hash)

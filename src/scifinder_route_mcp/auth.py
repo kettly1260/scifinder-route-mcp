@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hmac
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -71,9 +72,10 @@ def parse_users(value: str | None) -> tuple[UserCredential, ...]:
 
 
 def authenticate_token(users: Iterable[UserCredential], legacy_admin_token: str | None, token: str | None) -> UserCredential | None:
-    if legacy_admin_token and token == legacy_admin_token:
+    candidate = token or ""
+    if legacy_admin_token and hmac.compare_digest(candidate, legacy_admin_token):
         return UserCredential(username="legacy-admin", token=legacy_admin_token, role="admin")
     for user in users:
-        if token == user.token:
+        if hmac.compare_digest(candidate, user.token):
             return user
     return None
