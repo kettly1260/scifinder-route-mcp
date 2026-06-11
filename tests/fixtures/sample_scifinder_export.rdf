@@ -1,0 +1,60 @@
+$RDFILE 1
+$DATM 06/12/2026 00:18:00
+$RFMT $RIREG SCHEME1 STEP1
+$RXN
+
+
+
+  1  1
+$MOL
+1-Pyrenecarboxylic acid
+C17H10O2
+19694-02-1 Copyright (C) 2025 ACS
+  0  0  0     0  0            999 V3000
+M  V30 BEGIN CTAB
+M  V30 COUNTS  1 0 0 0 0
+M  V30 BEGIN ATOM
+M  V30 1 C 0.0000 0.0000 0.0 0
+M  V30 END ATOM
+M  V30 BEGIN BOND
+M  V30 END BOND
+M  V30 END CTAB
+M  END
+$MOL
+1-Pyrenecarboxylic acid hydrazide
+C17H12N2O
+129-00-0 Copyright (C) 2025 ACS
+  0  0  0     0  0            999 V3000
+M  V30 BEGIN CTAB
+M  V30 COUNTS  1 0 0 0 0
+M  V30 BEGIN ATOM
+M  V30 1 N 0.0000 0.0000 0.0 0
+M  V30 END ATOM
+M  V30 BEGIN BOND
+M  V30 END BOND
+M  V30 END CTAB
+M  END
+$DTYPE RXN:RCT(1):CAS_RN
+$DATUM 19694-02-1
+$DTYPE RXN:PRO(1):CAS_RN
+$DATUM 129-00-0
+$DTYPE RXN:VAR(1):CAS_Reaction_Number
+$DATUM 31-614-CAS-40557461
+$DTYPE RXN:VAR(1):STEPS
+$DATUM 1
+$DTYPE RXN:VAR(1):STAGES
+$DATUM 1
+$DTYPE RXN:VAR(1):PRO(1):YIELD
+$DATUM 92
+$DTYPE RXN:VAR(1):RGT(1):CAS_RN
+$DATUM 10217-52-4
+$DTYPE RXN:VAR(1):SOL(1):CAS_RN
+$DATUM 68-12-2
+$DTYPE RXN:VAR(1):EXP_PROC
+$DATUM Synthesis procedure: Add hydrazine hydrate to 1-pyrenecarboxylic acid in dimethylformamide and stir for 3 h at rt to give product in 92% yield.
+$DTYPE RXN:VAR(1):REFERENCE(1):TITLE
+$DATUM Cu-selective turn-on fluorescence signaling based on metal-induced hydrolysis of pyrenecarbohydrazide
+$DTYPE RXN:VAR(1):REFERENCE(1):AUTHOR
+$DATUM Ryu, Hyein; Baek, Ji Hye
+$DTYPE RXN:VAR(1):REFERENCE(1):CITATION
+$DATUM Tetrahedron Letters (2017), 58(30), 2927-2930.

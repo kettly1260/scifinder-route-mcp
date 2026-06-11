@@ -11,15 +11,41 @@ security:
   allow_external_paths: false
   token: null
   users: []
+  upload_av_scan_enabled: false
+  upload_av_engine: clamav
+  upload_av_endpoint: null
+  upload_av_fail_closed: true
 
 ingest:
   scan_extensions:
     - .pdf
+    - .rtf
+    - .rdf
     - .html
     - .htm
     - .mhtml
     - .mht
+    - .md
+    - .markdown
     - .txt
+  upload_extensions:
+    - .pdf
+    - .rtf
+    - .rdf
+    - .html
+    - .htm
+    - .mhtml
+    - .mht
+    - .md
+    - .markdown
+    - .txt
+  upload_max_bytes: 52428800
+  reject_file_type_mismatch: true
+  extract_visual_evidence: true
+  render_visual_pages: true
+  visual_page_dpi: 160
+  max_visual_pages_per_document: 20
+  max_embedded_images_per_document: 100
 
 integrations:
   llm_enabled: false
@@ -35,6 +61,8 @@ integrations:
   structure_recognition_endpoint: null
   structure_recognition_model: null
   postgres_url: null
+  # Keep frequently edited Web UI integration state in webui-config.yaml instead of this startup config.
+  # Zotero MCP endpoint lists, linking toggles, and note-writeback policy belong there.
 
 extraction:
   llm_schema_version: reaction_step.v1

@@ -4,14 +4,18 @@ version = "0.1.0"
 description = "MCP server for indexing and searching reaction-step-level synthesis routes from local SciFinder exports."
 requires-python = ">=3.10"
 dependencies = [
-  "fastmcp>=0.4.0",
+  "fastmcp>=2.0.0",
   "beautifulsoup4>=4.12.0",
   "pymupdf>=1.24.0",
+  "uvicorn>=0.30.0",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0.0",
+]
+chem = [
+  "rdkit>=2024.3.0",
 ]
 
 [project.scripts]

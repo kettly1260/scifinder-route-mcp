@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+import base64
 import json
 import time
 
 import pytest
 
 from scifinder_route_mcp.admin import AdminRunConfig, admin_state, render_dashboard
-from scifinder_route_mcp.config import AppConfig, merge_hot_config, read_config_yaml
-from scifinder_route_mcp.server import ServerRunConfig, create_mcp, run_mcp_server
+from scifinder_route_mcp.config import AppConfig, merge_hot_config, read_config_yaml, write_config_yaml
+from scifinder_route_mcp.server import ServerRunConfig, create_dual_transport_app, create_mcp, run_mcp_server
 from scifinder_route_mcp.service import RouteService
+from scifinder_route_mcp.parsers import parse_document
 from scifinder_route_mcp.storage import RouteStorage
+from scifinder_route_mcp.rdfile import parse_rdfile_reactions
+from scifinder_route_mcp.literature import diff_reaction_fields, extract_method_fields
 
 
 def make_service(tmp_path: Path) -> RouteService:
@@ -77,6 +81,84 @@ def test_upload_and_reparse(tmp_path: Path) -> None:
     assert len(hits) >= 1
 
 
+def test_mcp_content_upload_validates_and_parses_rtf(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rtf"
+
+    uploaded = service.upload_document_content("sample.rtf", base64.b64encode(fixture.read_bytes()).decode("ascii"))
+
+    assert uploaded["document"]["file_type"] == "rtf"
+    assert Path(uploaded["uploaded_path"]).parent == service.config.upload_dir
+    hits = service.search_reaction_steps(query="hydrazine dimethylformamide", limit=5)
+    assert hits
+
+
+def test_upload_rejects_disguised_executable(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+
+    with pytest.raises(ValueError, match="dangerous"):
+        service.upload_document_content("not-a-pdf.pdf", base64.b64encode(b"MZ fake executable").decode("ascii"))
+
+
+def test_parse_rdfile_extracts_structured_summary(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
+
+    parsed = parse_document(fixture)
+
+    assert parsed.file_type == "rdf"
+    assert "CAS Reaction Number: 31-614-CAS-40557461" in parsed.full_text
+    assert "Experimental Procedure" in parsed.full_text
+
+
+def test_rdfile_structure_parser_supports_v3000_and_v2000() -> None:
+    v3000 = (Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf").read_text(encoding="utf-8")
+    v2000 = (Path(__file__).parent / "fixtures" / "sample_scifinder_export_v2000.rdf").read_text(encoding="utf-8")
+
+    first = parse_rdfile_reactions(v3000)[0]
+    second = parse_rdfile_reactions(v2000)[0]
+
+    assert first.scheme_id == "SCHEME1"
+    assert first.molecules[0].molfile_version == "V3000"
+    assert first.molecules[0].cas_rn == "19694-02-1"
+    assert second.scheme_id == "SCHEME2"
+    assert second.molecules[0].molfile_version == "V2000"
+    assert second.molecules[1].role == "product"
+
+
+def test_rdf_import_indexes_structures_and_trash(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
+
+    result = service.register_document(str(fixture))
+    document_id = result["document"]["id"]
+    reactions = service.list_rdf_reactions(document_id=document_id)
+    structures = service.list_rdf_structures(document_id=document_id)
+
+    assert reactions
+    assert reactions[0]["scheme_id"] == "SCHEME1"
+    assert len(structures) >= 2
+    assert {item["molfile_version"] for item in structures if item["molfile"]} == {"V3000"}
+    assert service.get_chem_status()["rdf_structure_index"]["total_structures"] >= 2
+
+    trashed = service.trash_item("rdf_structure", structures[0]["id"])
+    assert trashed["status"] == "trashed"
+    assert all(item["id"] != structures[0]["id"] for item in service.list_rdf_structures(document_id=document_id))
+    assert service.list_trash()
+    service.restore_trash_item("rdf_structure", structures[0]["id"])
+    assert any(item["id"] == structures[0]["id"] for item in service.list_rdf_structures(document_id=document_id))
+
+
+def test_rdf_v2000_import_is_viewable_without_rdkit(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export_v2000.rdf"
+
+    result = service.register_document(str(fixture))
+    structures = service.list_rdf_structures(document_id=result["document"]["id"])
+
+    assert [item["molfile_version"] for item in structures] == ["V2000", "V2000"]
+    assert structures[0]["molfile"]
+
+
 def test_scan_inbox_deduplicates_registered_files(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.html"
@@ -139,6 +221,7 @@ def test_mcp_fallback_registers_core_tools(tmp_path: Path) -> None:
         assert {
             "register_document",
             "upload_document",
+            "upload_document_content",
             "scan_inbox",
             "get_parse_job_status",
             "list_parse_jobs",
@@ -163,13 +246,36 @@ def test_mcp_fallback_registers_core_tools(tmp_path: Path) -> None:
             "merge_compounds",
             "search_by_smiles",
             "recognize_structure_image",
+            "get_chem_status",
+            "list_rdf_reactions",
+            "get_rdf_reaction",
+            "search_rdf_structures",
+            "similarity_search_structures",
+            "substructure_search_structures",
+            "trash_item",
+            "restore_trash_item",
+            "list_trash",
+            "empty_trash",
             "compute_evaluation_metrics",
             "get_evaluation_status",
             "backup_database",
             "get_storage_usage",
             "cleanup_evidence_cache",
             "test_integration_endpoint",
+            "list_zotero_mcp_endpoints",
+            "upsert_zotero_mcp_endpoint",
+            "delete_zotero_mcp_endpoint",
+            "enqueue_literature_linking",
+            "list_literature_links",
+            "confirm_literature_link",
+            "reject_literature_link",
+            "get_reaction_literature_context",
+            "write_zotero_link_note",
+            "list_export_batches",
+            "get_export_batch",
+            "unlink_document_from_batch",
         }.issubset(set(mcp.tools))
+        assert "docs://scifinder-import-guidance" in getattr(mcp, "resources", {})
 
 
 def test_mcp_token_guard_blocks_calls(tmp_path: Path) -> None:
@@ -201,7 +307,7 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
         {
             "server": {"storage_backend": "sqlite"},
             "queue": {"backend": "redis", "redis_url": "redis://queue:6379/0"},
-            "ingest": {"scan_extensions": [".html"]},
+            "ingest": {"scan_extensions": [".html"], "upload_extensions": [".html", ".rdf"], "upload_max_bytes": 4096},
             "integrations": {
                 "embedding_endpoint": "http://embedding:8000/v1",
                 "embedding_model": "bge-m3",
@@ -220,6 +326,8 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
     assert updated["queue"]["backend"] == "redis"
     assert updated["queue"]["redis_url"] == "re***/0"
     assert updated["ingest"]["scan_extensions"] == [".html"]
+    assert updated["ingest"]["upload_extensions"] == [".html", ".rdf"]
+    assert updated["ingest"]["upload_max_bytes"] == 4096
     assert updated["integrations"]["embedding_model"] == "bge-m3"
     assert updated["integrations"]["ocr_endpoint"] == "http://ocr-worker:9000"
     assert updated["integrations"]["document_parser_endpoint"] == "http://parser:9100"
@@ -229,10 +337,10 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
     assert updated["extraction"]["llm_cost_limit_usd"] == 1.25
     assert updated["thresholds"]["verification_confidence_threshold"] == 0.75
     assert updated["retention"]["cache_retention_days"] == 14
-    assert service.config.config_path.exists()
-    raw_config = read_config_yaml(service.config.config_path)
-    assert raw_config["queue"]["backend"] == "redis"
-    assert raw_config["queue"]["redis_url"] == "redis://queue:6379/0"
+    assert service.config.config_path.exists() is False
+    webui_config = read_config_yaml(service.config.data_dir / "webui-config.yaml")
+    assert webui_config["queue"]["backend"] == "redis"
+    assert webui_config["queue"]["redis_url"] == "redis://queue:6379/0"
 
     fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.html"
     html_target = service.config.inbox_dir / "sample.html"
@@ -246,16 +354,34 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
     assert result["registered"][0]["document"]["file_path"].endswith("sample.html")
 
 
+def test_auto_batch_links_similar_scifinder_exports(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    rdf = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
+    rtf = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rtf"
+
+    first = service.upload_document(str(rdf), filename="Reaction_20260612_0018.rdf")
+    second = service.upload_document(str(rtf), filename="Reaction_20260612_0018.rtf")
+
+    first_links = service.storage.list_batches_for_document(first["document"]["id"])
+    second_links = service.storage.list_batches_for_document(second["document"]["id"])
+    assert first_links
+    assert second_links
+    assert first_links[0]["id"] == second_links[0]["id"]
+    batch = service.storage.get_export_batch(first_links[0]["id"])
+    assert batch is not None
+    assert len(batch["documents"]) == 2
+
+
 def test_update_config_preserves_secret_when_section_omits_it(tmp_path: Path) -> None:
     service = make_service(tmp_path)
 
     service.update_config({"security": {"token": "secret-token"}, "queue": {"redis_url": "redis://queue:6379/0"}})
     updated = service.update_config({"security": {"allow_external_paths": False}, "queue": {"backend": "redis"}})
-    raw_config = read_config_yaml(service.config.config_path)
+    webui_config = read_config_yaml(service.config.data_dir / "webui-config.yaml")
 
     assert updated["security"]["token"] == "se***en"
-    assert raw_config["security"]["token"] == "secret-token"
-    assert raw_config["queue"]["redis_url"] == "redis://queue:6379/0"
+    assert webui_config["security"]["token"] == "secret-token"
+    assert webui_config["queue"]["redis_url"] == "redis://queue:6379/0"
 
 
 def test_merge_hot_config_rejects_unknown_keys() -> None:
@@ -274,6 +400,92 @@ def test_validate_config_reports_invalid_threshold(tmp_path: Path) -> None:
     assert validation["warnings"]
 
 
+def test_webui_config_manages_zotero_endpoints_separately(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+
+    endpoint = service.upsert_zotero_mcp_endpoint(
+        {
+            "alias": "lab-zotero",
+            "group_name": "lab",
+            "url": "http://zotero-host:23120/mcp",
+            "headers": {"Authorization": "Bearer secret"},
+            "write_note_enabled": True,
+        }
+    )
+    webui_config = read_config_yaml(service.config.data_dir / "webui-config.yaml")
+
+    assert endpoint["alias"] == "lab-zotero"
+    assert service.config.config_path.exists() is False
+    assert webui_config["integrations"]["zotero_mcp_endpoints"][0]["alias"] == "lab-zotero"
+    listed = service.list_zotero_mcp_endpoints()
+    assert listed[0]["headers"]["Authorization"] == "****"
+    assert service.get_config()["paths"]["webui_config_path"].endswith("webui-config.yaml")
+
+
+def test_nested_webui_yaml_round_trips_zotero_endpoints(tmp_path: Path) -> None:
+    path = tmp_path / "webui-config.yaml"
+    payload = {
+        "integrations": {
+            "zotero_linking_enabled": True,
+            "zotero_mcp_endpoints": [
+                {
+                    "id": "lan",
+                    "alias": "lan",
+                    "group_name": "main",
+                    "url": "http://zotero-lan:23120/mcp",
+                    "enabled": True,
+                    "priority": 10,
+                    "timeout_seconds": 5,
+                    "write_note_enabled": False,
+                    "headers": {"Authorization": "Bearer secret"},
+                }
+            ],
+        }
+    }
+
+    write_config_yaml(path, payload)
+    parsed = read_config_yaml(path)
+
+    assert parsed["integrations"]["zotero_linking_enabled"] is True
+    assert parsed["integrations"]["zotero_mcp_endpoints"][0]["group_name"] == "main"
+    assert parsed["integrations"]["zotero_mcp_endpoints"][0]["headers"]["Authorization"] == "Bearer secret"
+
+
+def test_literature_link_storage_and_field_diff(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.html"
+    result = service.register_document(str(fixture))
+    step = service.search_reaction_steps(query="triethylamine", limit=1)[0]
+
+    fields = extract_method_fields("The product was purified by column chromatography and afforded in 82% yield in dichloromethane for 2 h.")
+    diff = diff_reaction_fields(step, fields)
+    link = service.storage.upsert_literature_link(
+        {
+            "reaction_step_id": step["id"],
+            "source_document_id": result["document"]["id"],
+            "endpoint_id": "zotero-main",
+            "endpoint_alias": "main",
+            "endpoint_group": "main",
+            "zotero_item_key": "ITEM1",
+            "doi": "10.1021/acs.joc.0c00001",
+            "title": "Sample synthesis",
+            "status": "auto_linked",
+            "confidence": 0.95,
+            "match_signals": {"doi_exact": True},
+            "method_excerpt": "afforded in 82% yield",
+            "extracted_fields": fields,
+            "field_diff": diff,
+        }
+    )
+
+    assert link["status"] == "auto_linked"
+    assert link["match_signals"]["doi_exact"] is True
+    context = service.get_reaction_literature_context(step["id"])
+    assert context["links"][0]["zotero_item_key"] == "ITEM1"
+    confirmed = service.confirm_literature_link(link["id"])
+    assert confirmed["status"] == "confirmed"
+
+
 def test_admin_dashboard_contains_modern_config_controls(tmp_path: Path) -> None:
     service = make_service(tmp_path)
 
@@ -287,6 +499,10 @@ def test_admin_dashboard_contains_modern_config_controls(tmp_path: Path) -> None
     assert "data-type=\"enum\"" in html
     assert "LLM cost limit USD" in html
     assert "Parser fallback" in html
+    assert "Zotero MCP" in html
+    assert "webui-config.yaml" in html
+    assert "Start Zotero Linking" in html
+    assert "zotero_linking_enabled" in html
     assert "Unchanged when blank" in html
     assert "backdrop-filter" in html
     assert "@media (min-width: 1440px)" in html
@@ -453,6 +669,23 @@ class LegacyRunnableServer:
         self.calls += 1
 
 
+class FakeHttpAppServer:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def http_app(self, **kwargs: object) -> object:
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+
+        self.calls.append(kwargs)
+
+        async def endpoint(_request: object) -> PlainTextResponse:
+            return PlainTextResponse("ok")
+
+        return Starlette(routes=[Route(str(kwargs["path"]), endpoint)])
+
+
 def test_run_mcp_server_passes_sse_configuration() -> None:
     server = FakeRunnableServer()
 
@@ -470,6 +703,81 @@ def test_run_mcp_server_passes_sse_configuration() -> None:
             "log_level": "DEBUG",
         }
     ]
+
+
+def test_run_mcp_server_defaults_http_to_mcp_path() -> None:
+    server = FakeRunnableServer()
+
+    run_mcp_server(
+        server,
+        ServerRunConfig(transport="http", host="0.0.0.0", port=8123, log_level="DEBUG"),
+    )
+
+    assert server.calls == [
+        {
+            "transport": "http",
+            "host": "0.0.0.0",
+            "port": 8123,
+            "path": "/mcp",
+            "log_level": "DEBUG",
+        }
+    ]
+
+
+def test_run_mcp_server_maps_streamable_http_alias_to_fastmcp_http() -> None:
+    server = FakeRunnableServer()
+
+    run_mcp_server(
+        server,
+        ServerRunConfig(transport="streamable-http", host="0.0.0.0", port=8123, log_level="DEBUG"),
+    )
+
+    assert server.calls == [
+        {
+            "transport": "http",
+            "host": "0.0.0.0",
+            "port": 8123,
+            "path": "/mcp",
+            "log_level": "DEBUG",
+        }
+    ]
+
+
+def test_server_run_config_uses_mcp_path_for_http(monkeypatch: object) -> None:
+    monkeypatch.setenv("SCIFINDER_ROUTE_TRANSPORT", "http")
+    monkeypatch.setenv("SCIFINDER_ROUTE_MCP_PATH", "/mcp")
+    monkeypatch.setenv("SCIFINDER_ROUTE_SSE_PATH", "/sse")
+
+    config = ServerRunConfig.from_env()
+
+    assert config.transport == "http"
+    assert config.path == "/mcp"
+
+
+def test_server_run_config_keeps_sse_path_for_legacy_sse(monkeypatch: object) -> None:
+    monkeypatch.setenv("SCIFINDER_ROUTE_TRANSPORT", "sse")
+    monkeypatch.delenv("SCIFINDER_ROUTE_MCP_PATH", raising=False)
+    monkeypatch.setenv("SCIFINDER_ROUTE_SSE_PATH", "/sse")
+
+    config = ServerRunConfig.from_env()
+
+    assert config.transport == "sse"
+    assert config.path == "/sse"
+
+
+def test_create_dual_transport_app_mounts_mcp_and_sse() -> None:
+    server = FakeHttpAppServer()
+
+    app = create_dual_transport_app(
+        server,
+        ServerRunConfig(transport="auto", host="0.0.0.0", port=8123, mcp_path="/mcp", sse_path="/sse"),
+    )
+
+    assert server.calls == [
+        {"path": "/mcp", "transport": "http"},
+        {"path": "/sse", "transport": "sse"},
+    ]
+    assert sorted(route.path for route in app.routes) == ["/mcp", "/sse"]
 
 
 def test_run_mcp_server_stdio_falls_back_to_legacy_run() -> None:

@@ -101,6 +101,40 @@ class RouteStorage:
                     confidence REAL NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS export_batch (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    export_timestamp TEXT,
+                    status TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    merge_method TEXT NOT NULL,
+                    explanation TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS export_batch_document (
+                    id TEXT PRIMARY KEY,
+                    batch_id TEXT NOT NULL REFERENCES export_batch(id) ON DELETE CASCADE,
+                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    explanation TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(batch_id, source_document_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS export_batch_candidate (
+                    id TEXT PRIMARY KEY,
+                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
+                    candidate_batch_id TEXT NOT NULL REFERENCES export_batch(id) ON DELETE CASCADE,
+                    confidence REAL NOT NULL,
+                    explanation TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS doi_verification (
                     id TEXT PRIMARY KEY,
                     reaction_step_id TEXT NOT NULL REFERENCES reaction_step(id) ON DELETE CASCADE,
@@ -133,6 +167,79 @@ class RouteStorage:
                     status TEXT NOT NULL,
                     detail TEXT,
                     checked_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS zotero_mcp_endpoint (
+                    id TEXT PRIMARY KEY,
+                    alias TEXT NOT NULL,
+                    group_name TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    timeout_seconds REAL NOT NULL DEFAULT 10,
+                    headers TEXT NOT NULL DEFAULT '{}',
+                    write_note_enabled INTEGER NOT NULL DEFAULT 0,
+                    last_status TEXT,
+                    last_latency_ms INTEGER,
+                    last_error TEXT,
+                    last_checked_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(alias)
+                );
+
+                CREATE TABLE IF NOT EXISTS literature_link_job (
+                    id TEXT PRIMARY KEY,
+                    document_id TEXT REFERENCES source_document(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    error TEXT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS zotero_literature_link (
+                    id TEXT PRIMARY KEY,
+                    reaction_step_id TEXT NOT NULL REFERENCES reaction_step(id) ON DELETE CASCADE,
+                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
+                    endpoint_id TEXT,
+                    endpoint_alias TEXT,
+                    endpoint_group TEXT,
+                    zotero_item_key TEXT NOT NULL,
+                    zotero_attachment_key TEXT,
+                    doi TEXT,
+                    title TEXT,
+                    authors TEXT NOT NULL DEFAULT '[]',
+                    year TEXT,
+                    abstract TEXT,
+                    source_kind TEXT NOT NULL DEFAULT 'zotero',
+                    status TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    match_signals TEXT NOT NULL DEFAULT '{}',
+                    method_excerpt TEXT,
+                    si_excerpt TEXT,
+                    extracted_fields TEXT NOT NULL DEFAULT '{}',
+                    field_diff TEXT NOT NULL DEFAULT '{}',
+                    user_note TEXT,
+                    confirmed_by TEXT,
+                    confirmed_at TEXT,
+                    rejected_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(reaction_step_id, endpoint_group, zotero_item_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS zotero_writeback_log (
+                    id TEXT PRIMARY KEY,
+                    literature_link_id TEXT NOT NULL REFERENCES zotero_literature_link(id) ON DELETE CASCADE,
+                    endpoint_id TEXT,
+                    zotero_item_key TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    payload TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS evaluation_metric (
@@ -172,20 +279,74 @@ class RouteStorage:
                     confidence REAL NOT NULL,
                     source TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS rdf_reaction_record (
+                    id TEXT PRIMARY KEY,
+                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
+                    record_index INTEGER NOT NULL,
+                    registry TEXT,
+                    scheme_id TEXT,
+                    step_id TEXT,
+                    reactant_count INTEGER NOT NULL DEFAULT 0,
+                    product_count INTEGER NOT NULL DEFAULT 0,
+                    cas_reaction_number TEXT,
+                    yield_text TEXT,
+                    reagents TEXT NOT NULL DEFAULT '[]',
+                    catalysts TEXT NOT NULL DEFAULT '[]',
+                    solvents TEXT NOT NULL DEFAULT '[]',
+                    reference TEXT NOT NULL DEFAULT '{}',
+                    experimental_procedure TEXT,
+                    fields TEXT NOT NULL DEFAULT '{}',
+                    warnings TEXT NOT NULL DEFAULT '[]',
+                    deleted_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_document_id, record_index)
+                );
+
+                CREATE TABLE IF NOT EXISTS rdf_structure (
+                    id TEXT PRIMARY KEY,
+                    rdf_reaction_id TEXT NOT NULL REFERENCES rdf_reaction_record(id) ON DELETE CASCADE,
+                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    role_index INTEGER NOT NULL,
+                    name TEXT,
+                    formula TEXT,
+                    cas_rn TEXT,
+                    molfile TEXT,
+                    molfile_version TEXT,
+                    smiles TEXT,
+                    inchikey TEXT,
+                    fingerprint TEXT,
+                    rdkit_status TEXT NOT NULL DEFAULT 'not_indexed',
+                    rdkit_error TEXT,
+                    warnings TEXT NOT NULL DEFAULT '[]',
+                    deleted_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             self._migrate_schema(conn)
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(reaction_step)")}
-        migrations = {
+        reaction_columns = {row["name"] for row in conn.execute("PRAGMA table_info(reaction_step)")}
+        reaction_migrations = {
             "extraction_method": "ALTER TABLE reaction_step ADD COLUMN extraction_method TEXT NOT NULL DEFAULT 'rules'",
             "schema_version": "ALTER TABLE reaction_step ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'reaction_step.v1'",
             "llm_confidence": "ALTER TABLE reaction_step ADD COLUMN llm_confidence REAL",
             "metadata": "ALTER TABLE reaction_step ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'",
+            "deleted_at": "ALTER TABLE reaction_step ADD COLUMN deleted_at TEXT",
         }
-        for column, statement in migrations.items():
-            if column not in columns:
+        for column, statement in reaction_migrations.items():
+            if column not in reaction_columns:
+                conn.execute(statement)
+        document_columns = {row["name"] for row in conn.execute("PRAGMA table_info(source_document)")}
+        document_migrations = {
+            "deleted_at": "ALTER TABLE source_document ADD COLUMN deleted_at TEXT",
+        }
+        for column, statement in document_migrations.items():
+            if column not in document_columns:
                 conn.execute(statement)
 
     def recover_interrupted_jobs(self, *, mode: str = "queued") -> int:
@@ -267,10 +428,10 @@ class RouteStorage:
                 conn.execute(
                     """
                     INSERT INTO source_document
-                    (id, file_path, file_hash, file_type, title, doi, ingest_status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, file_path, file_hash, file_type, title, doi, scifinder_metadata, ingest_status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (document_id, file_path, file_hash, file_type, title, doi, ingest_status, now, now),
+                    (document_id, file_path, file_hash, file_type, title, doi, json.dumps({}, ensure_ascii=False), ingest_status, now, now),
                 )
                 row = conn.execute("SELECT * FROM source_document WHERE id = ?", (document_id,)).fetchone()
         return self._document_from_row(row)
@@ -379,12 +540,12 @@ class RouteStorage:
 
     def count_documents(self) -> int:
         with self.connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS total FROM source_document").fetchone()
+            row = conn.execute("SELECT COUNT(*) AS total FROM source_document WHERE deleted_at IS NULL").fetchone()
         return int(row["total"])
 
     def count_reaction_steps(self) -> int:
         with self.connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS total FROM reaction_step").fetchone()
+            row = conn.execute("SELECT COUNT(*) AS total FROM reaction_step WHERE deleted_at IS NULL").fetchone()
         return int(row["total"])
 
     def clear_document_reactions(self, document_id: str) -> None:
@@ -393,6 +554,220 @@ class RouteStorage:
             for step_id in step_ids:
                 conn.execute("DELETE FROM reaction_step_fts WHERE reaction_step_id = ?", (step_id,))
             conn.execute("DELETE FROM reaction_step WHERE source_document_id = ?", (document_id,))
+            conn.execute("DELETE FROM rdf_reaction_record WHERE source_document_id = ?", (document_id,))
+
+    def upsert_rdf_reaction_records(self, document_id: str, records: list[dict[str, Any]]) -> dict[str, int]:
+        now = utc_now()
+        inserted_records = 0
+        inserted_structures = 0
+        with self.connect() as conn:
+            conn.execute("DELETE FROM rdf_reaction_record WHERE source_document_id = ?", (document_id,))
+            for record in records:
+                reaction_id = new_id("rdfrec")
+                conn.execute(
+                    """
+                    INSERT INTO rdf_reaction_record
+                    (id, source_document_id, record_index, registry, scheme_id, step_id, reactant_count,
+                     product_count, cas_reaction_number, yield_text, reagents, catalysts, solvents, reference,
+                     experimental_procedure, fields, warnings, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        reaction_id,
+                        document_id,
+                        record.get("record_index"),
+                        record.get("registry"),
+                        record.get("scheme_id"),
+                        record.get("step_id"),
+                        int(record.get("reactant_count") or 0),
+                        int(record.get("product_count") or 0),
+                        record.get("cas_reaction_number"),
+                        record.get("yield_text"),
+                        json.dumps(record.get("reagents") or [], ensure_ascii=False),
+                        json.dumps(record.get("catalysts") or [], ensure_ascii=False),
+                        json.dumps(record.get("solvents") or [], ensure_ascii=False),
+                        json.dumps(record.get("reference") or {}, ensure_ascii=False, sort_keys=True),
+                        record.get("experimental_procedure"),
+                        json.dumps(record.get("fields") or {}, ensure_ascii=False, sort_keys=True),
+                        json.dumps(record.get("warnings") or [], ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+                inserted_records += 1
+                for molecule in record.get("molecules") or []:
+                    conn.execute(
+                        """
+                        INSERT INTO rdf_structure
+                        (id, rdf_reaction_id, source_document_id, role, role_index, name, formula, cas_rn,
+                         molfile, molfile_version, smiles, inchikey, fingerprint, rdkit_status, rdkit_error,
+                         warnings, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            new_id("rdfstr"),
+                            reaction_id,
+                            document_id,
+                            molecule.get("role") or "unknown",
+                            int(molecule.get("role_index") or 0),
+                            molecule.get("name"),
+                            molecule.get("formula"),
+                            molecule.get("cas_rn"),
+                            molecule.get("molfile"),
+                            molecule.get("molfile_version"),
+                            molecule.get("smiles"),
+                            molecule.get("inchikey"),
+                            molecule.get("fingerprint"),
+                            molecule.get("rdkit_status") or "not_indexed",
+                            molecule.get("rdkit_error"),
+                            json.dumps(molecule.get("warnings") or [], ensure_ascii=False),
+                            now,
+                            now,
+                        ),
+                    )
+                    inserted_structures += 1
+        return {"records": inserted_records, "structures": inserted_structures}
+
+    def list_rdf_reactions(self, *, document_id: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
+        clauses = [] if include_deleted else ["r.deleted_at IS NULL"]
+        params: list[Any] = []
+        if document_id:
+            clauses.append("r.source_document_id = ?")
+            params.append(document_id)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT r.*, COUNT(s.id) AS structure_count
+                FROM rdf_reaction_record r
+                LEFT JOIN rdf_structure s ON s.rdf_reaction_id = r.id AND (? OR s.deleted_at IS NULL)
+                {where}
+                GROUP BY r.id
+                ORDER BY r.source_document_id, r.record_index
+                LIMIT ? OFFSET ?
+                """,
+                (1 if include_deleted else 0, *params, limit, offset),
+            ).fetchall()
+        return [self._rdf_reaction_row_to_dict(row) for row in rows]
+
+    def get_rdf_reaction(self, reaction_id: str, *, include_deleted: bool = False) -> dict[str, Any] | None:
+        deleted_clause = "" if include_deleted else " AND deleted_at IS NULL"
+        with self.connect() as conn:
+            row = conn.execute(f"SELECT * FROM rdf_reaction_record WHERE id = ?{deleted_clause}", (reaction_id,)).fetchone()
+            if not row:
+                return None
+            structures = conn.execute(
+                f"SELECT * FROM rdf_structure WHERE rdf_reaction_id = ?{' ' if include_deleted else ' AND deleted_at IS NULL '}ORDER BY role, role_index",
+                (reaction_id,),
+            ).fetchall()
+        data = self._rdf_reaction_row_to_dict(row)
+        data["structures"] = [self._rdf_structure_row_to_dict(item) for item in structures]
+        return data
+
+    def list_rdf_structures(self, *, document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
+        clauses = [] if include_deleted else ["s.deleted_at IS NULL", "r.deleted_at IS NULL"]
+        params: list[Any] = []
+        if document_id:
+            clauses.append("s.source_document_id = ?")
+            params.append(document_id)
+        if query:
+            clauses.append("(LOWER(COALESCE(s.name,'')) LIKE ? OR LOWER(COALESCE(s.cas_rn,'')) LIKE ? OR LOWER(COALESCE(s.smiles,'')) LIKE ? OR LOWER(COALESCE(s.inchikey,'')) LIKE ?)")
+            params.extend([f"%{query.lower()}%"] * 4)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT s.*, r.record_index, r.scheme_id, r.step_id, r.cas_reaction_number, r.yield_text
+                FROM rdf_structure s
+                JOIN rdf_reaction_record r ON r.id = s.rdf_reaction_id
+                {where}
+                ORDER BY s.updated_at DESC, s.role, s.role_index
+                LIMIT ? OFFSET ?
+                """,
+                (*params, limit, offset),
+            ).fetchall()
+        return [self._rdf_structure_row_to_dict(row) for row in rows]
+
+    def list_rdf_structures_for_search(self, *, limit: int = 10000) -> list[dict[str, Any]]:
+        return self.list_rdf_structures(limit=limit)
+
+    def rdf_structure_index_status(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            total = int(conn.execute("SELECT COUNT(*) AS total FROM rdf_structure WHERE deleted_at IS NULL").fetchone()["total"])
+            indexed = int(conn.execute("SELECT COUNT(*) AS total FROM rdf_structure WHERE deleted_at IS NULL AND rdkit_status = 'indexed'").fetchone()["total"])
+            failed = int(conn.execute("SELECT COUNT(*) AS total FROM rdf_structure WHERE deleted_at IS NULL AND rdkit_status = 'rdkit_failed'").fetchone()["total"])
+            unavailable = int(conn.execute("SELECT COUNT(*) AS total FROM rdf_structure WHERE deleted_at IS NULL AND rdkit_status = 'rdkit_unavailable'").fetchone()["total"])
+            reactions = int(conn.execute("SELECT COUNT(*) AS total FROM rdf_reaction_record WHERE deleted_at IS NULL").fetchone()["total"])
+        if total == 0:
+            status = "empty"
+        elif indexed == total:
+            status = "complete"
+        elif indexed > 0:
+            status = "partial"
+        else:
+            status = "unavailable"
+        return {"status": status, "reaction_records": reactions, "total_structures": total, "indexed_structures": indexed, "failed_structures": failed, "rdkit_unavailable_structures": unavailable}
+
+    def soft_delete(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as conn:
+            if entity_type == "document":
+                conn.execute("UPDATE source_document SET deleted_at = ?, updated_at = ? WHERE id = ?", (now, now, entity_id))
+                conn.execute("UPDATE reaction_step SET deleted_at = ? WHERE source_document_id = ?", (now, entity_id))
+                conn.execute("UPDATE rdf_reaction_record SET deleted_at = ?, updated_at = ? WHERE source_document_id = ?", (now, now, entity_id))
+                conn.execute("UPDATE rdf_structure SET deleted_at = ?, updated_at = ? WHERE source_document_id = ?", (now, now, entity_id))
+            elif entity_type == "rdf_reaction":
+                conn.execute("UPDATE rdf_reaction_record SET deleted_at = ?, updated_at = ? WHERE id = ?", (now, now, entity_id))
+                conn.execute("UPDATE rdf_structure SET deleted_at = ?, updated_at = ? WHERE rdf_reaction_id = ?", (now, now, entity_id))
+            elif entity_type == "rdf_structure":
+                conn.execute("UPDATE rdf_structure SET deleted_at = ?, updated_at = ? WHERE id = ?", (now, now, entity_id))
+            elif entity_type == "reaction_step":
+                conn.execute("UPDATE reaction_step SET deleted_at = ? WHERE id = ?", (now, entity_id))
+            else:
+                raise ValueError(f"Unsupported delete entity type: {entity_type}")
+        return {"status": "trashed", "entity_type": entity_type, "entity_id": entity_id, "deleted_at": now}
+
+    def restore_trash_item(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as conn:
+            if entity_type == "document":
+                conn.execute("UPDATE source_document SET deleted_at = NULL, updated_at = ? WHERE id = ?", (now, entity_id))
+                conn.execute("UPDATE reaction_step SET deleted_at = NULL WHERE source_document_id = ?", (entity_id,))
+                conn.execute("UPDATE rdf_reaction_record SET deleted_at = NULL, updated_at = ? WHERE source_document_id = ?", (now, entity_id))
+                conn.execute("UPDATE rdf_structure SET deleted_at = NULL, updated_at = ? WHERE source_document_id = ?", (now, entity_id))
+            elif entity_type == "rdf_reaction":
+                conn.execute("UPDATE rdf_reaction_record SET deleted_at = NULL, updated_at = ? WHERE id = ?", (now, entity_id))
+                conn.execute("UPDATE rdf_structure SET deleted_at = NULL, updated_at = ? WHERE rdf_reaction_id = ?", (now, entity_id))
+            elif entity_type == "rdf_structure":
+                conn.execute("UPDATE rdf_structure SET deleted_at = NULL, updated_at = ? WHERE id = ?", (now, entity_id))
+            elif entity_type == "reaction_step":
+                conn.execute("UPDATE reaction_step SET deleted_at = NULL WHERE id = ?", (entity_id,))
+            else:
+                raise ValueError(f"Unsupported restore entity type: {entity_type}")
+        return {"status": "restored", "entity_type": entity_type, "entity_id": entity_id}
+
+    def list_trash(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            documents = conn.execute("SELECT id, title, file_path, deleted_at FROM source_document WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ?", (limit,)).fetchall()
+            reactions = conn.execute("SELECT id, cas_reaction_number AS title, source_document_id, deleted_at FROM rdf_reaction_record WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ?", (limit,)).fetchall()
+            structures = conn.execute("SELECT id, name AS title, cas_rn, rdf_reaction_id, deleted_at FROM rdf_structure WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ?", (limit,)).fetchall()
+        items: list[dict[str, Any]] = []
+        items.extend({"entity_type": "document", **dict(row)} for row in documents)
+        items.extend({"entity_type": "rdf_reaction", **dict(row)} for row in reactions)
+        items.extend({"entity_type": "rdf_structure", **dict(row)} for row in structures)
+        items.sort(key=lambda item: item.get("deleted_at") or "", reverse=True)
+        return items[:limit]
+
+    def empty_trash(self) -> dict[str, int]:
+        with self.connect() as conn:
+            structures = conn.execute("DELETE FROM rdf_structure WHERE deleted_at IS NOT NULL").rowcount
+            reactions = conn.execute("DELETE FROM rdf_reaction_record WHERE deleted_at IS NOT NULL").rowcount
+            step_ids = [row["id"] for row in conn.execute("SELECT id FROM reaction_step WHERE deleted_at IS NOT NULL")]
+            for step_id in step_ids:
+                conn.execute("DELETE FROM reaction_step_fts WHERE reaction_step_id = ?", (step_id,))
+            reaction_steps = conn.execute("DELETE FROM reaction_step WHERE deleted_at IS NOT NULL").rowcount
+            documents = conn.execute("DELETE FROM source_document WHERE deleted_at IS NOT NULL").rowcount
+        return {"documents": documents, "reaction_steps": reaction_steps, "rdf_reactions": reactions, "rdf_structures": structures}
 
     def insert_reaction_step(self, step: dict[str, Any], provenance: dict[str, Any]) -> ReactionStep:
         step_id = new_id("rxnstep")
@@ -508,7 +883,7 @@ class RouteStorage:
         min_confidence: float = 0.0,
         limit: int = 10,
     ) -> list[ReactionStep]:
-        clauses = ["r.confidence >= ?"]
+        clauses = ["r.confidence >= ?", "r.deleted_at IS NULL"]
         params: list[Any] = [min_confidence]
         if reagent:
             clauses.append("LOWER(COALESCE(r.reagent_text, '')) LIKE ?")
@@ -547,7 +922,7 @@ class RouteStorage:
 
     def get_reaction_step(self, reaction_step_id: str) -> ReactionStep | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM reaction_step WHERE id = ?", (reaction_step_id,)).fetchone()
+            row = conn.execute("SELECT * FROM reaction_step WHERE id = ? AND deleted_at IS NULL", (reaction_step_id,)).fetchone()
         return self._reaction_from_row(row) if row else None
 
     def get_provenance(self, reaction_step_id: str) -> list[Provenance]:
@@ -557,6 +932,126 @@ class RouteStorage:
                 (reaction_step_id,),
             ).fetchall()
         return [self._provenance_from_row(row) for row in rows]
+
+    def auto_batch_document(self, document_id: str) -> dict[str, Any]:
+        document = self.get_document(document_id)
+        if not document:
+            raise KeyError(f"Document not found: {document_id}")
+        existing_links = self.list_batches_for_document(document_id)
+        if existing_links:
+            return {"status": "already_linked", "batch": existing_links[0]}
+        candidate = self._best_batch_candidate(document)
+        if candidate and candidate["confidence"] >= 0.85:
+            self._link_document_to_batch(candidate["batch_id"], document_id, document_role(document.file_type), candidate["confidence"], candidate["explanation"])
+            return {"status": "auto_merged", "batch_id": candidate["batch_id"], "confidence": candidate["confidence"], "explanation": candidate["explanation"]}
+        if candidate and candidate["confidence"] >= 0.55:
+            self._record_batch_candidate(document_id, candidate["batch_id"], candidate["confidence"], candidate["explanation"])
+            return {"status": "candidate", "batch_id": candidate["batch_id"], "confidence": candidate["confidence"], "explanation": candidate["explanation"]}
+        batch_id = self._create_export_batch(document.title, status="auto_merged", confidence=1.0, merge_method="single_document", explanation={"signals": [{"name": "first_document", "matched": True}]})
+        self._link_document_to_batch(batch_id, document_id, document_role(document.file_type), 1.0, {"signals": [{"name": "first_document", "matched": True}]})
+        return {"status": "created", "batch_id": batch_id, "confidence": 1.0}
+
+    def list_batches_for_document(self, document_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT b.*, bd.role, bd.confidence AS document_confidence, bd.explanation AS document_explanation
+                FROM export_batch_document bd
+                JOIN export_batch b ON b.id = bd.batch_id
+                WHERE bd.source_document_id = ?
+                ORDER BY bd.confidence DESC, b.updated_at DESC
+                """,
+                (document_id,),
+            ).fetchall()
+        return [batch_row_to_dict(row) for row in rows]
+
+    def list_export_batches(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM export_batch ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+        return [plain_batch_row_to_dict(row) for row in rows]
+
+    def get_export_batch(self, batch_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            batch = conn.execute("SELECT * FROM export_batch WHERE id = ?", (batch_id,)).fetchone()
+            if not batch:
+                return None
+            documents = conn.execute(
+                """
+                SELECT d.*, bd.role, bd.confidence AS link_confidence, bd.explanation AS link_explanation
+                FROM export_batch_document bd
+                JOIN source_document d ON d.id = bd.source_document_id
+                WHERE bd.batch_id = ?
+                ORDER BY bd.role, d.created_at
+                """,
+                (batch_id,),
+            ).fetchall()
+        data = plain_batch_row_to_dict(batch)
+        data["documents"] = [{key: json.loads(row[key]) if key in {"scifinder_metadata", "link_explanation"} and row[key] else row[key] for key in row.keys()} for row in documents]
+        return data
+
+    def unlink_document_from_batch(self, document_id: str, batch_id: str, reason: str = "") -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM export_batch_document WHERE source_document_id = ? AND batch_id = ?", (document_id, batch_id))
+            row = conn.execute("SELECT explanation FROM export_batch WHERE id = ?", (batch_id,)).fetchone()
+            explanation = json.loads(row["explanation"]) if row and row["explanation"] else {}
+            explanation["last_unlink_reason"] = reason
+            conn.execute("UPDATE export_batch SET updated_at = ?, explanation = ? WHERE id = ?", (utc_now(), json.dumps(explanation, ensure_ascii=False, sort_keys=True), batch_id))
+        return {"status": "unlinked", "document_id": document_id, "batch_id": batch_id, "reason": reason}
+
+    def _best_batch_candidate(self, document: SourceDocument) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT b.id AS batch_id, b.title, d.file_path, d.file_type, d.title AS document_title
+                FROM export_batch b
+                JOIN export_batch_document bd ON bd.batch_id = b.id
+                JOIN source_document d ON d.id = bd.source_document_id
+                ORDER BY b.updated_at DESC
+                LIMIT 100
+                """
+            ).fetchall()
+        best: dict[str, Any] | None = None
+        for row in rows:
+            score, explanation = batch_match_score(document, row)
+            if not best or score > best["confidence"]:
+                best = {"batch_id": row["batch_id"], "confidence": score, "explanation": explanation}
+        return best
+
+    def _create_export_batch(self, title: str | None, *, status: str, confidence: float, merge_method: str, explanation: dict[str, Any]) -> str:
+        batch_id = new_id("batch")
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO export_batch (id, title, export_timestamp, status, confidence, merge_method, explanation, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (batch_id, title, None, status, confidence, merge_method, json.dumps(explanation, ensure_ascii=False, sort_keys=True), now, now),
+            )
+        return batch_id
+
+    def _link_document_to_batch(self, batch_id: str, document_id: str, role: str, confidence: float, explanation: dict[str, Any]) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO export_batch_document (id, batch_id, source_document_id, role, confidence, explanation, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (new_id("batchdoc"), batch_id, document_id, role, confidence, json.dumps(explanation, ensure_ascii=False, sort_keys=True), now),
+            )
+            conn.execute("UPDATE export_batch SET updated_at = ?, confidence = MAX(confidence, ?) WHERE id = ?", (now, confidence, batch_id))
+
+    def _record_batch_candidate(self, document_id: str, batch_id: str, confidence: float, explanation: dict[str, Any]) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO export_batch_candidate (id, source_document_id, candidate_batch_id, confidence, explanation, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (new_id("batchcand"), document_id, batch_id, confidence, json.dumps(explanation, ensure_ascii=False, sort_keys=True), now, now),
+            )
 
     def add_provenance(self, reaction_step_id: str, source_document_id: str, *, text_span: str, parser_name: str, parser_version: str = "external", page_number: int | None = None, image_region_path: str | None = None, ocr_output: str | None = None, confidence: float = 0.0) -> Provenance:
         provenance_id = new_id("prov")
@@ -627,6 +1122,7 @@ class RouteStorage:
                 SELECT r.*, d.file_path, d.title, d.doi
                 FROM reaction_step r
                 JOIN source_document d ON d.id = r.source_document_id
+                WHERE r.deleted_at IS NULL AND d.deleted_at IS NULL
                 ORDER BY d.created_at ASC, r.step_index ASC
                 LIMIT ?
                 """,
@@ -637,7 +1133,7 @@ class RouteStorage:
 
     def list_reaction_steps_for_index(self, limit: int = 10000) -> list[ReactionStep]:
         with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM reaction_step ORDER BY created_at ASC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute("SELECT * FROM reaction_step WHERE deleted_at IS NULL ORDER BY created_at ASC LIMIT ?", (limit,)).fetchall()
         return [self._reaction_from_row(row) for row in rows]
 
     def upsert_embedding(self, reaction_step_id: str, *, model: str, embedding: list[float], error: str | None = None) -> None:
@@ -655,10 +1151,10 @@ class RouteStorage:
 
     def vector_index_status(self) -> dict[str, Any]:
         with self.connect() as conn:
-            total = conn.execute("SELECT COUNT(*) AS total FROM reaction_step").fetchone()["total"]
-            indexed = conn.execute("SELECT COUNT(*) AS total FROM vector_index WHERE error IS NULL").fetchone()["total"]
+            total = conn.execute("SELECT COUNT(*) AS total FROM reaction_step WHERE deleted_at IS NULL").fetchone()["total"]
+            indexed = conn.execute("SELECT COUNT(*) AS total FROM vector_index v JOIN reaction_step r ON r.id = v.reaction_step_id WHERE v.error IS NULL AND r.deleted_at IS NULL").fetchone()["total"]
             last = conn.execute("SELECT * FROM vector_index ORDER BY updated_at DESC LIMIT 1").fetchone()
-            errors = conn.execute("SELECT COUNT(*) AS total FROM vector_index WHERE error IS NOT NULL").fetchone()["total"]
+            errors = conn.execute("SELECT COUNT(*) AS total FROM vector_index v JOIN reaction_step r ON r.id = v.reaction_step_id WHERE v.error IS NOT NULL AND r.deleted_at IS NULL").fetchone()["total"]
         return {
             "total_steps": int(total),
             "indexed_steps": int(indexed),
@@ -670,7 +1166,7 @@ class RouteStorage:
 
     def semantic_search(self, embedding: list[float], *, limit: int = 10) -> list[tuple[ReactionStep, float]]:
         with self.connect() as conn:
-            rows = conn.execute("SELECT reaction_step_id, embedding FROM vector_index WHERE error IS NULL").fetchall()
+            rows = conn.execute("SELECT v.reaction_step_id, v.embedding FROM vector_index v JOIN reaction_step r ON r.id = v.reaction_step_id WHERE v.error IS NULL AND r.deleted_at IS NULL").fetchall()
         scored: list[tuple[ReactionStep, float]] = []
         for row in rows:
             try:
@@ -708,15 +1204,145 @@ class RouteStorage:
 
     def count_ocr_backlog(self) -> int:
         with self.connect() as conn:
-            return int(conn.execute("SELECT COUNT(*) AS total FROM reaction_step WHERE needs_ocr = 1").fetchone()["total"])
+            return int(conn.execute("SELECT COUNT(*) AS total FROM reaction_step WHERE needs_ocr = 1 AND deleted_at IS NULL").fetchone()["total"])
 
     def low_confidence_doi_queue(self, threshold: float, limit: int = 50) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM reaction_step WHERE confidence < ? OR verification_status != 'doi_verified' ORDER BY confidence ASC LIMIT ?",
+                "SELECT * FROM reaction_step WHERE deleted_at IS NULL AND (confidence < ? OR verification_status != 'doi_verified') ORDER BY confidence ASC LIMIT ?",
                 (threshold, limit),
             ).fetchall()
         return [self._reaction_from_row(row).to_dict() for row in rows]
+
+    def upsert_zotero_endpoint(self, data: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        endpoint_id = str(data.get("id") or data.get("alias") or new_id("zotep")).strip()
+        alias = str(data.get("alias") or endpoint_id).strip()
+        group_name = str(data.get("group_name") or data.get("group") or alias).strip()
+        url = str(data.get("url") or "").strip()
+        headers = data.get("headers") if isinstance(data.get("headers"), dict) else {}
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO zotero_mcp_endpoint
+                (id, alias, group_name, url, enabled, priority, timeout_seconds, headers, write_note_enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET alias = excluded.alias, group_name = excluded.group_name,
+                  url = excluded.url, enabled = excluded.enabled, priority = excluded.priority,
+                  timeout_seconds = excluded.timeout_seconds, headers = excluded.headers,
+                  write_note_enabled = excluded.write_note_enabled, updated_at = excluded.updated_at
+                """,
+                (endpoint_id, alias, group_name, url, 1 if data.get("enabled", True) else 0, int(data.get("priority") or 100), float(data.get("timeout_seconds") or 10), json.dumps(headers, ensure_ascii=False, sort_keys=True), 1 if data.get("write_note_enabled") else 0, now, now),
+            )
+            row = conn.execute("SELECT * FROM zotero_mcp_endpoint WHERE id = ?", (endpoint_id,)).fetchone()
+        return endpoint_row_to_dict(row, include_headers=True)
+
+    def list_zotero_endpoints(self, *, include_headers: bool = False) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM zotero_mcp_endpoint ORDER BY group_name, priority, alias").fetchall()
+        return [endpoint_row_to_dict(row, include_headers=include_headers) for row in rows]
+
+    def delete_zotero_endpoint(self, endpoint_id: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            count = conn.execute("DELETE FROM zotero_mcp_endpoint WHERE id = ?", (endpoint_id,)).rowcount
+        return {"status": "deleted", "id": endpoint_id, "deleted": count}
+
+    def update_zotero_endpoint_status(self, endpoint_id: str, *, status: str, latency_ms: int | None = None, error: str | None = None) -> dict[str, Any] | None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("UPDATE zotero_mcp_endpoint SET last_status = ?, last_latency_ms = ?, last_error = ?, last_checked_at = ?, updated_at = ? WHERE id = ?", (status, latency_ms, error, now, now, endpoint_id))
+            row = conn.execute("SELECT * FROM zotero_mcp_endpoint WHERE id = ?", (endpoint_id,)).fetchone()
+        return endpoint_row_to_dict(row, include_headers=False) if row else None
+
+    def create_literature_link_job(self, document_id: str | None = None, *, status: str = "queued", stage: str = "queued") -> dict[str, Any]:
+        job_id = new_id("litjob")
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("INSERT INTO literature_link_job (id, document_id, status, stage, started_at, created_at) VALUES (?, ?, ?, ?, ?, ?)", (job_id, document_id, status, stage, now if status == "running" else None, now))
+            row = conn.execute("SELECT * FROM literature_link_job WHERE id = ?", (job_id,)).fetchone()
+        return job_row_to_dict(row)
+
+    def update_literature_link_job(self, job_id: str, *, status: str, stage: str, error: str | None = None) -> dict[str, Any] | None:
+        finished_at = utc_now() if status in {"completed", "failed"} else None
+        started_at = utc_now() if status == "running" else None
+        with self.connect() as conn:
+            conn.execute("UPDATE literature_link_job SET status = ?, stage = ?, error = ?, started_at = COALESCE(started_at, ?), finished_at = COALESCE(?, finished_at) WHERE id = ?", (status, stage, error, started_at, finished_at, job_id))
+            row = conn.execute("SELECT * FROM literature_link_job WHERE id = ?", (job_id,)).fetchone()
+        return job_row_to_dict(row) if row else None
+
+    def list_literature_link_jobs(self, *, status: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if status:
+                rows = conn.execute("SELECT * FROM literature_link_job WHERE status = ? ORDER BY created_at DESC LIMIT ?", (status, limit)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM literature_link_job ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [job_row_to_dict(row) for row in rows]
+
+    def list_reaction_steps_for_document(self, document_id: str | None = None, *, limit: int = 100) -> list[ReactionStep]:
+        with self.connect() as conn:
+            if document_id:
+                rows = conn.execute("SELECT * FROM reaction_step WHERE source_document_id = ? AND deleted_at IS NULL ORDER BY step_index ASC LIMIT ?", (document_id, limit)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM reaction_step WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [self._reaction_from_row(row) for row in rows]
+
+    def upsert_literature_link(self, data: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        link_id = str(data.get("id") or "") or new_id("litlink")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO zotero_literature_link
+                (id, reaction_step_id, source_document_id, endpoint_id, endpoint_alias, endpoint_group, zotero_item_key,
+                 zotero_attachment_key, doi, title, authors, year, abstract, source_kind, status, confidence,
+                 match_signals, method_excerpt, si_excerpt, extracted_fields, field_diff, user_note, confirmed_by,
+                 confirmed_at, rejected_reason, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(reaction_step_id, endpoint_group, zotero_item_key) DO UPDATE SET
+                  endpoint_id = excluded.endpoint_id, endpoint_alias = excluded.endpoint_alias, doi = excluded.doi,
+                  title = excluded.title, authors = excluded.authors, year = excluded.year, abstract = excluded.abstract,
+                  status = CASE WHEN zotero_literature_link.status = 'confirmed' THEN 'confirmed' ELSE excluded.status END,
+                  confidence = MAX(zotero_literature_link.confidence, excluded.confidence), match_signals = excluded.match_signals,
+                  method_excerpt = excluded.method_excerpt, si_excerpt = excluded.si_excerpt, extracted_fields = excluded.extracted_fields,
+                  field_diff = excluded.field_diff, updated_at = excluded.updated_at
+                """,
+                (link_id, data["reaction_step_id"], data["source_document_id"], data.get("endpoint_id"), data.get("endpoint_alias"), data.get("endpoint_group"), data["zotero_item_key"], data.get("zotero_attachment_key"), data.get("doi"), data.get("title"), json.dumps(data.get("authors") or [], ensure_ascii=False), data.get("year"), data.get("abstract"), data.get("source_kind") or "zotero", data.get("status") or "candidate", float(data.get("confidence") or 0), json.dumps(data.get("match_signals") or {}, ensure_ascii=False, sort_keys=True), data.get("method_excerpt"), data.get("si_excerpt"), json.dumps(data.get("extracted_fields") or {}, ensure_ascii=False, sort_keys=True), json.dumps(data.get("field_diff") or {}, ensure_ascii=False, sort_keys=True), data.get("user_note"), data.get("confirmed_by"), data.get("confirmed_at"), data.get("rejected_reason"), now, now),
+            )
+            row = conn.execute("SELECT * FROM zotero_literature_link WHERE reaction_step_id = ? AND endpoint_group = ? AND zotero_item_key = ?", (data["reaction_step_id"], data.get("endpoint_group"), data["zotero_item_key"])).fetchone()
+        return literature_link_row_to_dict(row)
+
+    def list_literature_links(self, *, status: str = "", reaction_step_id: str = "", document_id: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if reaction_step_id:
+            clauses.append("reaction_step_id = ?")
+            params.append(reaction_step_id)
+        if document_id:
+            clauses.append("source_document_id = ?")
+            params.append(document_id)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(f"SELECT * FROM zotero_literature_link {where} ORDER BY confidence DESC, updated_at DESC LIMIT ?", (*params, limit)).fetchall()
+        return [literature_link_row_to_dict(row) for row in rows]
+
+    def update_literature_link_status(self, link_id: str, *, status: str, confirmed_by: str | None = None, reason: str | None = None) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("UPDATE zotero_literature_link SET status = ?, confirmed_by = COALESCE(?, confirmed_by), confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END, rejected_reason = ?, updated_at = ? WHERE id = ?", (status, confirmed_by, status, now, reason, now, link_id))
+            row = conn.execute("SELECT * FROM zotero_literature_link WHERE id = ?", (link_id,)).fetchone()
+        if not row:
+            raise KeyError(f"Literature link not found: {link_id}")
+        return literature_link_row_to_dict(row)
+
+    def record_zotero_writeback(self, *, literature_link_id: str, endpoint_id: str | None, zotero_item_key: str, operation: str, payload: dict[str, Any], status: str, error: str | None = None) -> dict[str, Any]:
+        log_id = new_id("zwb")
+        created_at = utc_now()
+        with self.connect() as conn:
+            conn.execute("INSERT INTO zotero_writeback_log (id, literature_link_id, endpoint_id, zotero_item_key, operation, payload, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (log_id, literature_link_id, endpoint_id, zotero_item_key, operation, json.dumps(payload, ensure_ascii=False, sort_keys=True), status, error, created_at))
+        return {"id": log_id, "literature_link_id": literature_link_id, "endpoint_id": endpoint_id, "zotero_item_key": zotero_item_key, "operation": operation, "payload": payload, "status": status, "error": error, "created_at": created_at}
 
     def record_evaluation_metrics(self, gold_set_path: str, metrics: dict[str, Any]) -> dict[str, Any]:
         metric_id = new_id("metric")
@@ -845,6 +1471,7 @@ class RouteStorage:
             file_type=row["file_type"],
             title=row["title"],
             doi=row["doi"],
+            scifinder_metadata=json.loads(row["scifinder_metadata"]) if "scifinder_metadata" in row.keys() and row["scifinder_metadata"] else {},
             ingest_status=row["ingest_status"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -917,6 +1544,120 @@ class RouteStorage:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    def _rdf_reaction_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = {key: row[key] for key in row.keys()}
+        for key in ["reagents", "catalysts", "solvents", "warnings"]:
+            data[key] = json.loads(data[key]) if data.get(key) else []
+        for key in ["reference", "fields"]:
+            data[key] = json.loads(data[key]) if data.get(key) else {}
+        return data
+
+    def _rdf_structure_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = {key: row[key] for key in row.keys()}
+        data["warnings"] = json.loads(data["warnings"]) if data.get("warnings") else []
+        return data
+
+
+def document_role(file_type: str) -> str:
+    mapping = {
+        "rdf": "structured_rdf",
+        "pdf": "readable_pdf",
+        "rtf": "readable_rtf",
+        "html": "readable_html",
+        "htm": "readable_html",
+        "mhtml": "readable_html",
+        "mht": "readable_html",
+        "md": "markdown",
+        "markdown": "markdown",
+        "txt": "text",
+    }
+    return mapping.get(file_type.lower(), "unknown")
+
+
+def batch_match_score(document: SourceDocument, row: sqlite3.Row) -> tuple[float, dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
+    score = 0.0
+    document_stem = Path(document.file_path).stem.lower()
+    other_stem = Path(row["file_path"]).stem.lower()
+    if document_stem and other_stem:
+        similarity = stem_similarity(document_stem, other_stem)
+        if similarity >= 0.75:
+            weight = 0.7
+            score += weight
+            signals.append({"name": "basename_similarity", "weight": weight, "matched": True, "detail": f"{document_stem} ~ {other_stem}"})
+    if document.title and row["document_title"] and normalize_for_match(document.title) == normalize_for_match(row["document_title"]):
+        weight = 0.25
+        score += weight
+        signals.append({"name": "title_exact_match", "weight": weight, "matched": True, "detail": document.title})
+    if document.file_type != row["file_type"] and {document.file_type, row["file_type"]} & {"rdf"}:
+        weight = 0.2
+        score += weight
+        signals.append({"name": "rdf_readable_pair", "weight": weight, "matched": True, "detail": f"{document.file_type}+{row['file_type']}"})
+    explanation = {"signals": signals, "score": round(min(score, 1.0), 3)}
+    return min(score, 1.0), explanation
+
+
+def stem_similarity(left: str, right: str) -> float:
+    left_tokens = {token for token in re_split_stem(left) if token}
+    right_tokens = {token for token in re_split_stem(right) if token}
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def re_split_stem(value: str) -> list[str]:
+    import re
+
+    return re.split(r"[^a-z0-9]+", value.lower())
+
+
+def normalize_for_match(value: str) -> str:
+    return " ".join(value.lower().split())
+
+
+def plain_batch_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = {key: row[key] for key in row.keys()}
+    data["explanation"] = json.loads(data["explanation"]) if data.get("explanation") else {}
+    return data
+
+
+def batch_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = plain_batch_row_to_dict(row)
+    if data.get("document_explanation"):
+        data["document_explanation"] = json.loads(data["document_explanation"])
+    return data
+
+
+def endpoint_row_to_dict(row: sqlite3.Row, *, include_headers: bool = False) -> dict[str, Any]:
+    headers = json.loads(row["headers"]) if row["headers"] else {}
+    return {
+        "id": row["id"],
+        "alias": row["alias"],
+        "group_name": row["group_name"],
+        "url": row["url"],
+        "enabled": bool(row["enabled"]),
+        "priority": row["priority"],
+        "timeout_seconds": row["timeout_seconds"],
+        "headers": headers if include_headers else {key: "****" for key in headers},
+        "write_note_enabled": bool(row["write_note_enabled"]),
+        "last_status": row["last_status"],
+        "last_latency_ms": row["last_latency_ms"],
+        "last_error": row["last_error"],
+        "last_checked_at": row["last_checked_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def job_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
+
+
+def literature_link_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    json_fields = {"authors", "match_signals", "extracted_fields", "field_diff"}
+    data = {key: json.loads(row[key]) if key in json_fields and row[key] else row[key] for key in row.keys()}
+    return data
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:

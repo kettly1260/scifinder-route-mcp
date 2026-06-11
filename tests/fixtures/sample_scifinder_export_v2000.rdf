@@ -1,0 +1,34 @@
+$RDFILE 1
+$DATM 06/12/2026 00:18:00
+$RFMT $RIREG SCHEME2 STEP1
+$RXN
+
+
+
+  1  1
+$MOL
+ethanol
+C2H6O
+64-17-5 Copyright (C) 2025 ACS
+  CDK     0612260000
+
+  1  0  0  0  0  0            999 V2000
+    0.0000    0.0000    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0
+M  END
+$MOL
+acetaldehyde
+C2H4O
+75-07-0 Copyright (C) 2025 ACS
+  CDK     0612260000
+
+  1  0  0  0  0  0            999 V2000
+    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+M  END
+$DTYPE RXN:RCT(1):CAS_RN
+$DATUM 64-17-5
+$DTYPE RXN:PRO(1):CAS_RN
+$DATUM 75-07-0
+$DTYPE RXN:VAR(1):CAS_Reaction_Number
+$DATUM 31-614-CAS-V2000
+$DTYPE RXN:VAR(1):PRO(1):YIELD
+$DATUM 55

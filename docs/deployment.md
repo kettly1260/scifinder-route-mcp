@@ -50,6 +50,39 @@ Recreate after port changes:
 docker compose -f docker-compose.image.yml up -d
 ```
 
+## MCP Transport
+
+The Docker profiles default to adaptive MCP transport mode:
+
+```env
+SCIFINDER_ROUTE_TRANSPORT=auto
+SCIFINDER_ROUTE_MCP_PATH=/mcp
+SCIFINDER_ROUTE_SSE_PATH=/sse
+```
+
+In `auto` mode, the same container and port expose both MCP endpoints:
+
+```text
+http://<nas-host>:8000/mcp  Streamable HTTP for modern MCP clients
+http://<nas-host>:8000/sse  Legacy SSE for older MCP clients
+```
+
+FastMCP handles the Streamable HTTP JSON-RPC endpoint, including `initialize`, `tools/list`, and `tools/call`; `GET /mcp` follows FastMCP's implementation of the MCP Streamable HTTP session behavior.
+
+For debugging or strict client compatibility, force a single transport explicitly:
+
+```env
+SCIFINDER_ROUTE_TRANSPORT=http
+SCIFINDER_ROUTE_MCP_PATH=/mcp
+```
+
+or:
+
+```env
+SCIFINDER_ROUTE_TRANSPORT=sse
+SCIFINDER_ROUTE_SSE_PATH=/sse
+```
+
 ## Volumes
 
 ```text

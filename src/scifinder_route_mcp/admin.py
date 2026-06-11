@@ -51,6 +51,53 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(admin_state(self.server.service))
             return
+        if parsed.path == "/api/rdf/reactions":
+            try:
+                self._require_role("viewer")
+                query = parse_qs(parsed.query)
+                self._send_json(self.server.service.list_rdf_reactions(document_id=first_query(query, "document_id"), limit=int(first_query(query, "limit", "50")), offset=int(first_query(query, "offset", "0"))))
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/rdf/structures":
+            try:
+                self._require_role("viewer")
+                query = parse_qs(parsed.query)
+                self._send_json(self.server.service.list_rdf_structures(document_id=first_query(query, "document_id"), query=first_query(query, "q"), limit=int(first_query(query, "limit", "50")), offset=int(first_query(query, "offset", "0"))))
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path.startswith("/api/rdf/reactions/"):
+            try:
+                self._require_role("viewer")
+                reaction_id = parsed.path.rsplit("/", 1)[-1]
+                self._send_json(self.server.service.get_rdf_reaction(reaction_id))
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/chem/status":
+            try:
+                self._require_role("viewer")
+                self._send_json(self.server.service.get_chem_status())
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            return
+        if parsed.path == "/api/trash":
+            try:
+                self._require_role("viewer")
+                query = parse_qs(parsed.query)
+                self._send_json(self.server.service.list_trash(limit=int(first_query(query, "limit", "100"))))
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
@@ -95,6 +142,34 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._require_role("operator")
                 payload = self._read_json()
                 self._send_json(self.server.service.test_integration_endpoint(str(payload.get("kind") or "")))
+                return
+            if parsed.path == "/api/chem/install-rdkit":
+                self._require_role("admin")
+                self._send_json(self.server.service.install_rdkit_async())
+                return
+            if parsed.path == "/api/chem/similarity-search":
+                self._require_role("viewer")
+                payload = self._read_json()
+                self._send_json(self.server.service.similarity_search_structures(str(payload.get("query") or ""), query_type=str(payload.get("query_type") or "smiles"), min_similarity=float(payload.get("min_similarity") or 0.2), limit=int(payload.get("limit") or 20)))
+                return
+            if parsed.path == "/api/chem/substructure-search":
+                self._require_role("viewer")
+                payload = self._read_json()
+                self._send_json(self.server.service.substructure_search_structures(str(payload.get("query") or ""), query_type=str(payload.get("query_type") or "smarts"), limit=int(payload.get("limit") or 20)))
+                return
+            if parsed.path == "/api/trash/delete":
+                self._require_role("operator")
+                payload = self._read_json()
+                self._send_json(self.server.service.trash_item(str(payload.get("entity_type") or ""), str(payload.get("entity_id") or "")))
+                return
+            if parsed.path == "/api/trash/restore":
+                self._require_role("operator")
+                payload = self._read_json()
+                self._send_json(self.server.service.restore_trash_item(str(payload.get("entity_type") or ""), str(payload.get("entity_id") or "")))
+                return
+            if parsed.path == "/api/trash/empty":
+                self._require_role("admin")
+                self._send_json(self.server.service.empty_trash())
                 return
         except PermissionError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
@@ -184,8 +259,9 @@ def render_dashboard(service: RouteService) -> str:
     validation = state["validation"]
     production = state["production"]
     vector = production["vector_index"]
+    chem = production.get("chem", {})
     usage_rows = "".join(f"<tr><td>{escape(name)}</td><td>{escape(item['files'])}</td><td>{escape(item['bytes'])}</td></tr>" for name, item in production["storage_usage"].items())
-    endpoint_buttons = "".join(f"<button type='button' onclick=\"testEndpoint('{kind}')\">Test {label}</button>" for kind, label in [("llm", "LLM"), ("embedding", "Embedding"), ("ocr", "OCR"), ("document_parser", "Parser"), ("structure_recognition", "Structure"), ("postgres", "Postgres")])
+    endpoint_buttons = "".join(f"<button type='button' onclick=\"testEndpoint('{kind}')\">Test {label}</button>" for kind, label in [("llm", "LLM"), ("embedding", "Embedding"), ("ocr", "OCR"), ("document_parser", "Parser"), ("structure_recognition", "Structure"), ("postgres", "Postgres"), ("zotero_mcp", "Zotero MCP")])
     warnings = "".join(f"<li>{escape(item)}</li>" for item in validation["warnings"]) or "<li>No config warnings</li>"
     return f"""<!doctype html>
 <html lang="en">
@@ -238,7 +314,12 @@ def render_dashboard(service: RouteService) -> str:
           <label>Structure recognition endpoint <input name="structure_recognition_endpoint" data-section="integrations" placeholder="http://decimer:9300"></label>
           <label>Structure recognition model <input name="structure_recognition_model" data-section="integrations" placeholder="decimer|molscribe|osra"></label>
           <label>LLM enabled <select name="llm_enabled" data-section="integrations" data-type="bool"><option value="false">false</option><option value="true">true</option></select></label>
+          <label>Zotero linking <select name="zotero_linking_enabled" data-section="integrations" data-type="bool"><option value="false">false</option><option value="true">true</option></select></label>
+          <label>Zotero on import <select name="zotero_linking_on_import" data-section="integrations" data-type="bool"><option value="true">true</option><option value="false">false</option></select></label>
+          <label>Zotero extraction <select name="zotero_extraction_strategy" data-section="integrations" data-type="enum"><option value="rules_first">rules_first</option><option value="llm_first">llm_first</option><option value="rules_only">rules_only</option></select></label>
+          <label>LLM priority terms <input name="zotero_llm_priority_terms" data-section="integrations" data-type="list" placeholder="scale,purification,SI"></label>
         </div>
+        <p class="hint">Web UI changes are saved to {escape((state['config'].get('paths') or {}).get('webui_config_path'))}, separate from the container startup config.</p>
       </form>
 
       <form class="panel glass" onsubmit="saveConfig(event)">
@@ -267,8 +348,17 @@ def render_dashboard(service: RouteService) -> str:
       <section class="panel glass"><div class="panel-title"><div><p class="eyebrow">Endpoint Health</p><h2>External APIs</h2></div></div><div class="button-row">{endpoint_buttons}</div><pre>{escape(json.dumps(health.get('integrations', []), indent=2))}</pre></section>
     </section>
 
+    <section class="panel glass"><div class="panel-title"><div><p class="eyebrow">Zotero MCP</p><h2>Literature Endpoints</h2></div><div><button onclick="saveZoteroEndpoint()">Save Endpoint</button> <button onclick="loadZoteroEndpoints()">Reload</button></div></div><div class="form-grid"><label>Alias <input id="zoteroAlias" placeholder="lab-zotero"></label><label>Group <input id="zoteroGroup" placeholder="primary-library"></label><label>URL <input id="zoteroUrl" placeholder="http://host:23120/mcp"></label><label>Priority <input id="zoteroPriority" type="number" value="100"></label><label>Timeout seconds <input id="zoteroTimeout" type="number" value="10" step="0.5"></label><label>Enabled <select id="zoteroEnabled"><option value="true">true</option><option value="false">false</option></select></label><label>Allow note writeback <select id="zoteroWriteNote"><option value="false">false</option><option value="true">true</option></select></label><label>Headers JSON <input id="zoteroHeaders" placeholder='{{"Authorization":"Bearer ..."}}'></label></div><div id="zoteroEndpoints" class="table-wrap"></div></section>
+
     <section class="grid two">
-      <section class="panel glass"><p class="eyebrow">OCR / DOI Review</p><h2>Backlogs</h2><pre>OCR backlog: {escape(health['ocr_backlog'])}\nLow-confidence DOI queue: {escape(len(production['doi_low_confidence_queue']))}</pre></section>
+      <section class="panel glass"><div class="panel-title"><div><p class="eyebrow">Chem Search</p><h2>RDKit Structures</h2></div><button onclick="installRdkit()">Install RDKit</button></div><pre>{escape(json.dumps(chem, indent=2))}</pre><div class="form-grid"><label>Query <input id="chemQuery" placeholder="SMILES, SMARTS, or CAS/name"></label><label>Mode <select id="chemMode"><option value="similarity">similarity</option><option value="substructure">substructure</option><option value="text">text filter</option></select></label></div><button onclick="runChemSearch()">Search Structures</button><div id="chemResults" class="table-wrap"></div></section>
+      <section class="panel glass"><div class="panel-title"><div><p class="eyebrow">RDF Viewer</p><h2>Reaction Records</h2></div><button onclick="loadRdfReactions()">Load</button></div><div class="form-grid"><label>Document ID <input id="rdfDocumentId" placeholder="optional"></label><label>Limit <input id="rdfLimit" type="number" value="25" min="1"></label></div><div id="rdfReactions" class="table-wrap"></div><pre id="rdfDetail">Select a reaction to inspect molfile blocks.</pre></section>
+    </section>
+
+    <section class="panel glass"><div class="panel-title"><div><p class="eyebrow">Trash</p><h2>Recycle Bin</h2></div><div><button onclick="loadTrash()">Load Trash</button> <button onclick="emptyTrash()">Empty Trash</button></div></div><div id="trashList" class="table-wrap"></div></section>
+
+    <section class="grid two">
+      <section class="panel glass"><div class="panel-title"><div><p class="eyebrow">OCR / DOI / Literature</p><h2>Backlogs</h2></div><div><button onclick="startLiteratureLinking()">Start Zotero Linking</button> <button onclick="loadLiterature()">Load Links</button></div></div><pre>OCR backlog: {escape(health['ocr_backlog'])}\nLow-confidence DOI queue: {escape(len(production['doi_low_confidence_queue']))}\nLiterature candidates: {escape(len(production.get('literature_candidates', [])))}</pre><div class="form-grid"><label>Document ID <input id="literatureDocumentId" placeholder="optional"></label></div><h3>Literature Jobs</h3><div id="literatureJobs" class="table-wrap"></div><h3>Candidate Links</h3><div id="literatureLinks" class="table-wrap"></div></section>
       <section class="panel glass"><p class="eyebrow">Evaluation</p><h2>Latest Metrics</h2><pre>{escape(json.dumps(production['evaluation'], indent=2))}</pre></section>
     </section>
 
@@ -302,6 +392,11 @@ def short_path(value: str) -> str:
 
 def safe_upload_name(value: str) -> str:
     return "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in os.path.basename(value)) or "upload.bin"
+
+
+def first_query(query: dict[str, list[str]], key: str, default: str = "") -> str:
+    values = query.get(key)
+    return values[0] if values else default
 
 
 def parse_multipart_upload(content_type: str, body: bytes) -> tuple[str, bytes]:
@@ -371,4 +466,25 @@ async function rebuildVector(){try{const data=await post('/api/vector/rebuild',{
 async function backupDb(){try{const data=await post('/api/backup',{});alert(JSON.stringify(data,null,2));location.reload()}catch(err){alert(err.message)}}
 async function cleanupDryRun(){try{const data=await post('/api/cleanup',{dry_run:true});alert(JSON.stringify(data,null,2))}catch(err){alert(err.message)}}
 async function testEndpoint(kind){try{const data=await post('/api/integration/test',{kind});alert(JSON.stringify(data,null,2));location.reload()}catch(err){alert(err.message)}}
+async function getJson(url){const res=await fetch(url,{headers:{'X-Scifinder-Route-Token':token()}});const data=await res.json();if(!res.ok||data.error)throw new Error(data.error||res.statusText);return data}
+function esc(v){return String(v ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function table(rows,cols){if(!rows.length)return '<p class="hint">No results</p>';return '<table><thead><tr>'+cols.map(c=>`<th>${esc(c.label)}</th>`).join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>`<td>${c.render?c.render(r):esc(r[c.key])}</td>`).join('')+'</tr>').join('')+'</tbody></table>'}
+function parseHeaders(){const text=document.getElementById('zoteroHeaders').value.trim();if(!text)return {};try{return JSON.parse(text)}catch(err){throw new Error('Headers JSON is invalid')}}
+async function loadZoteroEndpoints(){try{const data=await getJson('/api/zotero/endpoints');document.getElementById('zoteroEndpoints').innerHTML=table(data,[{label:'Alias',key:'alias'},{label:'Group',key:'group_name'},{label:'URL',key:'url'},{label:'Enabled',key:'enabled'},{label:'Priority',key:'priority'},{label:'Write note',key:'write_note_enabled'},{label:'Status',key:'last_status'},{label:'Latency',key:'last_latency_ms'},{label:'Test',render:r=>`<button onclick="testZoteroEndpoint('${esc(r.id)}')">Test</button>`},{label:'Delete',render:r=>`<button onclick="deleteZoteroEndpoint('${esc(r.id)}')">Delete</button>`}])}catch(err){alert(err.message)}}
+async function saveZoteroEndpoint(){try{const payload={alias:document.getElementById('zoteroAlias').value.trim(),group_name:document.getElementById('zoteroGroup').value.trim(),url:document.getElementById('zoteroUrl').value.trim(),priority:Number(document.getElementById('zoteroPriority').value||100),timeout_seconds:Number(document.getElementById('zoteroTimeout').value||10),enabled:document.getElementById('zoteroEnabled').value==='true',write_note_enabled:document.getElementById('zoteroWriteNote').value==='true',headers:parseHeaders()};await post('/api/zotero/endpoints',payload);await loadZoteroEndpoints()}catch(err){alert(err.message)}}
+async function testZoteroEndpoint(id){try{const data=await post('/api/zotero/endpoints/test',{id});alert(JSON.stringify(data,null,2));await loadZoteroEndpoints()}catch(err){alert(err.message)}}
+async function deleteZoteroEndpoint(id){if(!confirm('Delete Zotero endpoint from Web UI config?'))return;try{await post('/api/zotero/endpoints/delete',{id});await loadZoteroEndpoints()}catch(err){alert(err.message)}}
+async function loadLiterature(){try{const doc=document.getElementById('literatureDocumentId').value.trim();const qs=doc?'?document_id='+encodeURIComponent(doc)+'&limit=50':'?status=candidate&limit=50';const links=await getJson('/api/literature/links'+qs);const jobs=await getJson('/api/literature/jobs?limit=20');document.getElementById('literatureJobs').innerHTML=table(jobs,[{label:'ID',key:'id'},{label:'Document',key:'document_id'},{label:'Status',key:'status'},{label:'Stage',key:'stage'},{label:'Error',key:'error'}]);document.getElementById('literatureLinks').innerHTML=table(links,[{label:'Status',key:'status'},{label:'Reaction',key:'reaction_step_id'},{label:'Endpoint',key:'endpoint_alias'},{label:'DOI',key:'doi'},{label:'Title',key:'title'},{label:'Score',key:'confidence'},{label:'Diff',render:r=>esc(Object.entries(r.field_diff||{}).map(([k,v])=>`${k}:${v.status}`).join(', '))},{label:'Confirm',render:r=>`<button onclick="confirmLiteratureLink('${esc(r.id)}')">Confirm</button>`},{label:'Reject',render:r=>`<button onclick="rejectLiteratureLink('${esc(r.id)}')">Reject</button>`},{label:'Write Note',render:r=>`<button onclick="writeZoteroNote('${esc(r.id)}')">Write</button>`}])}catch(err){alert(err.message)}}
+async function startLiteratureLinking(){try{const document_id=document.getElementById('literatureDocumentId').value.trim();const data=await post('/api/literature/jobs/start',{document_id});alert(JSON.stringify(data,null,2));await loadLiterature()}catch(err){alert(err.message)}}
+async function confirmLiteratureLink(id){try{await post('/api/literature/links/confirm',{id});await loadLiterature()}catch(err){alert(err.message)}}
+async function rejectLiteratureLink(id){const reason=prompt('Reject reason')||'';try{await post('/api/literature/links/reject',{id,reason});await loadLiterature()}catch(err){alert(err.message)}}
+async function writeZoteroNote(id){try{const data=await post('/api/literature/links/write-note',{id});alert(JSON.stringify(data,null,2))}catch(err){alert(err.message)}}
+async function installRdkit(){try{const data=await post('/api/chem/install-rdkit',{});alert('RDKit install job started. Restart the service/container after success.\n'+JSON.stringify(data,null,2))}catch(err){alert(err.message)}}
+async function runChemSearch(){try{const query=document.getElementById('chemQuery').value.trim();const mode=document.getElementById('chemMode').value;let data;if(mode==='text'){data=await getJson('/api/rdf/structures?q='+encodeURIComponent(query)+'&limit=50')}else if(mode==='similarity'){data=(await post('/api/chem/similarity-search',{query,query_type:'smiles',min_similarity:0.2,limit:50})).results}else{data=(await post('/api/chem/substructure-search',{query,query_type:'smarts',limit:50})).results}document.getElementById('chemResults').innerHTML=table(data,[{label:'Name',key:'name'},{label:'Role',key:'role'},{label:'CAS',key:'cas_rn'},{label:'Version',key:'molfile_version'},{label:'Score',render:r=>esc(r.similarity??'')},{label:'Reaction',render:r=>`<button onclick="showRdfReaction('${esc(r.rdf_reaction_id)}')">Open</button>`},{label:'Delete',render:r=>`<button onclick="trashItem('rdf_structure','${esc(r.id)}')">Trash</button>`}])}catch(err){alert(err.message)}}
+async function loadRdfReactions(){try{const doc=document.getElementById('rdfDocumentId').value.trim();const limit=document.getElementById('rdfLimit').value||25;const url='/api/rdf/reactions?limit='+encodeURIComponent(limit)+(doc?'&document_id='+encodeURIComponent(doc):'');const data=await getJson(url);document.getElementById('rdfReactions').innerHTML=table(data,[{label:'Record',key:'record_index'},{label:'Scheme',key:'scheme_id'},{label:'Step',key:'step_id'},{label:'CAS Reaction',key:'cas_reaction_number'},{label:'Yield',key:'yield_text'},{label:'Structures',key:'structure_count'},{label:'Open',render:r=>`<button onclick="showRdfReaction('${esc(r.id)}')">Open</button>`},{label:'Delete',render:r=>`<button onclick="trashItem('rdf_reaction','${esc(r.id)}')">Trash</button>`}])}catch(err){alert(err.message)}}
+async function showRdfReaction(id){try{const data=await getJson('/api/rdf/reactions/'+encodeURIComponent(id));const structures=data.structures||[];const summary={id:data.id,record_index:data.record_index,scheme_id:data.scheme_id,step_id:data.step_id,cas_reaction_number:data.cas_reaction_number,yield_text:data.yield_text,reagents:data.reagents,catalysts:data.catalysts,solvents:data.solvents,reference:data.reference,warnings:data.warnings,structures:structures.map(s=>({id:s.id,role:s.role,role_index:s.role_index,name:s.name,cas_rn:s.cas_rn,molfile_version:s.molfile_version,smiles:s.smiles,rdkit_status:s.rdkit_status,warnings:s.warnings,molfile:s.molfile}))};document.getElementById('rdfDetail').textContent=JSON.stringify(summary,null,2)}catch(err){alert(err.message)}}
+async function trashItem(entity_type,entity_id){if(!confirm(`Move ${entity_type} to trash?`))return;try{await post('/api/trash/delete',{entity_type,entity_id});await loadRdfReactions();await runChemSearch()}catch(err){alert(err.message)}}
+async function loadTrash(){try{const data=await getJson('/api/trash?limit=100');document.getElementById('trashList').innerHTML=table(data,[{label:'Type',key:'entity_type'},{label:'ID',key:'id'},{label:'Title',key:'title'},{label:'Deleted',key:'deleted_at'},{label:'Restore',render:r=>`<button onclick="restoreTrash('${esc(r.entity_type)}','${esc(r.id)}')">Restore</button>`}])}catch(err){alert(err.message)}}
+async function restoreTrash(entity_type,entity_id){try{await post('/api/trash/restore',{entity_type,entity_id});await loadTrash()}catch(err){alert(err.message)}}
+async function emptyTrash(){if(!confirm('Permanently delete all trash?'))return;try{const data=await post('/api/trash/empty',{});alert(JSON.stringify(data,null,2));await loadTrash()}catch(err){alert(err.message)}}
 """

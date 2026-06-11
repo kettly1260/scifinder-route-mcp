@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
+from collections.abc import AsyncIterator
 from typing import Any, Callable
 
 from .auth import authenticate_token, role_allows
@@ -14,16 +16,27 @@ class ServerRunConfig:
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
-    path: str = "/sse"
+    path: str = ""
+    mcp_path: str = "/mcp"
+    sse_path: str = "/sse"
     log_level: str = "INFO"
 
     @classmethod
     def from_env(cls) -> "ServerRunConfig":
+        transport = os.getenv("SCIFINDER_ROUTE_TRANSPORT", "stdio").lower()
+        mcp_path = os.getenv("SCIFINDER_ROUTE_MCP_PATH", "/mcp")
+        sse_path = os.getenv("SCIFINDER_ROUTE_SSE_PATH", "/sse")
+        if transport == "sse":
+            path = sse_path
+        else:
+            path = mcp_path
         return cls(
-            transport=os.getenv("SCIFINDER_ROUTE_TRANSPORT", "stdio").lower(),
+            transport=transport,
             host=os.getenv("SCIFINDER_ROUTE_HOST", "127.0.0.1"),
             port=int(os.getenv("SCIFINDER_ROUTE_PORT", "8000")),
-            path=os.getenv("SCIFINDER_ROUTE_SSE_PATH", "/sse"),
+            path=path,
+            mcp_path=mcp_path,
+            sse_path=sse_path,
             log_level=os.getenv("SCIFINDER_ROUTE_LOG_LEVEL", "INFO"),
         )
 
@@ -34,10 +47,26 @@ class LocalMCP:
     def __init__(self, name: str):
         self.name = name
         self.tools: dict[str, Callable[..., Any]] = {}
+        self.resources: dict[str, Callable[..., Any]] = {}
+        self.prompts: dict[str, Callable[..., Any]] = {}
 
     def tool(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             self.tools[func.__name__] = func
+            return func
+
+        return decorator
+
+    def resource(self, uri: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            self.resources[uri] = func
+            return func
+
+        return decorator
+
+    def prompt(self) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            self.prompts[func.__name__] = func
             return func
 
         return decorator
@@ -83,6 +112,12 @@ def create_mcp(service: RouteService | None = None) -> Any:
         """Copy a server-visible file into the upload area, then register and parse it."""
         require_role(token, "operator")
         return get_service().upload_document(source_path=source_path, filename=filename, reparse=reparse)
+
+    @mcp.tool()
+    def upload_document_content(filename: str, content_base64: str, reparse: bool = False, token: str | None = None) -> dict[str, Any]:
+        """Upload base64-encoded SciFinder export content through MCP after safety validation."""
+        require_role(token, "operator")
+        return get_service().upload_document_content(filename=filename, content_base64=content_base64, reparse=reparse)
 
     @mcp.tool()
     def scan_inbox(reparse: bool = False, limit: int = 500, token: str | None = None) -> dict[str, Any]:
@@ -261,6 +296,66 @@ def create_mcp(service: RouteService | None = None) -> Any:
         return get_service().recognize_structure_image(image_path=image_path, reaction_step_id=reaction_step_id)
 
     @mcp.tool()
+    def get_chem_status(token: str | None = None) -> dict[str, Any]:
+        """Return RDKit availability and RDF structure index coverage."""
+        require_role(token, "viewer")
+        return get_service().get_chem_status()
+
+    @mcp.tool()
+    def list_rdf_reactions(document_id: str = "", limit: int = 50, offset: int = 0, token: str | None = None) -> list[dict[str, Any]]:
+        """List indexed SciFinder RDF reaction records with scheme/step metadata."""
+        require_role(token, "viewer")
+        return get_service().list_rdf_reactions(document_id=document_id, limit=limit, offset=offset)
+
+    @mcp.tool()
+    def get_rdf_reaction(reaction_id: str, token: str | None = None) -> dict[str, Any]:
+        """Return one RDF reaction record with V2000/V3000 molfile structures."""
+        require_role(token, "viewer")
+        return get_service().get_rdf_reaction(reaction_id)
+
+    @mcp.tool()
+    def search_rdf_structures(query: str = "", document_id: str = "", limit: int = 50, offset: int = 0, token: str | None = None) -> list[dict[str, Any]]:
+        """Search indexed RDF structures by name, CAS, SMILES, or InChIKey."""
+        require_role(token, "viewer")
+        return get_service().list_rdf_structures(document_id=document_id, query=query, limit=limit, offset=offset)
+
+    @mcp.tool()
+    def similarity_search_structures(query: str, query_type: str = "smiles", min_similarity: float = 0.2, limit: int = 20, token: str | None = None) -> dict[str, Any]:
+        """Run RDKit fingerprint similarity search over indexed RDF compounds."""
+        require_role(token, "viewer")
+        return get_service().similarity_search_structures(query=query, query_type=query_type, min_similarity=min_similarity, limit=limit)
+
+    @mcp.tool()
+    def substructure_search_structures(query: str, query_type: str = "smarts", limit: int = 20, token: str | None = None) -> dict[str, Any]:
+        """Run RDKit substructure search over indexed RDF molfile structures."""
+        require_role(token, "viewer")
+        return get_service().substructure_search_structures(query=query, query_type=query_type, limit=limit)
+
+    @mcp.tool()
+    def trash_item(entity_type: str, entity_id: str, token: str | None = None) -> dict[str, Any]:
+        """Move a document, RDF reaction, RDF structure, or reaction step to trash."""
+        require_role(token, "operator")
+        return get_service().trash_item(entity_type, entity_id)
+
+    @mcp.tool()
+    def restore_trash_item(entity_type: str, entity_id: str, token: str | None = None) -> dict[str, Any]:
+        """Restore a trashed document, RDF reaction, RDF structure, or reaction step."""
+        require_role(token, "operator")
+        return get_service().restore_trash_item(entity_type, entity_id)
+
+    @mcp.tool()
+    def list_trash(limit: int = 100, token: str | None = None) -> list[dict[str, Any]]:
+        """List items in the recycle bin."""
+        require_role(token, "viewer")
+        return get_service().list_trash(limit=limit)
+
+    @mcp.tool()
+    def empty_trash(token: str | None = None) -> dict[str, int]:
+        """Permanently delete all trashed records and their dependent indexes."""
+        require_role(token, "admin")
+        return get_service().empty_trash()
+
+    @mcp.tool()
     def compute_evaluation_metrics(gold_set_path: str, token: str | None = None) -> dict[str, Any]:
         """Compute regression metrics from a gold-set JSONL file."""
         require_role(token, "operator")
@@ -292,11 +387,118 @@ def create_mcp(service: RouteService | None = None) -> Any:
 
     @mcp.tool()
     def test_integration_endpoint(kind: str, token: str | None = None) -> dict[str, Any]:
-        """Test one configured integration endpoint: llm, embedding, ocr, document_parser, structure_recognition, postgres."""
+        """Test one configured integration endpoint: llm, embedding, ocr, document_parser, structure_recognition, postgres, zotero_mcp."""
         require_role(token, "operator")
         return get_service().test_integration_endpoint(kind)
 
+    @mcp.tool()
+    def list_zotero_mcp_endpoints(token: str | None = None) -> list[dict[str, Any]]:
+        """List Zotero MCP endpoints from the Web UI hot config plus latest health status."""
+        require_role(token, "viewer")
+        return get_service().list_zotero_mcp_endpoints()
+
+    @mcp.tool()
+    def upsert_zotero_mcp_endpoint(endpoint: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        """Create or update a Zotero MCP endpoint in the separate Web UI config YAML."""
+        require_role(token, "admin")
+        return get_service().upsert_zotero_mcp_endpoint(endpoint)
+
+    @mcp.tool()
+    def delete_zotero_mcp_endpoint(endpoint_id: str, token: str | None = None) -> dict[str, Any]:
+        """Delete a Zotero MCP endpoint from the separate Web UI config YAML."""
+        require_role(token, "admin")
+        return get_service().delete_zotero_mcp_endpoint(endpoint_id)
+
+    @mcp.tool()
+    def enqueue_literature_linking(document_id: str = "", token: str | None = None) -> dict[str, Any]:
+        """Start a background Zotero literature linking job for one document or recent reaction steps."""
+        require_role(token, "operator")
+        return get_service().enqueue_literature_linking(document_id=document_id or None)
+
+    @mcp.tool()
+    def list_literature_links(status: str = "", reaction_step_id: str = "", document_id: str = "", limit: int = 50, token: str | None = None) -> list[dict[str, Any]]:
+        """List Zotero literature candidates, auto-links, confirmed links, and rejected links."""
+        require_role(token, "viewer")
+        return get_service().list_literature_links(status=status, reaction_step_id=reaction_step_id, document_id=document_id, limit=limit)
+
+    @mcp.tool()
+    def confirm_literature_link(link_id: str, token: str | None = None) -> dict[str, Any]:
+        """Confirm a candidate Zotero literature link for a reaction step."""
+        require_role(token, "operator")
+        return get_service().confirm_literature_link(link_id)
+
+    @mcp.tool()
+    def reject_literature_link(link_id: str, reason: str = "", token: str | None = None) -> dict[str, Any]:
+        """Reject an incorrect candidate Zotero literature link."""
+        require_role(token, "operator")
+        return get_service().reject_literature_link(link_id, reason=reason)
+
+    @mcp.tool()
+    def get_reaction_literature_context(reaction_step_id: str, token: str | None = None) -> dict[str, Any]:
+        """Return a reaction step with linked Zotero literature, excerpts, and field differences."""
+        require_role(token, "viewer")
+        return get_service().get_reaction_literature_context(reaction_step_id)
+
+    @mcp.tool()
+    def write_zotero_link_note(link_id: str, token: str | None = None) -> dict[str, Any]:
+        """Optionally create a Zotero note for a confirmed literature link when endpoint writeback is enabled."""
+        require_role(token, "operator")
+        return get_service().write_zotero_link_note(link_id)
+
+    @mcp.tool()
+    def list_export_batches(limit: int = 100, token: str | None = None) -> list[dict[str, Any]]:
+        """List explainable SciFinder export batches linking RDF with readable/visual files."""
+        require_role(token, "viewer")
+        return get_service().storage.list_export_batches(limit=limit)
+
+    @mcp.tool()
+    def get_export_batch(batch_id: str, token: str | None = None) -> dict[str, Any]:
+        """Return one export batch, linked documents, confidence, and merge explanation."""
+        require_role(token, "viewer")
+        batch = get_service().storage.get_export_batch(batch_id)
+        if not batch:
+            raise KeyError(f"Export batch not found: {batch_id}")
+        return batch
+
+    @mcp.tool()
+    def unlink_document_from_batch(document_id: str, batch_id: str, reason: str = "", token: str | None = None) -> dict[str, Any]:
+        """Remove an incorrectly merged document from an export batch with an audit reason."""
+        require_role(token, "operator")
+        return get_service().storage.unlink_document_from_batch(document_id=document_id, batch_id=batch_id, reason=reason)
+
+    register_guidance_interfaces(mcp)
+
     return mcp
+
+
+SCIFINDER_IMPORT_GUIDANCE = """SciFinder Route MCP import guidance:
+- Prefer Streamable HTTP /mcp for MCP clients; /sse is legacy compatibility only.
+- The Admin UI is a separate operational HTTP interface, not an MCP transport.
+- Ask the user before importing files they provide.
+- Use upload_document_content for client-local/chat attachment content when available; it requires operator/admin token permission.
+- Supported import formats are PDF, RTF, MDL RDfile/RDF, HTML/MHTML, Markdown, and plain text. ODF/ODT/ODS/ODP are not supported.
+- Uploads must pass size, extension, content-type sniffing, format-specific safety checks, and optional ClamAV scanning before writing to upload_dir.
+- RDF/RDfile is the preferred structured reaction source for CAS Reaction Number, molecule CTAB, CAS RN fields, yield, reagents, catalysts, solvents, and references.
+- RDF may not contain full experimental procedures. Link RDF-derived records to PDF/RTF/HTML readable or visual provenance when available.
+- Auto-merge export batches only with explainable high-confidence signals; keep low-confidence matches as candidates and ask for confirmation.
+"""
+
+
+def register_guidance_interfaces(mcp: Any) -> None:
+    if hasattr(mcp, "resource"):
+        try:
+            @mcp.resource("docs://scifinder-import-guidance")
+            def scifinder_import_guidance_resource() -> str:
+                return SCIFINDER_IMPORT_GUIDANCE
+        except Exception:
+            pass
+    if hasattr(mcp, "prompt"):
+        try:
+            @mcp.prompt()
+            def scifinder_import_guidance() -> str:
+                return SCIFINDER_IMPORT_GUIDANCE
+        except Exception:
+            pass
 
 
 mcp = create_mcp()
@@ -311,23 +513,30 @@ def run_mcp_server(server: Any, config: ServerRunConfig | None = None) -> None:
             server.run()
         return
 
+    if run_config.transport in {"auto", "dual"}:
+        run_dual_transport_server(server, run_config)
+        return
+
     if run_config.transport not in {"sse", "streamable-http", "http"}:
         raise ValueError(f"Unsupported MCP transport: {run_config.transport}")
 
+    path = run_config.path or ("/sse" if run_config.transport == "sse" else "/mcp")
+    fastmcp_transport = "http" if run_config.transport == "streamable-http" else run_config.transport
+
     attempts = [
         {
-            "transport": run_config.transport,
+            "transport": fastmcp_transport,
             "host": run_config.host,
             "port": run_config.port,
-            "path": run_config.path,
+            "path": path,
             "log_level": run_config.log_level,
         },
         {
-            "transport": run_config.transport,
+            "transport": fastmcp_transport,
             "host": run_config.host,
             "port": run_config.port,
         },
-        {"transport": run_config.transport},
+        {"transport": fastmcp_transport},
     ]
     last_error: TypeError | None = None
     for kwargs in attempts:
@@ -338,8 +547,44 @@ def run_mcp_server(server: Any, config: ServerRunConfig | None = None) -> None:
             last_error = exc
     raise RuntimeError(
         "Installed FastMCP does not support the requested SSE/HTTP run signature. "
-        "Upgrade FastMCP in the Docker image or switch SCIFINDER_ROUTE_TRANSPORT=stdio."
+        "Upgrade FastMCP in the Docker image or switch SCIFINDER_ROUTE_TRANSPORT=stdio. "
+        "Use SCIFINDER_ROUTE_TRANSPORT=http for Streamable HTTP."
     ) from last_error
+
+
+def create_dual_transport_app(server: Any, config: ServerRunConfig | None = None) -> Any:
+    """Create one ASGI app exposing Streamable HTTP and legacy SSE endpoints."""
+    run_config = config or ServerRunConfig.from_env()
+    if not hasattr(server, "http_app"):
+        raise RuntimeError("Installed FastMCP does not support ASGI http_app(). Upgrade FastMCP to use dual MCP transports.")
+
+    try:
+        from starlette.applications import Starlette
+    except ImportError as exc:  # pragma: no cover - dependency is provided by FastMCP HTTP extras in production
+        raise RuntimeError("Starlette is required for dual MCP transport mode. Upgrade FastMCP or install project dependencies.") from exc
+
+    http_app = server.http_app(path=run_config.mcp_path, transport="http")
+    sse_app = server.http_app(path=run_config.sse_path, transport="sse")
+
+    @asynccontextmanager
+    async def lifespan(app: Any) -> AsyncIterator[None]:
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(http_app.lifespan(app))
+            await stack.enter_async_context(sse_app.lifespan(app))
+            yield
+
+    return Starlette(routes=[*http_app.routes, *sse_app.routes], lifespan=lifespan)
+
+
+def run_dual_transport_server(server: Any, config: ServerRunConfig | None = None) -> None:
+    run_config = config or ServerRunConfig.from_env()
+    try:
+        import uvicorn
+    except ImportError as exc:  # pragma: no cover - production image installs uvicorn explicitly
+        raise RuntimeError("Uvicorn is required for dual MCP transport mode. Install project dependencies or use a single transport.") from exc
+
+    app = create_dual_transport_app(server, run_config)
+    uvicorn.run(app, host=run_config.host, port=run_config.port, log_level=run_config.log_level.lower())
 
 
 def main() -> None:

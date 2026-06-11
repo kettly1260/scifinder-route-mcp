@@ -29,10 +29,11 @@ docker compose -f docker-compose.image.yml up -d
 
 ```text
 Admin Web UI: http://<nas-host>:8001/
-MCP SSE:      http://<nas-host>:8000/sse
+MCP HTTP:     http://<nas-host>:8000/mcp
+Legacy SSE:   http://<nas-host>:8000/sse
 ```
 
-把 SciFinder 导出的 PDF / HTML / MHTML / TXT 文件放入 `nas-inbox`，然后在 Admin Web UI 中点击 **Scan Inbox**，或通过 MCP 调用 `scan_inbox` 工具。`docker-compose.image.yml` 只依赖预构建 `image:`，不会在本地构建镜像。
+把 SciFinder 导出的 PDF / RTF / RDF，以及 HTML / MHTML / Markdown / TXT 文件放入 `nas-inbox`，然后在 Admin Web UI 中点击 **Scan Inbox**，或通过 MCP 调用 `scan_inbox` 工具。支持的扩展名为 `.pdf`、`.rtf`、`.rdf`、`.html`、`.htm`、`.mhtml`、`.mht`、`.md`、`.markdown`、`.txt`；不支持 ODF / ODT / ODS / ODP。`docker-compose.image.yml` 只依赖预构建 `image:`，不会在本地构建镜像。
 
 ## 本地构建部署
 
@@ -68,11 +69,14 @@ cp config.example.yaml nas-data/config.yaml
 server.async_jobs, server.max_workers, server.storage_backend
 queue.backend, queue.redis_url
 security.allow_external_paths, security.token, security.users
-ingest.scan_extensions
+ingest.scan_extensions, ingest.upload_extensions, ingest.upload_max_bytes,
+ingest.reject_file_type_mismatch, ingest.extract_visual_evidence
 integrations.*
 extraction.llm_schema_version, extraction.llm_prompt_profile, extraction.llm_cost_limit_usd
 thresholds.verification_confidence_threshold
 retention.evidence_retention_days, retention.cache_retention_days
+security.upload_av_scan_enabled, security.upload_av_engine,
+security.upload_av_endpoint, security.upload_av_fail_closed
 ```
 
 可通过 MCP 工具管理配置：
@@ -85,6 +89,39 @@ reload_config
 ```
 
 也可以直接使用 Admin Web UI 修改可热更新配置。
+
+## MCP 传输方式
+
+Docker 部署默认使用自适应 MCP 传输模式：
+
+```env
+SCIFINDER_ROUTE_TRANSPORT=auto
+SCIFINDER_ROUTE_MCP_PATH=/mcp
+SCIFINDER_ROUTE_SSE_PATH=/sse
+```
+
+在 `auto` 模式下，同一个容器、同一个端口会同时暴露两个 MCP 入口：
+
+```text
+http://<nas-host>:8000/mcp  供现代 MCP 客户端使用的 Streamable HTTP
+http://<nas-host>:8000/sse  供旧 MCP 客户端使用的 legacy SSE
+```
+
+该入口由 FastMCP 处理 MCP JSON-RPC 请求，包括 `initialize`、`tools/list`、`tools/call`；`GET /mcp` 的 session / SSE 行为按 MCP Streamable HTTP 规范由 FastMCP 提供。
+
+如果需要调试或严格兼容某类客户端，也可以显式强制单一 transport：
+
+```env
+SCIFINDER_ROUTE_TRANSPORT=http
+SCIFINDER_ROUTE_MCP_PATH=/mcp
+```
+
+或：
+
+```env
+SCIFINDER_ROUTE_TRANSPORT=sse
+SCIFINDER_ROUTE_SSE_PATH=/sse
+```
 
 ## Admin Web UI
 
@@ -131,6 +168,7 @@ reload_config
 scan_inbox
 register_document
 upload_document
+upload_document_content
 get_parse_job_status
 list_parse_jobs
 retry_parse_job
@@ -155,13 +193,17 @@ backup_database
 get_storage_usage
 cleanup_evidence_cache
 test_integration_endpoint
+list_export_batches
+get_export_batch
+unlink_document_from_batch
 ```
 
 ## 功能矩阵
 
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
-| Docker / NAS SSE 服务 | 已实现 | 支持本地构建 Compose 和预构建镜像 Compose。 |
+| Docker / NAS 自适应 MCP 服务 | 已实现 | 默认 `auto` 模式在同一端口同时暴露 `/mcp` Streamable HTTP 和 `/sse` legacy SSE。 |
+| 单 transport 覆盖 | 已实现 | 可设置 `SCIFINDER_ROUTE_TRANSPORT=http` 或 `sse` 强制只暴露一种 transport。 |
 | GHCR 多架构镜像 workflow | 已实现 | 支持 `linux/amd64` 和 `linux/arm64`；GHCR 包可见性可能需要手动设为 Public。 |
 | 只读 NAS inbox 扫描 | 已实现 | `/inbox` 在容器内只读挂载。 |
 | HTTP 上传暂存 | 已实现 | `POST /api/upload` 写入 `/data/uploads`；支持 hash 去重。 |

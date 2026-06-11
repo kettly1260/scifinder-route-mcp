@@ -20,10 +20,11 @@ Then open:
 
 ```text
 Admin Web UI: http://<nas-host>:8001/
-MCP SSE:      http://<nas-host>:8000/sse
+MCP HTTP:     http://<nas-host>:8000/mcp
+Legacy SSE:   http://<nas-host>:8000/sse
 ```
 
-Put SciFinder exports into `nas-inbox`, then click **Scan Inbox** in the Admin Web UI or call the MCP `scan_inbox` tool. The image compose file uses `image:` only and does not build locally.
+Put SciFinder exports into `nas-inbox`, then click **Scan Inbox** in the Admin Web UI or call the MCP `scan_inbox` tool. Supported import formats are `.pdf`, `.rtf`, `.rdf`, `.html`, `.htm`, `.mhtml`, `.mht`, `.md`, `.markdown`, and `.txt`. The image compose file uses `image:` only and does not build locally.
 
 Do not expose the Admin Web UI directly to the public internet. Use a trusted LAN/VPN or a reverse proxy with TLS and authentication. The Python default Admin bind address is `127.0.0.1`; the Docker compose profiles explicitly bind `0.0.0.0` for NAS access.
 
@@ -53,14 +54,50 @@ Hot application config is read from `/data/config.yaml`; copy `config.example.ya
 server.async_jobs, server.max_workers, server.storage_backend
 queue.backend, queue.redis_url
 security.allow_external_paths, security.token, security.users
-ingest.scan_extensions
+ingest.scan_extensions, ingest.upload_extensions, ingest.upload_max_bytes,
+ingest.reject_file_type_mismatch, ingest.extract_visual_evidence
 integrations.*
 extraction.llm_schema_version, extraction.llm_prompt_profile, extraction.llm_cost_limit_usd
 thresholds.verification_confidence_threshold
 retention.evidence_retention_days, retention.cache_retention_days
+security.upload_av_scan_enabled, security.upload_av_engine,
+security.upload_av_endpoint, security.upload_av_fail_closed
 ```
 
 Use MCP tools `get_config`, `update_config`, `validate_config`, and `reload_config`, or use the Admin Web UI.
+
+## MCP Transport
+
+Docker deployments default to adaptive MCP transport mode:
+
+```env
+SCIFINDER_ROUTE_TRANSPORT=auto
+SCIFINDER_ROUTE_MCP_PATH=/mcp
+SCIFINDER_ROUTE_SSE_PATH=/sse
+```
+
+In `auto` mode, the same container and port expose both MCP endpoints:
+
+```text
+http://<nas-host>:8000/mcp  Streamable HTTP for modern MCP clients
+http://<nas-host>:8000/sse  Legacy SSE for older MCP clients
+```
+
+`/mcp` handles MCP JSON-RPC requests such as `initialize`, `tools/list`, and `tools/call`; `GET /mcp` behavior is provided by FastMCP according to the MCP Streamable HTTP transport. `/sse` is retained for older clients that have not moved to Streamable HTTP.
+
+For debugging or strict compatibility, force a single transport explicitly:
+
+```env
+SCIFINDER_ROUTE_TRANSPORT=http
+SCIFINDER_ROUTE_MCP_PATH=/mcp
+```
+
+or:
+
+```env
+SCIFINDER_ROUTE_TRANSPORT=sse
+SCIFINDER_ROUTE_SSE_PATH=/sse
+```
 
 ## Admin Web UI
 
@@ -98,6 +135,7 @@ reload_config
 scan_inbox
 register_document
 upload_document
+upload_document_content
 get_parse_job_status
 list_parse_jobs
 retry_parse_job
@@ -122,13 +160,17 @@ backup_database
 get_storage_usage
 cleanup_evidence_cache
 test_integration_endpoint
+list_export_batches
+get_export_batch
+unlink_document_from_batch
 ```
 
 ## Feature Matrix
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Docker/NAS SSE service | Implemented | Compose and prebuilt-image compose supported. |
+| Docker/NAS adaptive MCP service | Implemented | Default `auto` mode exposes `/mcp` Streamable HTTP and `/sse` legacy SSE on the same port. |
+| Single-transport override | Implemented | Set `SCIFINDER_ROUTE_TRANSPORT=http` or `sse` to expose only one transport. |
 | GHCR multi-arch image workflow | Implemented | `linux/amd64`, `linux/arm64`. GHCR package visibility may need manual public setting. |
 | Read-only inbox scanning | Implemented | `/inbox` mounted read-only. |
 | HTTP upload staging | Implemented | `POST /api/upload` writes to `/data/uploads`; hash dedupe supported. |

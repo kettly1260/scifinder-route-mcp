@@ -1,0 +1,28 @@
+integrations:
+  zotero_linking_enabled: false
+  zotero_linking_on_import: true
+  zotero_extraction_strategy: rules_first
+  zotero_llm_priority_terms:
+    - scale
+    - purification
+    - SI
+  zotero_mcp_endpoints:
+    - id: lab-zotero-lan
+      alias: lab-zotero-lan
+      group_name: lab-zotero
+      url: http://zotero-host:23120/mcp
+      enabled: true
+      priority: 10
+      timeout_seconds: 10
+      write_note_enabled: false
+      headers: {}
+    - id: lab-zotero-vpn
+      alias: lab-zotero-vpn
+      group_name: lab-zotero
+      url: http://zotero-vpn:23120/mcp
+      enabled: false
+      priority: 20
+      timeout_seconds: 15
+      write_note_enabled: false
+      headers:
+        Authorization: Bearer replace-me

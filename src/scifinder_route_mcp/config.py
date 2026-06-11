@@ -9,12 +9,12 @@ from typing import Any
 from .auth import UserCredential, mask_secret, parse_users
 
 
-DEFAULT_SCAN_EXTENSIONS = (".pdf", ".html", ".htm", ".mhtml", ".mht", ".txt")
+DEFAULT_SCAN_EXTENSIONS = (".pdf", ".rtf", ".rdf", ".html", ".htm", ".mhtml", ".mht", ".md", ".markdown", ".txt")
 HOT_CONFIG_SECTIONS = {"server", "security", "ingest", "integrations", "thresholds", "queue", "extraction", "retention"}
 HOT_CONFIG_KEYS = {
     "server": {"async_jobs", "max_workers", "storage_backend"},
-    "security": {"allow_external_paths", "token", "users"},
-    "ingest": {"scan_extensions"},
+    "security": {"allow_external_paths", "token", "users", "upload_av_scan_enabled", "upload_av_engine", "upload_av_endpoint", "upload_av_fail_closed"},
+    "ingest": {"scan_extensions", "upload_extensions", "upload_max_bytes", "reject_file_type_mismatch", "extract_visual_evidence", "render_visual_pages", "visual_page_dpi", "max_visual_pages_per_document", "max_embedded_images_per_document"},
     "queue": {"backend", "redis_url"},
     "integrations": {
         "llm_endpoint",
@@ -30,6 +30,11 @@ HOT_CONFIG_KEYS = {
         "structure_recognition_endpoint",
         "structure_recognition_model",
         "postgres_url",
+        "zotero_mcp_endpoints",
+        "zotero_linking_enabled",
+        "zotero_linking_on_import",
+        "zotero_extraction_strategy",
+        "zotero_llm_priority_terms",
     },
     "extraction": {"llm_schema_version", "llm_prompt_profile", "llm_cost_limit_usd"},
     "thresholds": {"verification_confidence_threshold"},
@@ -46,6 +51,7 @@ class AppConfig:
     evidence_dir: Path
     database_path: Path
     config_path: Path
+    webui_config_path: Path | None = None
     sample_dir: Path | None = None
     async_jobs: bool = False
     max_workers: int = 1
@@ -53,6 +59,18 @@ class AppConfig:
     auth_token: str | None = None
     users: tuple[UserCredential, ...] = ()
     scan_extensions: tuple[str, ...] = DEFAULT_SCAN_EXTENSIONS
+    upload_extensions: tuple[str, ...] = DEFAULT_SCAN_EXTENSIONS
+    upload_max_bytes: int = 50 * 1024 * 1024
+    reject_file_type_mismatch: bool = True
+    extract_visual_evidence: bool = True
+    render_visual_pages: bool = True
+    visual_page_dpi: int = 160
+    max_visual_pages_per_document: int = 20
+    max_embedded_images_per_document: int = 100
+    upload_av_scan_enabled: bool = False
+    upload_av_engine: str = "clamav"
+    upload_av_endpoint: str | None = None
+    upload_av_fail_closed: bool = True
     storage_backend: str = "sqlite"
     queue_backend: str = "sqlite"
     llm_endpoint: str | None = None
@@ -71,6 +89,11 @@ class AppConfig:
     structure_recognition_endpoint: str | None = None
     structure_recognition_model: str | None = None
     postgres_url: str | None = None
+    zotero_mcp_endpoints: tuple[dict[str, Any], ...] = ()
+    zotero_linking_enabled: bool = False
+    zotero_linking_on_import: bool = True
+    zotero_extraction_strategy: str = "rules_first"
+    zotero_llm_priority_terms: tuple[str, ...] = ()
     redis_url: str | None = None
     verification_confidence_threshold: float = 0.65
     evidence_retention_days: int = 90
@@ -84,6 +107,7 @@ class AppConfig:
         evidence_dir = Path(os.getenv("SCIFINDER_ROUTE_EVIDENCE_DIR", data_dir / "evidence")).resolve()
         database_path = Path(os.getenv("SCIFINDER_ROUTE_DATABASE", data_dir / "scifinder_routes.sqlite3")).resolve()
         config_path = Path(os.getenv("SCIFINDER_ROUTE_CONFIG", data_dir / "config.yaml")).resolve()
+        webui_config_path = Path(os.getenv("SCIFINDER_ROUTE_WEBUI_CONFIG", data_dir / "webui-config.yaml")).resolve()
         sample_dir_value = os.getenv("SCIFINDER_ROUTE_SAMPLE_DIR")
         sample_dir = Path(sample_dir_value).resolve() if sample_dir_value else None
         config = cls(
@@ -93,6 +117,7 @@ class AppConfig:
             evidence_dir=evidence_dir,
             database_path=database_path,
             config_path=config_path,
+            webui_config_path=webui_config_path,
             sample_dir=sample_dir,
             async_jobs=parse_bool(os.getenv("SCIFINDER_ROUTE_ASYNC_JOBS"), default=False),
             max_workers=max(1, int(os.getenv("SCIFINDER_ROUTE_MAX_WORKERS", "1"))),
@@ -100,6 +125,18 @@ class AppConfig:
             auth_token=os.getenv("SCIFINDER_ROUTE_TOKEN") or None,
             users=parse_users(os.getenv("SCIFINDER_ROUTE_USERS")),
             scan_extensions=parse_extensions(os.getenv("SCIFINDER_ROUTE_SCAN_EXTENSIONS"), DEFAULT_SCAN_EXTENSIONS),
+            upload_extensions=parse_extensions(os.getenv("SCIFINDER_ROUTE_UPLOAD_EXTENSIONS"), DEFAULT_SCAN_EXTENSIONS),
+            upload_max_bytes=max(1, int(os.getenv("SCIFINDER_ROUTE_UPLOAD_MAX_BYTES", str(50 * 1024 * 1024)))),
+            reject_file_type_mismatch=parse_bool(os.getenv("SCIFINDER_ROUTE_REJECT_FILE_TYPE_MISMATCH"), default=True),
+            extract_visual_evidence=parse_bool(os.getenv("SCIFINDER_ROUTE_EXTRACT_VISUAL_EVIDENCE"), default=True),
+            render_visual_pages=parse_bool(os.getenv("SCIFINDER_ROUTE_RENDER_VISUAL_PAGES"), default=True),
+            visual_page_dpi=max(72, int(os.getenv("SCIFINDER_ROUTE_VISUAL_PAGE_DPI", "160"))),
+            max_visual_pages_per_document=max(0, int(os.getenv("SCIFINDER_ROUTE_MAX_VISUAL_PAGES_PER_DOCUMENT", "20"))),
+            max_embedded_images_per_document=max(0, int(os.getenv("SCIFINDER_ROUTE_MAX_EMBEDDED_IMAGES_PER_DOCUMENT", "100"))),
+            upload_av_scan_enabled=parse_bool(os.getenv("SCIFINDER_ROUTE_UPLOAD_AV_SCAN_ENABLED"), default=False),
+            upload_av_engine=os.getenv("SCIFINDER_ROUTE_UPLOAD_AV_ENGINE", "clamav").strip().lower() or "clamav",
+            upload_av_endpoint=os.getenv("SCIFINDER_ROUTE_UPLOAD_AV_ENDPOINT") or None,
+            upload_av_fail_closed=parse_bool(os.getenv("SCIFINDER_ROUTE_UPLOAD_AV_FAIL_CLOSED"), default=True),
             storage_backend=os.getenv("SCIFINDER_ROUTE_BACKEND", "sqlite").strip().lower() or "sqlite",
             queue_backend=os.getenv("SCIFINDER_ROUTE_QUEUE_BACKEND", "sqlite").strip().lower() or "sqlite",
             llm_endpoint=os.getenv("SCIFINDER_ROUTE_LLM_ENDPOINT") or None,
@@ -118,6 +155,11 @@ class AppConfig:
             structure_recognition_endpoint=os.getenv("SCIFINDER_ROUTE_STRUCTURE_RECOGNITION_ENDPOINT") or None,
             structure_recognition_model=os.getenv("SCIFINDER_ROUTE_STRUCTURE_RECOGNITION_MODEL") or None,
             postgres_url=os.getenv("SCIFINDER_ROUTE_POSTGRES_URL") or None,
+            zotero_mcp_endpoints=parse_json_list(os.getenv("SCIFINDER_ROUTE_ZOTERO_MCP_ENDPOINTS")),
+            zotero_linking_enabled=parse_bool(os.getenv("SCIFINDER_ROUTE_ZOTERO_LINKING_ENABLED"), default=False),
+            zotero_linking_on_import=parse_bool(os.getenv("SCIFINDER_ROUTE_ZOTERO_LINKING_ON_IMPORT"), default=True),
+            zotero_extraction_strategy=os.getenv("SCIFINDER_ROUTE_ZOTERO_EXTRACTION_STRATEGY", "rules_first"),
+            zotero_llm_priority_terms=tuple(item.strip() for item in os.getenv("SCIFINDER_ROUTE_ZOTERO_LLM_PRIORITY_TERMS", "").split(",") if item.strip()),
             redis_url=os.getenv("SCIFINDER_ROUTE_REDIS_URL") or None,
             verification_confidence_threshold=float(os.getenv("SCIFINDER_ROUTE_VERIFICATION_CONFIDENCE_THRESHOLD", "0.65")),
             evidence_retention_days=int(os.getenv("SCIFINDER_ROUTE_EVIDENCE_RETENTION_DAYS", "90")),
@@ -132,12 +174,20 @@ class AppConfig:
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.webui_config_path:
+            self.webui_config_path.parent.mkdir(parents=True, exist_ok=True)
 
     def apply_file_overrides(self) -> "AppConfig":
-        if not self.config_path.exists():
-            return self
-        raw = read_config_yaml(self.config_path)
-        return apply_config_overrides(self, raw)
+        config = self
+        if self.config_path.exists():
+            config = apply_config_overrides(config, read_config_yaml(self.config_path))
+        webui_path = config.webui_config_path or self.webui_config_path or config.data_dir / "webui-config.yaml"
+        if webui_path and webui_path.exists():
+            try:
+                config = apply_config_overrides(config, read_config_yaml(webui_path))
+            except Exception:
+                return config
+        return config
 
     def effective_config(self, *, include_secrets: bool = False) -> dict[str, Any]:
         token = self.auth_token if include_secrets else mask_secret(self.auth_token)
@@ -151,6 +201,7 @@ class AppConfig:
                 "evidence_dir": str(self.evidence_dir),
                 "database_path": str(self.database_path),
                 "config_path": str(self.config_path),
+                "webui_config_path": str(self.webui_config_path or self.data_dir / "webui-config.yaml"),
             },
             "server": {
                 "async_jobs": self.async_jobs,
@@ -161,9 +212,21 @@ class AppConfig:
                 "allow_external_paths": self.allow_external_paths,
                 "token": token,
                 "users": [user.__dict__ if include_secrets else user.masked() for user in self.users],
+                "upload_av_scan_enabled": self.upload_av_scan_enabled,
+                "upload_av_engine": self.upload_av_engine,
+                "upload_av_endpoint": self.upload_av_endpoint if include_secrets else mask_secret(self.upload_av_endpoint),
+                "upload_av_fail_closed": self.upload_av_fail_closed,
             },
             "ingest": {
                 "scan_extensions": list(self.scan_extensions),
+                "upload_extensions": list(self.upload_extensions),
+                "upload_max_bytes": self.upload_max_bytes,
+                "reject_file_type_mismatch": self.reject_file_type_mismatch,
+                "extract_visual_evidence": self.extract_visual_evidence,
+                "render_visual_pages": self.render_visual_pages,
+                "visual_page_dpi": self.visual_page_dpi,
+                "max_visual_pages_per_document": self.max_visual_pages_per_document,
+                "max_embedded_images_per_document": self.max_embedded_images_per_document,
             },
             "queue": {
                 "backend": self.queue_backend,
@@ -183,6 +246,11 @@ class AppConfig:
                 "structure_recognition_endpoint": self.structure_recognition_endpoint,
                 "structure_recognition_model": self.structure_recognition_model,
                 "postgres_url": postgres_url,
+                "zotero_mcp_endpoints": mask_zotero_endpoints(self.zotero_mcp_endpoints, include_secrets=include_secrets),
+                "zotero_linking_enabled": self.zotero_linking_enabled,
+                "zotero_linking_on_import": self.zotero_linking_on_import,
+                "zotero_extraction_strategy": self.zotero_extraction_strategy,
+                "zotero_llm_priority_terms": list(self.zotero_llm_priority_terms),
             },
             "extraction": {
                 "llm_schema_version": self.llm_schema_version,
@@ -204,9 +272,10 @@ class AppConfig:
 
     def write_hot_config(self, updates: dict[str, Any]) -> None:
         with CONFIG_WRITE_LOCK:
-            current = read_config_yaml(self.config_path) if self.config_path.exists() else self.hot_config(include_secrets=True)
+            target = self.webui_config_path or self.data_dir / "webui-config.yaml"
+            current = read_config_yaml(target) if target.exists() else self.hot_config(include_secrets=True)
             merged = merge_hot_config(current, updates)
-            write_config_yaml(self.config_path, merged)
+            write_config_yaml(target, merged)
 
     def validate(self) -> list[str]:
         warnings: list[str] = []
@@ -225,6 +294,17 @@ class AppConfig:
         for extension in self.scan_extensions:
             if not extension.startswith("."):
                 warnings.append(f"ingest.scan_extensions entry must start with '.': {extension}")
+        if not self.upload_extensions:
+            warnings.append("ingest.upload_extensions is empty; MCP content uploads will reject every file")
+        for extension in self.upload_extensions:
+            if not extension.startswith("."):
+                warnings.append(f"ingest.upload_extensions entry must start with '.': {extension}")
+        if self.upload_max_bytes < 1:
+            warnings.append("ingest.upload_max_bytes must be >= 1")
+        if self.upload_av_scan_enabled and self.upload_av_engine != "clamav":
+            warnings.append("security.upload_av_engine currently supports clamav only")
+        if self.upload_av_scan_enabled and not self.upload_av_endpoint:
+            warnings.append("security.upload_av_scan_enabled=true requires security.upload_av_endpoint")
         if self.verification_confidence_threshold < 0 or self.verification_confidence_threshold > 1:
             warnings.append("thresholds.verification_confidence_threshold must be between 0 and 1")
         for name, endpoint in {
@@ -255,6 +335,14 @@ class AppConfig:
         ]:
             if model and not endpoint:
                 warnings.append(f"{model_name} is set but {endpoint_name} is empty")
+        for index, endpoint in enumerate(self.zotero_mcp_endpoints):
+            url = str(endpoint.get("url") or "")
+            if url and not url.startswith(("http://", "https://")):
+                warnings.append(f"integrations.zotero_mcp_endpoints[{index}].url should start with http:// or https://")
+            if endpoint.get("enabled", True) and not url:
+                warnings.append(f"integrations.zotero_mcp_endpoints[{index}].url is required when enabled")
+        if self.zotero_extraction_strategy not in {"rules_first", "llm_first", "rules_only"}:
+            warnings.append("integrations.zotero_extraction_strategy must be rules_first, llm_first, or rules_only")
         return warnings
 
 
@@ -276,6 +364,16 @@ def normalize_extension(value: str) -> str:
     return extension if extension.startswith(".") else f".{extension}"
 
 
+def parse_json_list(value: str | None) -> tuple[dict[str, Any], ...]:
+    if not value:
+        return ()
+    try:
+        parsed = __import__("json").loads(value)
+    except Exception:
+        return ()
+    return normalize_endpoint_list(parsed)
+
+
 def apply_config_overrides(config: AppConfig, raw: dict[str, Any]) -> AppConfig:
     server = section(raw, "server")
     security = section(raw, "security")
@@ -290,6 +388,16 @@ def apply_config_overrides(config: AppConfig, raw: dict[str, Any]) -> AppConfig:
         scan_extensions = parse_extensions(scan_extensions, config.scan_extensions)
     else:
         scan_extensions = tuple(normalize_extension(str(item)) for item in scan_extensions)
+    upload_extensions = ingest.get("upload_extensions", config.upload_extensions)
+    if isinstance(upload_extensions, str):
+        upload_extensions = parse_extensions(upload_extensions, config.upload_extensions)
+    else:
+        upload_extensions = tuple(normalize_extension(str(item)) for item in upload_extensions)
+    priority_terms = integrations.get("zotero_llm_priority_terms", config.zotero_llm_priority_terms)
+    if isinstance(priority_terms, str):
+        priority_terms = tuple(item.strip() for item in priority_terms.split(",") if item.strip())
+    else:
+        priority_terms = tuple(str(item).strip() for item in priority_terms if str(item).strip())
     return replace(
         config,
         async_jobs=coerce_bool(server.get("async_jobs"), config.async_jobs),
@@ -298,7 +406,19 @@ def apply_config_overrides(config: AppConfig, raw: dict[str, Any]) -> AppConfig:
         allow_external_paths=coerce_bool(security.get("allow_external_paths"), config.allow_external_paths),
         auth_token=none_if_empty(security.get("token", config.auth_token)),
         users=parse_users(jsonish(security.get("users"))) if "users" in security else config.users,
+        upload_av_scan_enabled=coerce_bool(security.get("upload_av_scan_enabled"), config.upload_av_scan_enabled),
+        upload_av_engine=str(security.get("upload_av_engine", config.upload_av_engine)).strip().lower() or "clamav",
+        upload_av_endpoint=none_if_empty(security.get("upload_av_endpoint", config.upload_av_endpoint)),
+        upload_av_fail_closed=coerce_bool(security.get("upload_av_fail_closed"), config.upload_av_fail_closed),
         scan_extensions=scan_extensions,
+        upload_extensions=upload_extensions,
+        upload_max_bytes=max(1, int(ingest.get("upload_max_bytes", config.upload_max_bytes))),
+        reject_file_type_mismatch=coerce_bool(ingest.get("reject_file_type_mismatch"), config.reject_file_type_mismatch),
+        extract_visual_evidence=coerce_bool(ingest.get("extract_visual_evidence"), config.extract_visual_evidence),
+        render_visual_pages=coerce_bool(ingest.get("render_visual_pages"), config.render_visual_pages),
+        visual_page_dpi=max(72, int(ingest.get("visual_page_dpi", config.visual_page_dpi))),
+        max_visual_pages_per_document=max(0, int(ingest.get("max_visual_pages_per_document", config.max_visual_pages_per_document))),
+        max_embedded_images_per_document=max(0, int(ingest.get("max_embedded_images_per_document", config.max_embedded_images_per_document))),
         queue_backend=str(queue.get("backend", config.queue_backend)).strip().lower() or "sqlite",
         redis_url=none_if_empty(queue.get("redis_url", config.redis_url)),
         llm_endpoint=none_if_empty(integrations.get("llm_endpoint", config.llm_endpoint)),
@@ -314,6 +434,11 @@ def apply_config_overrides(config: AppConfig, raw: dict[str, Any]) -> AppConfig:
         structure_recognition_endpoint=none_if_empty(integrations.get("structure_recognition_endpoint", config.structure_recognition_endpoint)),
         structure_recognition_model=none_if_empty(integrations.get("structure_recognition_model", config.structure_recognition_model)),
         postgres_url=none_if_empty(integrations.get("postgres_url", config.postgres_url)),
+        zotero_mcp_endpoints=normalize_endpoint_list(integrations.get("zotero_mcp_endpoints", config.zotero_mcp_endpoints)),
+        zotero_linking_enabled=coerce_bool(integrations.get("zotero_linking_enabled"), config.zotero_linking_enabled),
+        zotero_linking_on_import=coerce_bool(integrations.get("zotero_linking_on_import"), config.zotero_linking_on_import),
+        zotero_extraction_strategy=str(integrations.get("zotero_extraction_strategy", config.zotero_extraction_strategy)).strip() or "rules_first",
+        zotero_llm_priority_terms=priority_terms,
         llm_schema_version=str(extraction.get("llm_schema_version", config.llm_schema_version)),
         llm_prompt_profile=str(extraction.get("llm_prompt_profile", config.llm_prompt_profile)),
         llm_cost_limit_usd=float(extraction.get("llm_cost_limit_usd", config.llm_cost_limit_usd)),
@@ -353,6 +478,46 @@ def none_if_empty(value: Any) -> str | None:
     return text or None
 
 
+def normalize_endpoint_list(value: Any) -> tuple[dict[str, Any], ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        try:
+            value = __import__("json").loads(value)
+        except Exception:
+            return ()
+    if not isinstance(value, (list, tuple)):
+        return ()
+    endpoints: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            continue
+        alias = str(item.get("alias") or f"zotero-{index + 1}").strip()
+        endpoint = {
+            "id": str(item.get("id") or alias).strip(),
+            "alias": alias,
+            "group_name": str(item.get("group_name") or item.get("group") or alias).strip(),
+            "url": str(item.get("url") or "").strip(),
+            "enabled": coerce_bool(item.get("enabled"), True),
+            "priority": int(item.get("priority") or 100),
+            "timeout_seconds": float(item.get("timeout_seconds") or 10),
+            "headers": item.get("headers") if isinstance(item.get("headers"), dict) else {},
+            "write_note_enabled": coerce_bool(item.get("write_note_enabled"), False),
+        }
+        endpoints.append(endpoint)
+    return tuple(endpoints)
+
+
+def mask_zotero_endpoints(endpoints: tuple[dict[str, Any], ...], *, include_secrets: bool) -> list[dict[str, Any]]:
+    masked: list[dict[str, Any]] = []
+    for endpoint in endpoints:
+        item = dict(endpoint)
+        headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
+        item["headers"] = headers if include_secrets else {key: mask_secret(str(value)) for key, value in headers.items()}
+        masked.append(item)
+    return masked
+
+
 def mask_secret(value: str | None) -> str | None:
     if not value:
         return None
@@ -381,37 +546,20 @@ def merge_hot_config(current: dict[str, Any], updates: dict[str, Any]) -> dict[s
 
 
 def read_config_yaml(path: Path) -> dict[str, Any]:
+    lines = [line.split("#", 1)[0].rstrip() for line in path.read_text(encoding="utf-8").splitlines()]
     result: dict[str, Any] = {}
-    current_section: str | None = None
-    current_list_key: str | None = None
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.split("#", 1)[0].rstrip()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         if not line.strip():
+            index += 1
             continue
         if not line.startswith(" ") and line.endswith(":"):
-            current_section = line[:-1].strip()
-            result.setdefault(current_section, {})
-            current_list_key = None
+            section_name = line[:-1].strip()
+            section_value, index = parse_yaml_mapping(lines, index + 1, indent=2)
+            result[section_name] = section_value
             continue
-        if current_section is None:
-            continue
-        stripped = line.strip()
-        if stripped.startswith("- ") and current_list_key:
-            section_value = result.setdefault(current_section, {})
-            section_value.setdefault(current_list_key, []).append(parse_scalar(stripped[2:]))
-            continue
-        if ":" not in stripped:
-            continue
-        key, raw_value = stripped.split(":", 1)
-        key = key.strip()
-        raw_value = raw_value.strip()
-        section_value = result.setdefault(current_section, {})
-        if raw_value == "":
-            section_value[key] = []
-            current_list_key = key
-        else:
-            section_value[key] = parse_scalar(raw_value)
-            current_list_key = None
+        index += 1
     return result
 
 
@@ -423,14 +571,7 @@ def write_config_yaml(path: Path, config: dict[str, Any]) -> None:
         if not isinstance(section_value, dict):
             continue
         lines.append(f"{section_name}:")
-        for key in sorted(section_value):
-            value = section_value[key]
-            if isinstance(value, (list, tuple)):
-                lines.append(f"  {key}:")
-                for item in value:
-                    lines.append(f"    - {format_scalar(item)}")
-            else:
-                lines.append(f"  {key}: {format_scalar(value)}")
+        lines.extend(format_yaml_mapping(section_value, indent=2))
         lines.append("")
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -451,6 +592,124 @@ def parse_scalar(value: str) -> Any:
         return int(value)
     except ValueError:
         return value
+
+
+def parse_yaml_mapping(lines: list[str], index: int, *, indent: int) -> tuple[dict[str, Any], int]:
+    result: dict[str, Any] = {}
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            index += 1
+            continue
+        current_indent = len(line) - len(line.lstrip(" "))
+        if current_indent < indent:
+            break
+        if current_indent > indent:
+            index += 1
+            continue
+        stripped = line.strip()
+        if ":" not in stripped:
+            index += 1
+            continue
+        key, raw_value = stripped.split(":", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        if raw_value:
+            result[key] = parse_scalar(raw_value)
+            index += 1
+            continue
+        next_index = next_content_index(lines, index + 1)
+        if next_index < len(lines) and lines[next_index].startswith(" " * (indent + 2) + "- "):
+            result[key], index = parse_yaml_list(lines, index + 1, indent=indent + 2)
+        else:
+            result[key], index = parse_yaml_mapping(lines, index + 1, indent=indent + 2)
+    return result, index
+
+
+def parse_yaml_list(lines: list[str], index: int, *, indent: int) -> tuple[list[Any], int]:
+    result: list[Any] = []
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            index += 1
+            continue
+        current_indent = len(line) - len(line.lstrip(" "))
+        if current_indent < indent:
+            break
+        if current_indent != indent or not line.strip().startswith("- "):
+            index += 1
+            continue
+        item_text = line.strip()[2:].strip()
+        if item_text and ":" not in item_text:
+            result.append(parse_scalar(item_text))
+            index += 1
+            continue
+        item: dict[str, Any] = {}
+        if item_text:
+            key, raw_value = item_text.split(":", 1)
+            item[key.strip()] = parse_scalar(raw_value.strip()) if raw_value.strip() else None
+        nested, index = parse_yaml_mapping(lines, index + 1, indent=indent + 2)
+        item.update(nested)
+        result.append(item)
+    return result, index
+
+
+def next_content_index(lines: list[str], index: int) -> int:
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    return index
+
+
+def format_yaml_mapping(mapping: dict[str, Any], *, indent: int) -> list[str]:
+    lines: list[str] = []
+    prefix = " " * indent
+    for key in sorted(mapping):
+        value = mapping[key]
+        if isinstance(value, dict):
+            lines.append(f"{prefix}{key}:")
+            lines.extend(format_yaml_mapping(value, indent=indent + 2))
+        elif isinstance(value, (list, tuple)):
+            lines.append(f"{prefix}{key}:")
+            lines.extend(format_yaml_list(value, indent=indent + 2))
+        else:
+            lines.append(f"{prefix}{key}: {format_scalar(value)}")
+    return lines
+
+
+def format_yaml_list(values: Any, *, indent: int) -> list[str]:
+    lines: list[str] = []
+    prefix = " " * indent
+    for item in values:
+        if isinstance(item, dict):
+            keys = sorted(item)
+            if not keys:
+                lines.append(f"{prefix}- {{}}")
+                continue
+            first, *rest = keys
+            first_value = item[first]
+            if isinstance(first_value, (dict, list, tuple)):
+                lines.append(f"{prefix}- {first}:")
+                lines.extend(format_yaml_value(first_value, indent=indent + 4))
+            else:
+                lines.append(f"{prefix}- {first}: {format_scalar(first_value)}")
+            for key in rest:
+                value = item[key]
+                if isinstance(value, (dict, list, tuple)):
+                    lines.append(f"{prefix}  {key}:")
+                    lines.extend(format_yaml_value(value, indent=indent + 4))
+                else:
+                    lines.append(f"{prefix}  {key}: {format_scalar(value)}")
+        else:
+            lines.append(f"{prefix}- {format_scalar(item)}")
+    return lines
+
+
+def format_yaml_value(value: Any, *, indent: int) -> list[str]:
+    if isinstance(value, dict):
+        return format_yaml_mapping(value, indent=indent)
+    if isinstance(value, (list, tuple)):
+        return format_yaml_list(value, indent=indent)
+    return [" " * indent + format_scalar(value)]
 
 
 def format_scalar(value: Any) -> str:

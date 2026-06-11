@@ -12,6 +12,7 @@ class SourceDocument:
     file_type: str
     title: str | None
     doi: str | None
+    scifinder_metadata: dict[str, Any] | None
     ingest_status: str
     created_at: str
     updated_at: str

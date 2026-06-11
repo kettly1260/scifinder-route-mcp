@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
+import re
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
+from .chem import fingerprint_from_query, install_rdkit, rdkit_info, substructure_match, tanimoto
 from .config import AppConfig
 from .extractor import extract_reaction_steps
 from .integrations import EmbeddingAdapter, ExternalParserAdapter, LLMStructuringAdapter, OCRAdapter, StructureRecognitionAdapter, test_http_endpoint
-from .parsers import ParsedDocument, TextChunk, detect_file_type, parse_document
+from .literature import ZoteroMcpClient, build_query, diff_reaction_fields, extract_method_fields, item_doi, item_key, item_title, item_year, normalize_doi, title_similarity, trim_text
+from .parsers import ParsedDocument, TextChunk, detect_file_type, parse_document, sniff_document_type
+from .rdfile import parse_rdfile_reactions
 from .registry import index_reaction_compounds, normalize_with_rdkit
 from .storage import RouteStorage
 
@@ -27,6 +33,9 @@ class RouteService:
         self._workers: list[threading.Thread] = []
         self._active_jobs: set[str] = set()
         self._active_jobs_lock = threading.Lock()
+        self._rdkit_install_job: dict[str, Any] | None = None
+        self._rdkit_install_lock = threading.Lock()
+        self._sync_zotero_endpoint_config()
         if self.config.async_jobs:
             self._start_workers()
 
@@ -45,6 +54,7 @@ class RouteService:
         self.storage_backend_status = self._resolve_storage_backend_status()
         if old_async != self.config.async_jobs or old_workers != self.config.max_workers:
             self._restart_workers()
+        self._sync_zotero_endpoint_config()
         return self.get_config()
 
     def validate_config(self) -> dict[str, Any]:
@@ -57,6 +67,8 @@ class RouteService:
                 "SCIFINDER_ROUTE_PUBLISHED_PORT",
                 "SCIFINDER_ROUTE_PORT",
                 "SCIFINDER_ROUTE_TRANSPORT",
+                "SCIFINDER_ROUTE_MCP_PATH",
+                "SCIFINDER_ROUTE_SSE_PATH",
                 "volume mounts",
                 "container network",
             ],
@@ -100,6 +112,7 @@ class RouteService:
         return result
 
     def upload_document_bytes(self, content: bytes, filename: str, reparse: bool = False) -> dict[str, Any]:
+        self._validate_upload_content(content, filename)
         digest = hashlib.sha256(content).hexdigest()
         existing = self.storage.get_document_by_hash(digest)
         if existing and not reparse:
@@ -111,6 +124,16 @@ class RouteService:
         result["uploaded_path"] = str(target)
         result["sha256"] = digest
         return result
+
+    def upload_document_content(self, filename: str, content_base64: str, reparse: bool = False) -> dict[str, Any]:
+        estimated = (len(content_base64.strip()) * 3) // 4
+        if estimated > self.config.upload_max_bytes + 3:
+            raise ValueError(f"Upload exceeds configured limit of {self.config.upload_max_bytes} bytes")
+        try:
+            content = base64.b64decode(content_base64, validate=True)
+        except Exception as exc:
+            raise ValueError("content_base64 is not valid base64") from exc
+        return self.upload_document_bytes(content, filename, reparse=reparse)
 
     def scan_inbox(self, reparse: bool = False, limit: int = 500) -> dict[str, Any]:
         supported = set(self.config.scan_extensions)
@@ -169,6 +192,7 @@ class RouteService:
             "vector_index": self.storage.vector_index_status(),
             "ocr_backlog": self.storage.count_ocr_backlog(),
             "integrations": self.storage.list_integration_statuses(),
+            "zotero_endpoints": self.list_zotero_mcp_endpoints(),
         }
 
     def shutdown(self) -> None:
@@ -179,7 +203,18 @@ class RouteService:
 
     def search_reaction_steps(self, query: str = "", reagent: str = "", solvent: str = "", document_id: str = "", min_confidence: float = 0.0, limit: int = 10) -> list[dict[str, Any]]:
         steps = self.storage.search_reaction_steps(query=query, reagent=reagent, solvent=solvent, document_id=document_id, min_confidence=min_confidence, limit=limit)
-        return [step.to_dict() for step in steps]
+        results = []
+        for step in steps:
+            data = step.to_dict()
+            batch_links = self.storage.list_batches_for_document(step.source_document_id)
+            data["batch_links"] = batch_links
+            metadata = step.metadata or {}
+            if metadata.get("structured_source") == "rdf" and not batch_links:
+                data["provenance_warning"] = "RDF structured reaction has no linked readable/visual export batch; verify against PDF/RTF/HTML before final chemical judgment."
+            elif metadata.get("has_visual_evidence"):
+                data["provenance_warning"] = "This result has linked visual chemical evidence; inspect provenance images when making structure-sensitive judgments."
+            results.append(data)
+        return results
 
     def get_reaction_step(self, reaction_step_id: str) -> dict[str, Any]:
         step = self.storage.get_reaction_step(reaction_step_id)
@@ -309,6 +344,14 @@ class RouteService:
         if kind == "postgres":
             result = self._test_postgres()
             return self.storage.record_integration_status("postgres", **result)
+        if kind == "zotero_mcp":
+            endpoints = self._configured_zotero_endpoints()
+            if not endpoints:
+                return self.storage.record_integration_status("zotero_mcp", configured=False, status="unknown", detail="No Zotero MCP endpoints configured")
+            results = [self.test_zotero_mcp_endpoint(endpoint["id"]) for endpoint in endpoints]
+            ok = [item for item in results if item.get("status") == "ok"]
+            detail = json.dumps(results, ensure_ascii=False)
+            return self.storage.record_integration_status("zotero_mcp", configured=True, status="ok" if ok else "error", detail=detail[:1000])
         if kind not in endpoints:
             raise ValueError(f"Unknown integration kind: {kind}")
         endpoint, model = endpoints[kind]
@@ -331,6 +374,81 @@ class RouteService:
         canonical, inchikey, _fingerprint = normalize_with_rdkit(smiles)
         query = inchikey or canonical or smiles
         return self.search_compounds(query=query, limit=limit)
+
+    def get_chem_status(self) -> dict[str, Any]:
+        return {"rdkit": rdkit_info().to_dict(), "rdf_structure_index": self.storage.rdf_structure_index_status(), "install_job": self._rdkit_install_job}
+
+    def install_rdkit_async(self) -> dict[str, Any]:
+        with self._rdkit_install_lock:
+            if self._rdkit_install_job and self._rdkit_install_job.get("status") == "running":
+                return self._rdkit_install_job
+            job = {"id": f"rdkit_install_{int(time.time())}", "status": "running", "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "result": None}
+            self._rdkit_install_job = job
+        threading.Thread(target=self._run_rdkit_install_job, name="rdkit-install", daemon=True).start()
+        return job
+
+    def _run_rdkit_install_job(self) -> None:
+        try:
+            result = install_rdkit()
+        except (subprocess.SubprocessError, OSError, TimeoutError) as exc:
+            result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}", "restart_required": False}
+        with self._rdkit_install_lock:
+            if self._rdkit_install_job is not None:
+                self._rdkit_install_job["status"] = result.get("status", "failed")
+                self._rdkit_install_job["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                self._rdkit_install_job["result"] = result
+
+    def list_rdf_reactions(self, document_id: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
+        return self.storage.list_rdf_reactions(document_id=document_id, limit=limit, offset=offset, include_deleted=include_deleted)
+
+    def get_rdf_reaction(self, reaction_id: str, include_deleted: bool = False) -> dict[str, Any]:
+        reaction = self.storage.get_rdf_reaction(reaction_id, include_deleted=include_deleted)
+        if not reaction:
+            raise KeyError(f"RDF reaction not found: {reaction_id}")
+        return reaction
+
+    def list_rdf_structures(self, document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
+        return self.storage.list_rdf_structures(document_id=document_id, query=query, limit=limit, offset=offset, include_deleted=include_deleted)
+
+    def similarity_search_structures(self, query: str, query_type: str = "smiles", min_similarity: float = 0.2, limit: int = 20) -> dict[str, Any]:
+        fp, error = fingerprint_from_query(query, query_type)
+        if error:
+            return {"configured": False, "error": error, "results": []}
+        scored: list[dict[str, Any]] = []
+        for structure in self.storage.list_rdf_structures_for_search(limit=10000):
+            score = tanimoto(fp, structure.get("fingerprint"))
+            if score >= min_similarity:
+                scored.append({**structure, "similarity": round(score, 4)})
+        scored.sort(key=lambda item: item["similarity"], reverse=True)
+        return {"configured": True, "query_type": query_type, "results": scored[:limit]}
+
+    def substructure_search_structures(self, query: str, query_type: str = "smarts", limit: int = 20) -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for structure in self.storage.list_rdf_structures_for_search(limit=10000):
+            molfile = structure.get("molfile")
+            if not molfile:
+                continue
+            matched, error = substructure_match(query, molfile, query_type=query_type)
+            if error and not errors:
+                errors.append(error)
+            if matched:
+                results.append(structure)
+                if len(results) >= limit:
+                    break
+        return {"configured": not errors or bool(results), "query_type": query_type, "errors": errors[:5], "results": results}
+
+    def trash_item(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        return self.storage.soft_delete(entity_type, entity_id)
+
+    def restore_trash_item(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        return self.storage.restore_trash_item(entity_type, entity_id)
+
+    def list_trash(self, limit: int = 100) -> list[dict[str, Any]]:
+        return self.storage.list_trash(limit=limit)
+
+    def empty_trash(self) -> dict[str, int]:
+        return self.storage.empty_trash()
 
     def recognize_structure_image(self, image_path: str, reaction_step_id: str | None = None) -> dict[str, Any]:
         adapter = StructureRecognitionAdapter(self.config.structure_recognition_endpoint, self.config.structure_recognition_model)
@@ -401,11 +519,256 @@ class RouteService:
         return {
             "health": self.health_check(),
             "vector_index": self.get_vector_index_status(),
+            "chem": self.get_chem_status(),
             "evaluation": self.get_evaluation_status(),
             "storage_usage": self.get_storage_usage(),
             "doi_low_confidence_queue": self.storage.low_confidence_doi_queue(self.config.verification_confidence_threshold, limit=20),
             "compound_count": len(self.search_compounds(limit=1000)),
+            "literature_link_jobs": self.list_literature_link_jobs(limit=10),
+            "literature_candidates": self.list_literature_links(status="candidate", limit=20),
         }
+
+    def list_zotero_mcp_endpoints(self, *, include_headers: bool = False) -> list[dict[str, Any]]:
+        status_by_id = {item["id"]: item for item in self.storage.list_zotero_endpoints(include_headers=False)}
+        endpoints = []
+        for endpoint in self._configured_zotero_endpoints(include_headers=include_headers):
+            status = status_by_id.get(endpoint["id"], {})
+            endpoints.append({**endpoint, "last_status": status.get("last_status"), "last_latency_ms": status.get("last_latency_ms"), "last_error": status.get("last_error"), "last_checked_at": status.get("last_checked_at")})
+        return endpoints
+
+    def upsert_zotero_mcp_endpoint(self, endpoint: dict[str, Any]) -> dict[str, Any]:
+        endpoints = [dict(item) for item in self.config.zotero_mcp_endpoints]
+        endpoint_id = str(endpoint.get("id") or endpoint.get("alias") or "").strip()
+        if not endpoint_id:
+            endpoint_id = str(endpoint.get("alias") or f"zotero-{len(endpoints) + 1}").strip()
+        endpoint = {**endpoint, "id": endpoint_id}
+        replaced = False
+        for index, item in enumerate(endpoints):
+            if item.get("id") == endpoint_id or item.get("alias") == endpoint.get("alias"):
+                endpoints[index] = {**item, **endpoint}
+                replaced = True
+                break
+        if not replaced:
+            endpoints.append(endpoint)
+        self.update_config({"integrations": {"zotero_mcp_endpoints": endpoints}})
+        normalized = [item for item in self._configured_zotero_endpoints(include_headers=True) if item["id"] == endpoint_id]
+        if not normalized:
+            raise KeyError(f"Zotero MCP endpoint not found after update: {endpoint_id}")
+        return normalized[0]
+
+    def delete_zotero_mcp_endpoint(self, endpoint_id: str) -> dict[str, Any]:
+        endpoints = [dict(item) for item in self.config.zotero_mcp_endpoints if item.get("id") != endpoint_id]
+        self.update_config({"integrations": {"zotero_mcp_endpoints": endpoints}})
+        self.storage.delete_zotero_endpoint(endpoint_id)
+        return {"status": "deleted", "id": endpoint_id}
+
+    def test_zotero_mcp_endpoint(self, endpoint_id: str) -> dict[str, Any]:
+        endpoint = next((item for item in self._configured_zotero_endpoints(include_headers=True) if item["id"] == endpoint_id), None)
+        if not endpoint:
+            raise KeyError(f"Zotero MCP endpoint not found: {endpoint_id}")
+        result = ZoteroMcpClient(endpoint).test()
+        status = str(result.get("status") or "error")
+        self.storage.update_zotero_endpoint_status(endpoint_id, status=status, latency_ms=result.get("latency_ms"), error=None if status == "ok" else str(result.get("detail") or ""))
+        return {**endpoint, **result, "headers": {key: "****" for key in (endpoint.get("headers") or {})}}
+
+    def enqueue_literature_linking(self, document_id: str | None = None, *, run_now: bool = False) -> dict[str, Any]:
+        job = self.storage.create_literature_link_job(document_id=document_id, status="running" if run_now else "queued")
+        if run_now:
+            self._process_literature_link_job(job["id"], document_id=document_id)
+            return self.storage.list_literature_link_jobs(limit=1)[0]
+        threading.Thread(target=self._process_literature_link_job, args=(job["id"],), kwargs={"document_id": document_id}, name="zotero-linker", daemon=True).start()
+        return job
+
+    def list_literature_link_jobs(self, status: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        return self.storage.list_literature_link_jobs(status=status, limit=limit)
+
+    def list_literature_links(self, status: str = "", reaction_step_id: str = "", document_id: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        return self.storage.list_literature_links(status=status, reaction_step_id=reaction_step_id, document_id=document_id, limit=limit)
+
+    def confirm_literature_link(self, link_id: str, confirmed_by: str | None = None) -> dict[str, Any]:
+        return self.storage.update_literature_link_status(link_id, status="confirmed", confirmed_by=confirmed_by or "webui")
+
+    def reject_literature_link(self, link_id: str, reason: str = "") -> dict[str, Any]:
+        return self.storage.update_literature_link_status(link_id, status="rejected", reason=reason)
+
+    def get_reaction_literature_context(self, reaction_step_id: str) -> dict[str, Any]:
+        step = self.get_reaction_step(reaction_step_id)
+        links = self.list_literature_links(reaction_step_id=reaction_step_id, limit=50)
+        return {"reaction_step": step, "links": links, "provenance": self.get_reaction_provenance(reaction_step_id)}
+
+    def write_zotero_link_note(self, link_id: str) -> dict[str, Any]:
+        link = next((item for item in self.list_literature_links(limit=1000) if item["id"] == link_id), None)
+        if not link:
+            raise KeyError(f"Literature link not found: {link_id}")
+        endpoint = next((item for item in self._configured_zotero_endpoints(include_headers=True) if item["id"] == link.get("endpoint_id")), None)
+        if not endpoint:
+            raise KeyError("Configured Zotero endpoint for this link is no longer available")
+        if not endpoint.get("write_note_enabled"):
+            raise PermissionError("Zotero endpoint does not allow note writeback")
+        step = self.get_reaction_step(link["reaction_step_id"])
+        note = build_zotero_note(step, link)
+        try:
+            result = ZoteroMcpClient(endpoint).write_note(link["zotero_item_key"], note)
+        except Exception as exc:
+            return self.storage.record_zotero_writeback(literature_link_id=link_id, endpoint_id=endpoint["id"], zotero_item_key=link["zotero_item_key"], operation="write_note", payload={"note": note}, status="error", error=str(exc))
+        return self.storage.record_zotero_writeback(literature_link_id=link_id, endpoint_id=endpoint["id"], zotero_item_key=link["zotero_item_key"], operation="write_note", payload={"note": note, "result": result}, status="ok")
+
+    def _configured_zotero_endpoints(self, *, include_headers: bool = True) -> list[dict[str, Any]]:
+        endpoints = []
+        for endpoint in self.config.zotero_mcp_endpoints:
+            item = dict(endpoint)
+            headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
+            if not include_headers:
+                headers = {key: "****" for key in headers}
+            item["headers"] = headers
+            endpoints.append(item)
+        return endpoints
+
+    def _sync_zotero_endpoint_config(self) -> None:
+        for endpoint in self._configured_zotero_endpoints(include_headers=True):
+            self.storage.upsert_zotero_endpoint(endpoint)
+
+    def _process_literature_link_job(self, job_id: str, document_id: str | None = None) -> None:
+        try:
+            self.storage.update_literature_link_job(job_id, status="running", stage="zotero_search")
+            if not self.config.zotero_linking_enabled:
+                self.storage.update_literature_link_job(job_id, status="completed", stage="skipped")
+                return
+            endpoints = [endpoint for endpoint in self._select_zotero_endpoints() if endpoint.get("enabled", True)]
+            if not endpoints:
+                self.storage.update_literature_link_job(job_id, status="completed", stage="no_endpoints")
+                return
+            steps = self.storage.list_reaction_steps_for_document(document_id, limit=100)
+            for step in steps:
+                self._link_step_with_zotero(step.to_dict(), endpoints)
+            self.storage.update_literature_link_job(job_id, status="completed", stage="completed")
+        except Exception as exc:
+            self.storage.update_literature_link_job(job_id, status="failed", stage="failed", error=str(exc))
+
+    def _select_zotero_endpoints(self) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for endpoint in self._configured_zotero_endpoints(include_headers=True):
+            grouped.setdefault(str(endpoint.get("group_name") or endpoint.get("alias")), []).append(endpoint)
+        selected = []
+        for endpoints in grouped.values():
+            endpoints.sort(key=lambda item: (int(item.get("priority") or 100), str(item.get("alias") or "")))
+            selected.append(endpoints[0])
+        return selected
+
+    def _link_step_with_zotero(self, step: dict[str, Any], endpoints: list[dict[str, Any]]) -> None:
+        document = self.storage.get_document(step["source_document_id"])
+        document_data = document.to_dict() if document else {}
+        doi = normalize_doi(str(document_data.get("doi") or ""))
+        query = build_query(step, document_data)
+        for endpoint in endpoints:
+            client = ZoteroMcpClient(endpoint)
+            items = client.search_library(doi=doi, limit=5) if doi else []
+            if not items and query:
+                items = client.search_library(query=query, limit=5)
+            for item in items[:5]:
+                key = item_key(item)
+                if not key:
+                    continue
+                details = client.get_item_details(key)
+                merged = {**item, **details}
+                match_doi = item_doi(merged)
+                title = item_title(merged)
+                similarity = title_similarity(str(document_data.get("title") or step.get("reaction_name") or ""), title)
+                doi_exact = bool(doi and match_doi and doi == match_doi)
+                confidence = 0.95 if doi_exact and similarity >= 0.5 else 0.72 if doi_exact else max(0.25, similarity)
+                status = "auto_linked" if doi_exact and similarity >= 0.5 else "candidate"
+                abstract = client.get_item_abstract(key) or str(merged.get("abstractNote") or merged.get("abstract") or "")
+                excerpt = client.search_fulltext(key, query or doi)
+                method_text = excerpt or abstract
+                extracted = extract_method_fields(method_text)
+                field_diff = diff_reaction_fields(step, extracted)
+                self.storage.upsert_literature_link(
+                    {
+                        "reaction_step_id": step["id"],
+                        "source_document_id": step["source_document_id"],
+                        "endpoint_id": endpoint.get("id"),
+                        "endpoint_alias": endpoint.get("alias"),
+                        "endpoint_group": endpoint.get("group_name"),
+                        "zotero_item_key": key,
+                        "doi": match_doi or doi,
+                        "title": title,
+                        "year": item_year(merged),
+                        "abstract": trim_text(abstract, 1200),
+                        "status": status,
+                        "confidence": confidence,
+                        "match_signals": {"doi_exact": doi_exact, "title_similarity": round(similarity, 3), "query": query[:200], "endpoint_alias": endpoint.get("alias")},
+                        "method_excerpt": trim_text(method_text, 1600),
+                        "extracted_fields": extracted,
+                        "field_diff": field_diff,
+                    }
+                )
+
+    def _validate_upload_content(self, content: bytes, filename: str) -> None:
+        if not content:
+            raise ValueError("Uploaded file is empty")
+        if len(content) > self.config.upload_max_bytes:
+            raise ValueError(f"Upload exceeds configured limit of {self.config.upload_max_bytes} bytes")
+        safe_name = safe_filename(filename)
+        suffix = Path(safe_name).suffix.lower()
+        if suffix not in set(self.config.upload_extensions):
+            raise ValueError(f"Unsupported upload extension: {suffix or '<none>'}")
+        dangerous = detect_dangerous_payload(content)
+        if dangerous:
+            raise ValueError(f"Rejected dangerous upload payload: {dangerous}")
+        detected = sniff_document_type(content)
+        allowed = {
+            ".pdf": {"pdf"},
+            ".rtf": {"rtf"},
+            ".rdf": {"rdf"},
+            ".html": {"html"},
+            ".htm": {"html"},
+            ".mhtml": {"mhtml"},
+            ".mht": {"mhtml"},
+            ".md": {"text"},
+            ".markdown": {"text"},
+            ".txt": {"text"},
+        }
+        if self.config.reject_file_type_mismatch and detected not in allowed.get(suffix, set()):
+            raise ValueError(f"Upload extension {suffix} does not match detected content type {detected}")
+        if self.config.upload_av_scan_enabled:
+            self._scan_upload_with_antivirus(content, safe_name)
+
+    def _scan_upload_with_antivirus(self, content: bytes, filename: str) -> None:
+        if self.config.upload_av_engine != "clamav" or not self.config.upload_av_endpoint:
+            if self.config.upload_av_fail_closed:
+                raise ValueError("Antivirus scanning is enabled but ClamAV endpoint is not configured")
+            return
+        if self.config.upload_av_endpoint.startswith("tcp://"):
+            self._scan_with_clamav_instream(content, filename)
+            return
+        if self.config.upload_av_fail_closed:
+            raise ValueError("Only tcp:// ClamAV endpoints are supported for upload antivirus scanning")
+
+    def _scan_with_clamav_instream(self, content: bytes, filename: str) -> None:
+        import socket
+        from urllib.parse import urlparse
+
+        endpoint = urlparse(self.config.upload_av_endpoint or "")
+        host = endpoint.hostname
+        port = endpoint.port or 3310
+        if not host:
+            raise ValueError("Invalid ClamAV endpoint")
+        try:
+            with socket.create_connection((host, port), timeout=10) as sock:
+                sock.sendall(b"zINSTREAM\0")
+                for offset in range(0, len(content), 1024 * 1024):
+                    chunk = content[offset : offset + 1024 * 1024]
+                    sock.sendall(len(chunk).to_bytes(4, "big") + chunk)
+                sock.sendall((0).to_bytes(4, "big"))
+                response = sock.recv(4096).decode("utf-8", errors="replace")
+        except OSError as exc:
+            if self.config.upload_av_fail_closed:
+                raise ValueError(f"ClamAV scan failed for {filename}: {exc}") from exc
+            return
+        if "FOUND" in response:
+            raise ValueError(f"ClamAV rejected upload {filename}: {response.strip()}")
+        if "OK" not in response and self.config.upload_av_fail_closed:
+            raise ValueError(f"Unexpected ClamAV response for {filename}: {response.strip()}")
 
     def _process_document(self, document_id: str, job_id: str, *, parsed: ParsedDocument | None = None, reparse: bool = False) -> None:
         document = self.storage.get_document(document_id)
@@ -414,27 +777,58 @@ class RouteService:
         try:
             self.storage.update_job(job_id, status="running", stage="document_parse")
             parsed_document = parsed or self._parse_with_optional_external(Path(document.file_path))
+            visual_metadata = self._extract_visual_evidence(Path(document.file_path), document_id)
             if self._should_run_ocr(parsed_document) and self.config.ocr_endpoint:
                 self.storage.update_job(job_id, status="running", stage="ocr")
                 parsed_document = self._augment_with_ocr(document.file_path, parsed_document)
             self.storage.update_document_metadata(document_id, file_type=parsed_document.file_type or detect_file_type(document.file_path), title=parsed_document.title, doi=parsed_document.doi)
             if reparse:
                 self.storage.clear_document_reactions(document_id)
+            if parsed_document.file_type == "rdf":
+                self.storage.update_job(job_id, status="running", stage="rdf_structure_index")
+                self._index_rdf_structures(Path(document.file_path), document_id)
             self.storage.update_job(job_id, status="running", stage="reaction_extraction")
             extracted = extract_reaction_steps(parsed_document, document_id)
             inserted = []
             for step, provenance in extracted:
+                metadata = dict(step.get("metadata") or {})
+                if parsed_document.file_type == "rdf":
+                    metadata["structured_source"] = "rdf"
+                if visual_metadata:
+                    metadata.update(visual_metadata)
+                    if visual_metadata.get("has_visual_evidence"):
+                        provenance = {**provenance, "image_region_path": visual_metadata.get("first_visual_evidence_path")}
+                if metadata:
+                    step["metadata"] = metadata
                 step = self._structure_with_llm(step)
                 inserted_step = self.storage.insert_reaction_step(step, provenance)
                 inserted.append(inserted_step)
                 index_reaction_compounds(self.storage, inserted_step.id, inserted_step.original_text)
             status = "parsed" if inserted else "parsed_no_reactions"
             self.storage.set_document_status(document_id, status)
+            self.storage.auto_batch_document(document_id)
             self.storage.update_job(job_id, status="completed", stage="completed")
+            if self.config.zotero_linking_enabled and self.config.zotero_linking_on_import and inserted:
+                self.enqueue_literature_linking(document_id=document_id)
         except Exception as exc:
             self.storage.set_document_status(document_id, "failed")
             self.storage.update_job(job_id, status="failed", stage="failed", error=str(exc))
             raise
+
+    def _index_rdf_structures(self, path: Path, document_id: str) -> dict[str, int]:
+        from .chem import normalize_molfile
+
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        records: list[dict[str, Any]] = []
+        for record in parse_rdfile_reactions(text):
+            data = record.to_dict()
+            molecules: list[dict[str, Any]] = []
+            for molecule in data.get("molecules") or []:
+                normalized = normalize_molfile(molecule.get("molfile"))
+                molecules.append({**molecule, "smiles": normalized.smiles, "inchikey": normalized.inchikey, "fingerprint": normalized.fingerprint, "rdkit_status": normalized.status, "rdkit_error": normalized.error})
+            data["molecules"] = molecules
+            records.append(data)
+        return self.storage.upsert_rdf_reaction_records(document_id, records)
 
     def _parse_with_optional_external(self, path: Path) -> ParsedDocument:
         adapter = ExternalParserAdapter(self.config.document_parser_endpoint, self.config.document_parser_model)
@@ -445,6 +839,46 @@ class RouteService:
                 if not self.config.parser_fallback:
                     raise
         return parse_document(path)
+
+    def _extract_visual_evidence(self, path: Path, document_id: str) -> dict[str, Any]:
+        if not self.config.extract_visual_evidence or path.suffix.lower() != ".pdf":
+            return {}
+        try:
+            import fitz  # type: ignore[import-not-found]
+        except ImportError:
+            return {}
+        evidence_dir = self.config.evidence_dir / document_id
+        rendered: list[str] = []
+        image_counts: list[int] = []
+        drawing_counts: list[int] = []
+        try:
+            with fitz.open(path) as doc:
+                for index, page in enumerate(doc, start=1):
+                    images = len(page.get_images(full=True))
+                    drawings = len(page.get_drawings())
+                    image_counts.append(images)
+                    drawing_counts.append(drawings)
+                    if not self.config.render_visual_pages or len(rendered) >= self.config.max_visual_pages_per_document:
+                        continue
+                    if images == 0 and drawings < 30:
+                        continue
+                    evidence_dir.mkdir(parents=True, exist_ok=True)
+                    matrix = fitz.Matrix(self.config.visual_page_dpi / 72, self.config.visual_page_dpi / 72)
+                    pix = page.get_pixmap(matrix=matrix, alpha=False)
+                    target = evidence_dir / f"page-{index}.png"
+                    pix.save(target)
+                    rendered.append(str(target))
+        except Exception:
+            return {}
+        has_visual = bool(rendered or any(image_counts) or any(count >= 30 for count in drawing_counts))
+        return {
+            "has_visual_evidence": has_visual,
+            "visual_evidence_count": len(rendered),
+            "first_visual_evidence_path": rendered[0] if rendered else None,
+            "pdf_page_image_counts": image_counts,
+            "pdf_page_drawing_counts": drawing_counts,
+            "needs_visual_review": has_visual,
+        }
 
     def _should_run_ocr(self, parsed: ParsedDocument) -> bool:
         return parsed.file_type == "pdf" and len(parsed.full_text.strip()) < 80
@@ -590,6 +1024,28 @@ def safe_filename(value: str) -> str:
     return cleaned or "upload"
 
 
+def detect_dangerous_payload(content: bytes) -> str | None:
+    head = content[:8192].lstrip()
+    checks = [
+        (b"MZ", "windows-executable"),
+        (b"\x7fELF", "elf-executable"),
+        (b"\xcf\xfa\xed\xfe", "mach-o-binary"),
+        (b"\xfe\xed\xfa\xcf", "mach-o-binary"),
+        (b"PK\x03\x04", "zip-or-office-container"),
+        (b"Rar!", "rar-archive"),
+        (b"7z\xbc\xaf\x27\x1c", "7z-archive"),
+    ]
+    for magic, label in checks:
+        if head.startswith(magic):
+            return label
+    text = content[:65536].decode("latin-1", errors="ignore").lower()
+    if "\\object" in text or "\\objdata" in text:
+        return "rtf-embedded-object"
+    if re.search(r"(?:^|\n)\s*(?:powershell|cmd\.exe|#!/bin/sh|#!/bin/bash|wscript\.shell)\b", text):
+        return "script-like-text"
+    return None
+
+
 def directory_usage(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"path": str(path), "exists": False, "files": 0, "bytes": 0}
@@ -603,3 +1059,26 @@ def directory_usage(path: Path) -> dict[str, Any]:
             except OSError:
                 pass
     return {"path": str(path), "exists": True, "files": files, "bytes": bytes_total}
+
+
+def build_zotero_note(step: dict[str, Any], link: dict[str, Any]) -> str:
+    diff_lines = []
+    for field, data in (link.get("field_diff") or {}).items():
+        diff_lines.append(f"- {field}: {data.get('status')} | SciFinder={data.get('scifinder') or ''} | Literature={data.get('literature') or ''}")
+    return "\n".join(
+        [
+            "# Linked SciFinder Route",
+            f"Reaction step: {step.get('id')}",
+            f"Linked DOI: {link.get('doi') or ''}",
+            f"Linked title: {link.get('title') or ''}",
+            "",
+            "## SciFinder method",
+            str(step.get("original_text") or ""),
+            "",
+            "## Literature/SI excerpt",
+            str(link.get("method_excerpt") or ""),
+            "",
+            "## Field differences",
+            "\n".join(diff_lines) if diff_lines else "No field-level differences detected.",
+        ]
+    )

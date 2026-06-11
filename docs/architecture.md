@@ -14,7 +14,8 @@ NAS deployment runs one container with:
 ```text
 /inbox          read-only source exports
 /data           mutable database, uploads, evidence, config, backups
-/data/config.yaml hot app config
+/data/config.yaml base app config
+/data/webui-config.yaml Web UI hot config
 ```
 
 ## Storage
@@ -32,6 +33,10 @@ doi_verification
 reaction_step_fts
 vector_index
 integration_status
+zotero_mcp_endpoint
+literature_link_job
+zotero_literature_link
+zotero_writeback_log
 evaluation_metric
 compound
 compound_alias
@@ -76,9 +81,22 @@ LLMStructuringAdapter      POST /chat/completions
 OCRAdapter                 POST /ocr
 ExternalParserAdapter      POST /parse
 StructureRecognitionAdapter POST /recognize
+ZoteroMcpClient          Streamable HTTP MCP tools/call
 ```
 
 Adapters never process whole documents through the LLM. The LLM sees only candidate reaction blocks and must return strict JSON.
+
+## Web UI Hot Config
+
+The base config file and Web UI hot config file are separate. Environment variables and `SCIFINDER_ROUTE_CONFIG` define startup-safe defaults. `SCIFINDER_ROUTE_WEBUI_CONFIG` overlays runtime-editable settings such as Zotero MCP endpoint groups and linking toggles.
+
+Malformed Web UI config is ignored during startup/reload so the container can still start from the base config. Web UI writes never modify Docker-owned settings such as published ports, volume mounts, or container networks.
+
+## Zotero Literature Linking
+
+SciFinder imports can enqueue independent literature-linking jobs after parsing. These jobs query configured Zotero MCP endpoint groups and persist reaction-step-level literature links. The service stores metadata, abstracts, short method/SI excerpts, extracted fields, field differences, candidate/confirmation status, and writeback audit entries. It does not cache complete Zotero full text.
+
+Multiple endpoints can share a `group_name` when they are alternate routes to the same Zotero MCP server. Different groups represent different Zotero libraries and are queried as separate candidate sources.
 
 ## Vector Index
 
