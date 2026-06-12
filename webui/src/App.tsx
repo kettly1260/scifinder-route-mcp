@@ -5,6 +5,16 @@ import type { AdminState, ConfigField, JsonObject } from './types';
 
 type PageId = 'dashboard' | 'ingest' | 'config' | 'rdf' | 'structures' | 'literature' | 'ops';
 type ThemeId = 'aurora' | 'graphite' | 'emerald' | 'rose' | 'light';
+type UploadResultRow = {
+  file_name: string;
+  status: string;
+  tone: 'success' | 'deduped' | 'failed';
+  detail: string;
+  uploaded_path?: string;
+  document_id?: string;
+  job_id?: string;
+  deduplicated?: boolean;
+};
 
 const THEME_KEY = 'scifinderRouteAdminTheme';
 
@@ -306,23 +316,126 @@ function Dashboard({ state }: { state: AdminState }) {
 }
 
 function IngestPage({ token, state, guarded, refresh }: PageProps & { refresh: () => Promise<AdminState> }) {
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
+  const [uploadStatus, setUploadStatus] = useState('');
+  const [uploadResults, setUploadResults] = useState<UploadResultRow[]>([]);
+
+  async function uploadSelectedFiles() {
+    if (!files.length) return;
+    const results: UploadResultRow[] = [];
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      setUploadStatus(`正在上传 ${index + 1}/${files.length}: ${file.name}`);
+      try {
+        const result = await uploadFile(token, file);
+        const job = result.job as JsonObject | undefined;
+        const document = result.document as JsonObject | undefined;
+        const deduplicated = Boolean(result.deduplicated);
+        results.push({
+          file_name: file.name,
+          status: deduplicated ? '已去重' : String((job?.status as string | undefined) || '已导入'),
+          tone: deduplicated ? 'deduped' : 'success',
+          detail: deduplicated ? '服务器检测到重复文档，已跳过写入' : String((job?.stage as string | undefined) || result.uploaded_path || '已提交导入'),
+          uploaded_path: String(result.uploaded_path || ''),
+          document_id: String(document?.id || ''),
+          job_id: String(job?.id || ''),
+          deduplicated
+        });
+      } catch (error) {
+        results.push({
+          file_name: file.name,
+          status: '失败',
+          tone: 'failed',
+          detail: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+    setUploadResults(results);
+    const successCount = results.filter((item) => item.status !== '失败').length;
+    setUploadStatus(`完成：${successCount}/${results.length} 个文件已处理`);
+    await refresh();
+  }
+
+  function clearSelection() {
+    setFiles([]);
+    setUploadResults([]);
+    setUploadStatus('');
+  }
+
+  const uploadCounts = uploadResults.reduce(
+    (counts, item) => ({ ...counts, [item.tone]: counts[item.tone] + 1 }),
+    { success: 0, deduped: 0, failed: 0 }
+  );
+
   return (
     <div className="page-stack">
       <div className="grid two">
-        <Card eyebrow="Upload" title="上传并导入" extra={<Button disabled={!file} onClick={() => guarded(async () => { if (!file) return {}; const result = await uploadFile(token, file); await refresh(); return result; }, '上传完成')}>上传</Button>}>
-          <input className="file-input" type="file" onChange={(event) => setFile(event.target.files?.[0] || null)} />
+        <Card
+          eyebrow="Upload"
+          title="上传并导入"
+          extra={
+            <div className="button-row">
+              <Button disabled={!files.length} onClick={() => guarded(uploadSelectedFiles)}>批量上传并导入</Button>
+              <Button variant="ghost" disabled={!files.length && !uploadResults.length} onClick={clearSelection}>清空</Button>
+            </div>
+          }
+        >
+          <input
+            className="file-input"
+            type="file"
+            multiple
+            accept=".pdf,.rtf,.rdf,.html,.htm,.mhtml,.mht,.md,.markdown,.txt"
+            onChange={(event) => {
+              setFiles(Array.from(event.target.files || []));
+              setUploadResults([]);
+              setUploadStatus('已选择文件，准备上传');
+            }}
+          />
+          <p className="muted">支持批量选择 PDF/RTF/RDF/HTML/MHTML/Markdown/TXT，系统会逐个上传并导入。</p>
+          <div className="upload-summary">
+            <span>{files.length ? `已选择 ${files.length} 个文件` : '尚未选择文件'}</span>
+            {uploadStatus && <strong>{uploadStatus}</strong>}
+          </div>
+          {files.length > 0 && (
+            <ul className="upload-file-list">
+              {files.map((file) => <li key={`${file.name}-${file.size}-${file.lastModified}`}>{file.name}</li>)}
+            </ul>
+          )}
           <p className="muted">支持 PDF/RTF/RDF/HTML/MHTML/Markdown/TXT。上传仍会经过后端扩展名、嗅探和安全校验。</p>
         </Card>
         <Card eyebrow="Inbox" title="扫描收件箱" extra={<Button onClick={() => guarded(async () => { const result = await postJson<JsonObject>('/api/scan', token); await refresh(); return result; }, '扫描完成')}>扫描</Button>}>
           <p className="muted">从服务端可见 inbox 中登记新增 SciFinder 导出文件。不会绕过导入规则。</p>
         </Card>
       </div>
+      {uploadResults.length > 0 && (
+        <Card eyebrow="Upload Results" title="批量上传结果">
+          <div className="upload-result-summary" aria-label="批量上传结果统计">
+            <span className="success">成功 {uploadCounts.success}</span>
+            <span className="deduped">去重 {uploadCounts.deduped}</span>
+            <span className="failed">失败 {uploadCounts.failed}</span>
+          </div>
+          <DataTable<UploadResultRow>
+            rows={uploadResults}
+            columns={[
+              { key: 'file_name', label: '文件' },
+              { key: 'status', label: '状态', render: (row) => <StatusBadge tone={row.tone}>{row.status}</StatusBadge> },
+              { key: 'detail', label: '详情' },
+              { key: 'document_id', label: '文档 ID' },
+              { key: 'job_id', label: '任务 ID' },
+              { key: 'uploaded_path', label: '写入路径' }
+            ]}
+          />
+        </Card>
+      )}
       <Card eyebrow="Jobs" title="最近解析任务" extra={<Button variant="secondary" onClick={() => guarded(() => postJson('/api/retry-failed', token), '已提交失败任务重试')}>重试失败任务</Button>}>
         <DataTable rows={state.jobs} columns={[{ key: 'id', label: 'ID' }, { key: 'status', label: '状态' }, { key: 'stage', label: '阶段' }, { key: 'error', label: '错误' }]} />
       </Card>
     </div>
   );
+}
+
+function StatusBadge({ tone, children }: { tone: 'success' | 'deduped' | 'failed'; children: string }) {
+  return <span className={`status-badge ${tone}`}>{children}</span>;
 }
 
 function ConfigPage({ token, state, guarded, refresh }: PageProps & { refresh: () => Promise<AdminState> }) {

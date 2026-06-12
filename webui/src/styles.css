@@ -345,6 +345,32 @@ pre {
 }
 .empty-state { border: 1px dashed var(--line-strong); border-radius: 18px; padding: 24px; display: grid; gap: 6px; color: var(--muted); text-align: center; }
 .warning-list { margin: 0; padding-left: 20px; color: var(--muted); }
+.upload-summary { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 12px 0; }
+.upload-summary span, .upload-summary strong {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 7px 10px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+.upload-file-list { margin: 0; padding-left: 20px; color: var(--muted); }
+.upload-file-list li { margin: 4px 0; word-break: break-word; }
+.upload-result-summary { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 14px; }
+.upload-result-summary span, .status-badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+.upload-result-summary .success, .status-badge.success { border-color: rgba(22, 163, 74, 0.34); background: rgba(22, 163, 74, 0.08); color: var(--accent); }
+.upload-result-summary .deduped, .status-badge.deduped { border-color: rgba(202, 138, 4, 0.32); background: rgba(202, 138, 4, 0.08); color: var(--warning); }
+.upload-result-summary .failed, .status-badge.failed { border-color: rgba(225, 29, 72, 0.34); background: rgba(225, 29, 72, 0.08); color: var(--danger); }
 .model-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 .model-list button, .model-list span {
   border: 1px solid var(--line);
