@@ -69,7 +69,7 @@ const configFields: ConfigField[] = [
   { section: 'queue', name: 'redis_url', label: 'Redis URL', type: 'password', secret: true, placeholder: '留空则不变' },
   { section: 'security', name: 'allow_external_paths', label: '允许外部路径', type: 'bool' },
   { section: 'security', name: 'token', label: '配置令牌', type: 'password', secret: true, placeholder: '留空则不变' },
-  { section: 'ingest', name: 'scan_extensions', label: '扫描扩展名', type: 'list', placeholder: '.pdf,.html,.mhtml,.rdf' },
+  { section: 'ingest', name: 'scan_extensions', label: '扫描扩展名', type: 'list', placeholder: '.pdf,.rtf,.rdf,.html,.htm,.mhtml,.mht,.md,.markdown,.txt' },
   { section: 'thresholds', name: 'verification_confidence_threshold', label: '验证置信阈值', type: 'number', min: '0', max: '1', step: '0.01' },
   { section: 'extraction', name: 'llm_schema_version', label: 'LLM Schema 版本' },
   { section: 'extraction', name: 'llm_prompt_profile', label: 'LLM 提示词配置' },
@@ -637,6 +637,7 @@ function RdfPage({ token, guarded }: Pick<PageProps, 'token' | 'guarded'>) {
   return (
     <div className="page-stack">
       <Card eyebrow="RDF Viewer" title="反应记录" extra={<Button onClick={() => guarded(load, 'RDF 反应已加载')}>加载 RDF 反应</Button>}>
+        <p className="muted">RDF/RDfile 是结构化证据，但可能不含完整实验步骤；最终化学结论前请结合 PDF/RTF/HTML 可读或视觉证据核验。</p>
         <div className="form-grid compact-form">
           <Input label="CAS / 文件名 / 标题" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="CAS 反应号、结构 CAS RN、PDF/RDF 文件名或标题" />
           <Input label="数量限制" type="number" min="1" value={limit} onChange={(event) => setLimit(event.target.value)} />
@@ -702,6 +703,7 @@ function LiteraturePage({ token, state, guarded }: PageProps) {
   return (
     <div className="page-stack">
       <Card eyebrow="Zotero MCP" title="文献源地址" extra={<div className="button-row"><Button onClick={() => guarded(saveEndpoint, 'Zotero 端点已保存')}>保存地址</Button><Button variant="secondary" onClick={() => guarded(loadEndpoints, '端点已加载')}>加载端点</Button></div>}>
+        <p className="muted">保存或删除 Zotero MCP 端点会修改 Web UI 热配置，需要 admin 权限；operator 仅可测试端点和启动文献链接任务。</p>
         <div className="form-grid">
           <Input label="地址别名" value={endpoint.alias} onChange={(e) => setEndpoint({ ...endpoint, alias: e.target.value })} placeholder="lab-zotero-lan" />
           <Input label="文献源组名" value={endpoint.group_name} onChange={(e) => setEndpoint({ ...endpoint, group_name: e.target.value })} placeholder="primary-library" />

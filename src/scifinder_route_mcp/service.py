@@ -20,7 +20,10 @@ from .literature import ZoteroMcpClient, build_query, diff_reaction_fields, extr
 from .parsers import ParsedDocument, TextChunk, detect_file_type, parse_document, sniff_document_type
 from .rdfile import parse_rdfile_reactions
 from .registry import index_reaction_compounds, normalize_with_rdkit
-from .storage import RouteStorage
+from .storage import RouteStorage, is_sqlite_locked_error
+
+
+RDF_PROVENANCE_WARNING = "RDF/RDfile records are structured SciFinder evidence but may not include complete experimental procedures; verify RDF-derived chemical claims against linked PDF/RTF/HTML readable or visual provenance before final use."
 
 
 class RouteService:
@@ -174,7 +177,7 @@ class RouteService:
         return {"retried": [job.to_dict() for job in jobs], "count": len(jobs)}
 
     def health_check(self) -> dict[str, Any]:
-        return {
+        health: dict[str, Any] = {
             "status": "ok",
             "database": str(self.config.database_path),
             "data_dir": str(self.config.data_dir),
@@ -187,13 +190,34 @@ class RouteService:
             "storage_backend_status": self.storage_backend_status,
             "scan_extensions": list(self.config.scan_extensions),
             "config_warnings": self.config.validate(),
-            "documents": self.storage.count_documents(),
-            "reaction_steps": self.storage.count_reaction_steps(),
-            "vector_index": self.storage.vector_index_status(),
-            "ocr_backlog": self.storage.count_ocr_backlog(),
-            "integrations": self.storage.list_integration_statuses(),
-            "zotero_endpoints": self.list_zotero_mcp_endpoints(),
         }
+        try:
+            health.update(
+                {
+                    "documents": self.storage.count_documents(),
+                    "reaction_steps": self.storage.count_reaction_steps(),
+                    "vector_index": self.storage.vector_index_status(),
+                    "ocr_backlog": self.storage.count_ocr_backlog(),
+                    "integrations": self.storage.list_integration_statuses(),
+                    "zotero_endpoints": self.list_zotero_mcp_endpoints(),
+                }
+            )
+        except Exception as exc:
+            if not is_sqlite_locked_error(exc):
+                raise
+            health.update(
+                {
+                    "status": "degraded",
+                    "database_error": "database is locked",
+                    "documents": None,
+                    "reaction_steps": None,
+                    "vector_index": {"indexed": None, "errors": None},
+                    "ocr_backlog": None,
+                    "integrations": [],
+                    "zotero_endpoints": [],
+                }
+            )
+        return health
 
     def shutdown(self) -> None:
         self._stop_event.set()
@@ -421,7 +445,14 @@ class RouteService:
         return self.search_compounds(query=query, limit=limit)
 
     def get_chem_status(self) -> dict[str, Any]:
-        return {"rdkit": rdkit_info().to_dict(), "rdf_structure_index": self.storage.rdf_structure_index_status(), "install_job": self._rdkit_install_job}
+        status = {"rdkit": rdkit_info().to_dict(), "install_job": self._rdkit_install_job}
+        try:
+            status["rdf_structure_index"] = self.storage.rdf_structure_index_status()
+        except Exception as exc:
+            if not is_sqlite_locked_error(exc):
+                raise
+            status["rdf_structure_index"] = {"status": "degraded", "database_error": "database is locked"}
+        return status
 
     def install_rdkit_async(self) -> dict[str, Any]:
         with self._rdkit_install_lock:
@@ -444,16 +475,22 @@ class RouteService:
                 self._rdkit_install_job["result"] = result
 
     def list_rdf_reactions(self, document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
-        return self.storage.list_rdf_reactions(document_id=document_id, query=query, limit=limit, offset=offset, include_deleted=include_deleted)
+        return [self._with_rdf_provenance_warning(item) for item in self.storage.list_rdf_reactions(document_id=document_id, query=query, limit=limit, offset=offset, include_deleted=include_deleted)]
 
     def get_rdf_reaction(self, reaction_id: str, include_deleted: bool = False) -> dict[str, Any]:
         reaction = self.storage.get_rdf_reaction(reaction_id, include_deleted=include_deleted)
         if not reaction:
             raise KeyError(f"RDF reaction not found: {reaction_id}")
-        return reaction
+        return self._with_rdf_provenance_warning(reaction)
 
     def list_rdf_structures(self, document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
-        return self.storage.list_rdf_structures(document_id=document_id, query=query, limit=limit, offset=offset, include_deleted=include_deleted)
+        return [self._with_rdf_provenance_warning(item) for item in self.storage.list_rdf_structures(document_id=document_id, query=query, limit=limit, offset=offset, include_deleted=include_deleted)]
+
+    def _with_rdf_provenance_warning(self, item: dict[str, Any]) -> dict[str, Any]:
+        warnings = list(item.get("warnings") or [])
+        if RDF_PROVENANCE_WARNING not in warnings:
+            warnings.append(RDF_PROVENANCE_WARNING)
+        return {**item, "warnings": warnings, "provenance_warning": RDF_PROVENANCE_WARNING}
 
     def similarity_search_structures(self, query: str, query_type: str = "smiles", min_similarity: float = 0.2, limit: int = 20) -> dict[str, Any]:
         fp, error = fingerprint_from_query(query, query_type)
@@ -561,17 +598,34 @@ class RouteService:
         return {"dry_run": dry_run, "files": len(candidates), "bytes": bytes_total, "deleted": 0 if dry_run else len(candidates)}
 
     def get_production_status(self) -> dict[str, Any]:
-        return {
-            "health": self.health_check(),
-            "vector_index": self.get_vector_index_status(),
-            "chem": self.get_chem_status(),
-            "evaluation": self.get_evaluation_status(),
-            "storage_usage": self.get_storage_usage(),
-            "doi_low_confidence_queue": self.storage.low_confidence_doi_queue(self.config.verification_confidence_threshold, limit=20),
-            "compound_count": len(self.search_compounds(limit=1000)),
-            "literature_link_jobs": self.list_literature_link_jobs(limit=10),
-            "literature_candidates": self.list_literature_links(status="candidate", limit=20),
-        }
+        try:
+            return {
+                "health": self.health_check(),
+                "vector_index": self.get_vector_index_status(),
+                "chem": self.get_chem_status(),
+                "evaluation": self.get_evaluation_status(),
+                "storage_usage": self.get_storage_usage(),
+                "doi_low_confidence_queue": self.storage.low_confidence_doi_queue(self.config.verification_confidence_threshold, limit=20),
+                "compound_count": len(self.search_compounds(limit=1000)),
+                "literature_link_jobs": self.list_literature_link_jobs(limit=10),
+                "literature_candidates": self.list_literature_links(status="candidate", limit=20),
+            }
+        except Exception as exc:
+            if not is_sqlite_locked_error(exc):
+                raise
+            return {
+                "health": self.health_check(),
+                "status": "degraded",
+                "database_error": "database is locked",
+                "vector_index": {"configured": bool(self.config.embedding_endpoint), "indexed": None, "errors": None},
+                "chem": self.get_chem_status(),
+                "evaluation": {"latest": None},
+                "storage_usage": self.get_storage_usage(),
+                "doi_low_confidence_queue": [],
+                "compound_count": None,
+                "literature_link_jobs": [],
+                "literature_candidates": [],
+            }
 
     def list_zotero_mcp_endpoints(self, *, include_headers: bool = False) -> list[dict[str, Any]]:
         status_by_id = {item["id"]: item for item in self.storage.list_zotero_endpoints(include_headers=False)}
@@ -993,7 +1047,13 @@ class RouteService:
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
-            job = self.storage.claim_next_job()
+            try:
+                job = self.storage.claim_next_job()
+            except Exception as exc:
+                if not is_sqlite_locked_error(exc):
+                    raise
+                self._stop_event.wait(0.5)
+                continue
             if not job:
                 self._stop_event.wait(0.2)
                 continue

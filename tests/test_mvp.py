@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 import base64
+import builtins
 import http.client
 import json
+import sqlite3
 import time
 
 import pytest
 
 from scifinder_route_mcp.admin import AdminRunConfig, admin_state, render_dashboard, start_admin_server
+from scifinder_route_mcp.auth import UserCredential
 from scifinder_route_mcp.config import AppConfig, merge_hot_config, read_config_yaml, write_config_yaml
-from scifinder_route_mcp.server import ServerRunConfig, create_dual_transport_app, create_mcp, run_mcp_server
+from scifinder_route_mcp.server import SCIFINDER_IMPORT_GUIDANCE, ServerRunConfig, create_dual_transport_app, create_mcp, run_mcp_server
 from scifinder_route_mcp.service import RouteService
 from scifinder_route_mcp.parsers import parse_document
 from scifinder_route_mcp.storage import RouteStorage
@@ -31,6 +34,18 @@ def make_service(tmp_path: Path) -> RouteService:
     )
     config.ensure_directories()
     return RouteService(config=config, storage=RouteStorage(config.database_path))
+
+
+def create_fallback_mcp(service: RouteService, monkeypatch: pytest.MonkeyPatch):
+    original_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "fastmcp":
+            raise ImportError("force LocalMCP fallback")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    return create_mcp(service)
 
 
 def test_register_search_provenance_and_export(tmp_path: Path) -> None:
@@ -159,6 +174,20 @@ def test_rdf_v2000_import_is_viewable_without_rdkit(tmp_path: Path) -> None:
 
     assert [item["molfile_version"] for item in structures] == ["V2000", "V2000"]
     assert structures[0]["molfile"]
+    assert "provenance_warning" in structures[0]
+
+
+def test_rdf_reader_api_includes_provenance_warning(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export_v2000.rdf"
+
+    result = service.register_document(str(fixture))
+    reactions = service.list_rdf_reactions(document_id=result["document"]["id"])
+    detail = service.get_rdf_reaction(reactions[0]["id"])
+
+    assert "RDF/RDfile records are structured SciFinder evidence" in reactions[0]["provenance_warning"]
+    assert reactions[0]["provenance_warning"] in reactions[0]["warnings"]
+    assert detail["provenance_warning"] in detail["warnings"]
 
 
 def test_scan_inbox_deduplicates_registered_files(tmp_path: Path) -> None:
@@ -185,6 +214,91 @@ def test_health_check_reports_counts(tmp_path: Path) -> None:
     assert health["status"] == "ok"
     assert health["documents"] == 1
     assert health["reaction_steps"] >= 1
+
+
+def test_health_check_degrades_on_sqlite_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+
+    def locked_count_documents() -> int:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service.storage, "count_documents", locked_count_documents)
+
+    health = service.health_check()
+
+    assert health["status"] == "degraded"
+    assert health["database_error"] == "database is locked"
+    assert health["documents"] is None
+
+
+def test_health_check_keeps_unexpected_database_errors_visible(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+
+    def broken_count_documents() -> int:
+        raise sqlite3.OperationalError("no such table: source_document")
+
+    monkeypatch.setattr(service.storage, "count_documents", broken_count_documents)
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        service.health_check()
+
+
+def test_admin_state_degrades_when_job_listing_hits_sqlite_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+
+    def locked_list_parse_jobs(status: str = "", limit: int = 100) -> list[dict[str, object]]:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service, "list_parse_jobs", locked_list_parse_jobs)
+
+    state = admin_state(service)
+
+    assert state["jobs"] == []
+    assert state["health"]["status"] == "ok"
+
+
+def test_chem_status_degrades_on_sqlite_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+
+    def locked_rdf_structure_index_status() -> dict[str, object]:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service.storage, "rdf_structure_index_status", locked_rdf_structure_index_status)
+
+    status = service.get_chem_status()
+
+    assert status["rdf_structure_index"] == {"status": "degraded", "database_error": "database is locked"}
+
+
+def test_production_status_degrades_when_chem_status_hits_sqlite_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+
+    def locked_rdf_structure_index_status() -> dict[str, object]:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service.storage, "rdf_structure_index_status", locked_rdf_structure_index_status)
+
+    status = service.get_production_status()
+
+    assert status["chem"]["rdf_structure_index"]["status"] == "degraded"
+
+
+def test_worker_survives_sqlite_lock_while_claiming_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    calls = 0
+
+    def claim_next_job() -> object | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        service._stop_event.set()
+        return None
+
+    monkeypatch.setattr(service.storage, "claim_next_job", claim_next_job)
+    service._worker_loop()
+
+    assert calls == 2
 
 
 def test_async_register_returns_queued_job_then_completes(tmp_path: Path) -> None:
@@ -280,6 +394,14 @@ def test_mcp_fallback_registers_core_tools(tmp_path: Path) -> None:
         assert "docs://scifinder-import-guidance" in getattr(mcp, "resources", {})
 
 
+def test_import_guidance_preserves_safety_and_evidence_rules() -> None:
+    assert "upload_document_content" in SCIFINDER_IMPORT_GUIDANCE
+    assert "server-visible and intentionally trusted" in SCIFINDER_IMPORT_GUIDANCE
+    assert "ODF/ODT/ODS/ODP are not supported" in SCIFINDER_IMPORT_GUIDANCE
+    assert "PDF/RTF/HTML readable or visual provenance" in SCIFINDER_IMPORT_GUIDANCE
+    assert "retry shortly" in SCIFINDER_IMPORT_GUIDANCE
+
+
 def test_mcp_token_guard_blocks_calls(tmp_path: Path) -> None:
     config = AppConfig(
         data_dir=tmp_path / "data",
@@ -300,6 +422,62 @@ def test_mcp_token_guard_blocks_calls(tmp_path: Path) -> None:
         assert mcp.tools["health_check"]("secret")["status"] == "ok"
         with pytest.raises(PermissionError):
             mcp.tools["update_config"]({}, token="bad")
+
+
+def test_mcp_dict_read_tool_degrades_on_sqlite_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    mcp = create_fallback_mcp(service, monkeypatch)
+
+    def locked_get_vector_index_status() -> dict[str, object]:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service, "get_vector_index_status", locked_get_vector_index_status)
+
+    status = mcp.tools["get_vector_index_status"]()
+
+    assert status["status"] == "degraded"
+    assert status["database_error"] == "database is locked"
+    assert status["indexed"] is None
+
+
+def test_mcp_single_record_read_tool_degrades_on_sqlite_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    mcp = create_fallback_mcp(service, monkeypatch)
+
+    def locked_get_reaction_step(reaction_step_id: str) -> dict[str, object]:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service, "get_reaction_step", locked_get_reaction_step)
+
+    result = mcp.tools["get_reaction_step"]("step_1")
+
+    assert result == {"status": "degraded", "database_error": "database is locked", "reaction_step_id": "step_1", "result": None}
+
+
+def test_mcp_list_read_tool_returns_retryable_error_on_sqlite_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    mcp = create_fallback_mcp(service, monkeypatch)
+
+    def locked_list_parse_jobs(status: str = "", limit: int = 100) -> list[dict[str, object]]:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service, "list_parse_jobs", locked_list_parse_jobs)
+
+    with pytest.raises(RuntimeError, match="retry shortly"):
+        mcp.tools["list_parse_jobs"]()
+
+
+def test_mcp_read_tool_keeps_unexpected_database_errors_visible(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    mcp = create_fallback_mcp(service, monkeypatch)
+
+    def broken_get_vector_index_status() -> dict[str, object]:
+        raise sqlite3.OperationalError("no such table: vector_index")
+
+    monkeypatch.setattr(service, "get_vector_index_status", broken_get_vector_index_status)
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        mcp.tools["get_vector_index_status"]()
 
 
 def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
@@ -526,11 +704,13 @@ def test_admin_dashboard_contains_modern_config_controls(tmp_path: Path) -> None
     assert "启动 Zotero 链接" in html
     assert "zotero_linking_enabled" in html
     assert "留空则不变" in html
+    assert ".pdf,.rtf,.rdf,.html,.htm,.mhtml,.mht,.md,.markdown,.txt" in html
     assert "aria-label=\"管理控制台分区导航\"" in html
     assert "href=\"#rdf-viewer\"" in html
     assert "id=\"rdf-viewer\"" in html
     assert "featured-panel" in html
     assert "加载 RDF 反应" in html
+    assert "RDF/RDfile 是结构化证据" in html
     assert "prefers-color-scheme: dark" in html
     assert "color-scheme:light dark" in html
     assert "position:sticky" in html
@@ -546,6 +726,19 @@ def admin_request(port: int, method: str, path: str, payload: dict[str, object] 
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"Content-Type": "application/json"} if payload is not None else {}
+    conn.request(method, path, body=body, headers=headers)
+    response = conn.getresponse()
+    text = response.read().decode("utf-8")
+    conn.close()
+    return response.status, text
+
+
+def admin_request_with_token(port: int, method: str, path: str, token: str, payload: dict[str, object] | None = None) -> tuple[int, str]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"X-Scifinder-Route-Token": token}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
     conn.request(method, path, body=body, headers=headers)
     response = conn.getresponse()
     text = response.read().decode("utf-8")
@@ -578,6 +771,40 @@ def test_admin_server_serves_react_webui_and_management_apis(tmp_path: Path) -> 
         status, body = admin_request(port, "GET", "/api/literature/links?status=candidate&limit=5")
         assert status == 200
         assert json.loads(body) == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_admin_zotero_endpoint_config_requires_admin_role(tmp_path: Path) -> None:
+    config = AppConfig(
+        data_dir=tmp_path / "data",
+        inbox_dir=tmp_path / "data" / "inbox",
+        upload_dir=tmp_path / "data" / "uploads",
+        evidence_dir=tmp_path / "data" / "evidence",
+        database_path=tmp_path / "data" / "routes.sqlite3",
+        config_path=tmp_path / "data" / "config.yaml",
+        sample_dir=None,
+        users=(UserCredential("ops", "operator-token", "operator"), UserCredential("admin", "admin-token", "admin")),
+    )
+    service = RouteService(config=config, storage=RouteStorage(config.database_path))
+    server = start_admin_server(service, AdminRunConfig(host="127.0.0.1", port=0))
+    assert server is not None
+    port = server.server_address[1]
+    payload = {"alias": "lab", "group_name": "main", "url": "http://zotero:23120/mcp"}
+    try:
+        status, _body = admin_request_with_token(port, "POST", "/api/zotero/endpoints", "operator-token", payload)
+        assert status == 403
+
+        status, body = admin_request_with_token(port, "POST", "/api/zotero/endpoints", "admin-token", payload)
+        assert status == 200
+        endpoint_id = json.loads(body)["id"]
+
+        status, _body = admin_request_with_token(port, "POST", "/api/zotero/endpoints/delete", "operator-token", {"id": endpoint_id})
+        assert status == 403
+
+        status, _body = admin_request_with_token(port, "POST", "/api/zotero/endpoints/delete", "admin-token", {"id": endpoint_id})
+        assert status == 200
     finally:
         server.shutdown()
         server.server_close()

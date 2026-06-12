@@ -9,6 +9,7 @@ from typing import Any, Callable
 from .auth import authenticate_token, role_allows
 from .admin import start_admin_server
 from .service import RouteService
+from .storage import is_sqlite_locked_error
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,25 @@ def create_mcp(service: RouteService | None = None) -> Any:
         if not role_allows(user.role, role):
             raise PermissionError(f"Token role '{user.role}' cannot perform '{role}' operations")
 
+    def locked_status(**extra: Any) -> dict[str, Any]:
+        return {"status": "degraded", "database_error": "database is locked", **extra}
+
+    def read_dict(call: Callable[[], dict[str, Any]], **locked_extra: Any) -> dict[str, Any]:
+        try:
+            return call()
+        except Exception as exc:
+            if is_sqlite_locked_error(exc):
+                return locked_status(**locked_extra)
+            raise
+
+    def read_list(call: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        try:
+            return call()
+        except Exception as exc:
+            if is_sqlite_locked_error(exc):
+                raise RuntimeError("database is locked; retry shortly") from exc
+            raise
+
     try:
         from fastmcp import FastMCP  # type: ignore[import-not-found]
     except ImportError:  # pragma: no cover - fallback is mainly for tests/minimal environments
@@ -129,13 +149,13 @@ def create_mcp(service: RouteService | None = None) -> Any:
     def get_parse_job_status(job_id: str, token: str | None = None) -> dict[str, Any]:
         """Return parse job status, stage, and error details."""
         require_role(token, "viewer")
-        return get_service().get_parse_job_status(job_id=job_id)
+        return read_dict(lambda: get_service().get_parse_job_status(job_id=job_id), job_id=job_id, result=None)
 
     @mcp.tool()
     def list_parse_jobs(status: str = "", limit: int = 100, token: str | None = None) -> list[dict[str, Any]]:
         """List recent parse jobs, optionally filtered by status."""
         require_role(token, "viewer")
-        return get_service().list_parse_jobs(status=status, limit=limit)
+        return read_list(lambda: get_service().list_parse_jobs(status=status, limit=limit))
 
     @mcp.tool()
     def health_check(token: str | None = None) -> dict[str, Any]:
@@ -179,26 +199,28 @@ def create_mcp(service: RouteService | None = None) -> Any:
     ) -> list[dict[str, Any]]:
         """Search extracted reaction steps by text and structured condition filters."""
         require_role(token, "viewer")
-        return get_service().search_reaction_steps(
-            query=query,
-            reagent=reagent,
-            solvent=solvent,
-            document_id=document_id,
-            min_confidence=min_confidence,
-            limit=limit,
+        return read_list(
+            lambda: get_service().search_reaction_steps(
+                query=query,
+                reagent=reagent,
+                solvent=solvent,
+                document_id=document_id,
+                min_confidence=min_confidence,
+                limit=limit,
+            )
         )
 
     @mcp.tool()
     def get_reaction_step(reaction_step_id: str, token: str | None = None) -> dict[str, Any]:
         """Return one structured reaction step."""
         require_role(token, "viewer")
-        return get_service().get_reaction_step(reaction_step_id=reaction_step_id)
+        return read_dict(lambda: get_service().get_reaction_step(reaction_step_id=reaction_step_id), reaction_step_id=reaction_step_id, result=None)
 
     @mcp.tool()
     def get_reaction_provenance(reaction_step_id: str, token: str | None = None) -> list[dict[str, Any]]:
         """Return source text/page/parser provenance for a reaction step."""
         require_role(token, "viewer")
-        return get_service().get_reaction_provenance(reaction_step_id=reaction_step_id)
+        return read_list(lambda: get_service().get_reaction_provenance(reaction_step_id=reaction_step_id))
 
     @mcp.tool()
     def reparse_document(document_id: str, token: str | None = None) -> dict[str, Any]:
@@ -257,25 +279,25 @@ def create_mcp(service: RouteService | None = None) -> Any:
     def get_vector_index_status(token: str | None = None) -> dict[str, Any]:
         """Return vector index coverage, model, and last error."""
         require_role(token, "viewer")
-        return get_service().get_vector_index_status()
+        return read_dict(lambda: get_service().get_vector_index_status(), indexed=None, errors=None)
 
     @mcp.tool()
     def semantic_search_reaction_steps(query: str, limit: int = 10, token: str | None = None) -> list[dict[str, Any]]:
         """Search reaction steps semantically using the configured embedding endpoint."""
         require_role(token, "viewer")
-        return get_service().semantic_search_reaction_steps(query=query, limit=limit)
+        return read_list(lambda: get_service().semantic_search_reaction_steps(query=query, limit=limit))
 
     @mcp.tool()
     def search_compounds(query: str = "", limit: int = 20, token: str | None = None) -> list[dict[str, Any]]:
         """Search the compound registry by name, CAS, SMILES, or InChIKey."""
         require_role(token, "viewer")
-        return get_service().search_compounds(query=query, limit=limit)
+        return read_list(lambda: get_service().search_compounds(query=query, limit=limit))
 
     @mcp.tool()
     def get_compound(compound_id: str, token: str | None = None) -> dict[str, Any]:
         """Return compound metadata, aliases, and linked reactions."""
         require_role(token, "viewer")
-        return get_service().get_compound(compound_id)
+        return read_dict(lambda: get_service().get_compound(compound_id), compound_id=compound_id, result=None)
 
     @mcp.tool()
     def merge_compounds(source_compound_id: str, target_compound_id: str, token: str | None = None) -> dict[str, Any]:
@@ -287,7 +309,7 @@ def create_mcp(service: RouteService | None = None) -> Any:
     def search_by_smiles(smiles: str, limit: int = 20, token: str | None = None) -> list[dict[str, Any]]:
         """Normalize a SMILES string when RDKit is available, then search compounds."""
         require_role(token, "viewer")
-        return get_service().search_by_smiles(smiles, limit=limit)
+        return read_list(lambda: get_service().search_by_smiles(smiles, limit=limit))
 
     @mcp.tool()
     def recognize_structure_image(image_path: str, reaction_step_id: str | None = None, token: str | None = None) -> dict[str, Any]:
@@ -305,31 +327,31 @@ def create_mcp(service: RouteService | None = None) -> Any:
     def list_rdf_reactions(document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, token: str | None = None) -> list[dict[str, Any]]:
         """List indexed SciFinder RDF reaction records with scheme/step metadata."""
         require_role(token, "viewer")
-        return get_service().list_rdf_reactions(document_id=document_id, query=query, limit=limit, offset=offset)
+        return read_list(lambda: get_service().list_rdf_reactions(document_id=document_id, query=query, limit=limit, offset=offset))
 
     @mcp.tool()
     def get_rdf_reaction(reaction_id: str, token: str | None = None) -> dict[str, Any]:
         """Return one RDF reaction record with V2000/V3000 molfile structures."""
         require_role(token, "viewer")
-        return get_service().get_rdf_reaction(reaction_id)
+        return read_dict(lambda: get_service().get_rdf_reaction(reaction_id), reaction_id=reaction_id, result=None)
 
     @mcp.tool()
     def search_rdf_structures(query: str = "", document_id: str = "", limit: int = 50, offset: int = 0, token: str | None = None) -> list[dict[str, Any]]:
         """Search indexed RDF structures by name, CAS, SMILES, or InChIKey."""
         require_role(token, "viewer")
-        return get_service().list_rdf_structures(document_id=document_id, query=query, limit=limit, offset=offset)
+        return read_list(lambda: get_service().list_rdf_structures(document_id=document_id, query=query, limit=limit, offset=offset))
 
     @mcp.tool()
     def similarity_search_structures(query: str, query_type: str = "smiles", min_similarity: float = 0.2, limit: int = 20, token: str | None = None) -> dict[str, Any]:
         """Run RDKit fingerprint similarity search over indexed RDF compounds."""
         require_role(token, "viewer")
-        return get_service().similarity_search_structures(query=query, query_type=query_type, min_similarity=min_similarity, limit=limit)
+        return read_dict(lambda: get_service().similarity_search_structures(query=query, query_type=query_type, min_similarity=min_similarity, limit=limit), query=query, results=[])
 
     @mcp.tool()
     def substructure_search_structures(query: str, query_type: str = "smarts", limit: int = 20, token: str | None = None) -> dict[str, Any]:
         """Run RDKit substructure search over indexed RDF molfile structures."""
         require_role(token, "viewer")
-        return get_service().substructure_search_structures(query=query, query_type=query_type, limit=limit)
+        return read_dict(lambda: get_service().substructure_search_structures(query=query, query_type=query_type, limit=limit), query=query, results=[])
 
     @mcp.tool()
     def trash_item(entity_type: str, entity_id: str, token: str | None = None) -> dict[str, Any]:
@@ -347,7 +369,7 @@ def create_mcp(service: RouteService | None = None) -> Any:
     def list_trash(limit: int = 100, token: str | None = None) -> list[dict[str, Any]]:
         """List items in the recycle bin."""
         require_role(token, "viewer")
-        return get_service().list_trash(limit=limit)
+        return read_list(lambda: get_service().list_trash(limit=limit))
 
     @mcp.tool()
     def empty_trash(token: str | None = None) -> dict[str, int]:
@@ -365,7 +387,7 @@ def create_mcp(service: RouteService | None = None) -> Any:
     def get_evaluation_status(token: str | None = None) -> dict[str, Any]:
         """Return the latest evaluation metrics."""
         require_role(token, "viewer")
-        return get_service().get_evaluation_status()
+        return read_dict(lambda: get_service().get_evaluation_status(), latest=None)
 
     @mcp.tool()
     def backup_database(output_path: str | None = None, token: str | None = None) -> dict[str, Any]:
@@ -395,7 +417,7 @@ def create_mcp(service: RouteService | None = None) -> Any:
     def list_zotero_mcp_endpoints(token: str | None = None) -> list[dict[str, Any]]:
         """List Zotero MCP endpoints from the Web UI hot config plus latest health status."""
         require_role(token, "viewer")
-        return get_service().list_zotero_mcp_endpoints()
+        return read_list(lambda: get_service().list_zotero_mcp_endpoints())
 
     @mcp.tool()
     def upsert_zotero_mcp_endpoint(endpoint: dict[str, Any], token: str | None = None) -> dict[str, Any]:
@@ -419,7 +441,7 @@ def create_mcp(service: RouteService | None = None) -> Any:
     def list_literature_links(status: str = "", reaction_step_id: str = "", document_id: str = "", limit: int = 50, token: str | None = None) -> list[dict[str, Any]]:
         """List Zotero literature candidates, auto-links, confirmed links, and rejected links."""
         require_role(token, "viewer")
-        return get_service().list_literature_links(status=status, reaction_step_id=reaction_step_id, document_id=document_id, limit=limit)
+        return read_list(lambda: get_service().list_literature_links(status=status, reaction_step_id=reaction_step_id, document_id=document_id, limit=limit))
 
     @mcp.tool()
     def confirm_literature_link(link_id: str, token: str | None = None) -> dict[str, Any]:
@@ -437,7 +459,7 @@ def create_mcp(service: RouteService | None = None) -> Any:
     def get_reaction_literature_context(reaction_step_id: str, token: str | None = None) -> dict[str, Any]:
         """Return a reaction step with linked Zotero literature, excerpts, and field differences."""
         require_role(token, "viewer")
-        return get_service().get_reaction_literature_context(reaction_step_id)
+        return read_dict(lambda: get_service().get_reaction_literature_context(reaction_step_id), reaction_step_id=reaction_step_id, result=None)
 
     @mcp.tool()
     def write_zotero_link_note(link_id: str, token: str | None = None) -> dict[str, Any]:
@@ -449,13 +471,15 @@ def create_mcp(service: RouteService | None = None) -> Any:
     def list_export_batches(limit: int = 100, token: str | None = None) -> list[dict[str, Any]]:
         """List explainable SciFinder export batches linking RDF with readable/visual files."""
         require_role(token, "viewer")
-        return get_service().storage.list_export_batches(limit=limit)
+        return read_list(lambda: get_service().storage.list_export_batches(limit=limit))
 
     @mcp.tool()
     def get_export_batch(batch_id: str, token: str | None = None) -> dict[str, Any]:
         """Return one export batch, linked documents, confidence, and merge explanation."""
         require_role(token, "viewer")
-        batch = get_service().storage.get_export_batch(batch_id)
+        batch = read_dict(lambda: get_service().storage.get_export_batch(batch_id) or {}, batch_id=batch_id, result=None)
+        if batch.get("status") == "degraded":
+            return batch
         if not batch:
             raise KeyError(f"Export batch not found: {batch_id}")
         return batch
@@ -476,10 +500,12 @@ SCIFINDER_IMPORT_GUIDANCE = """SciFinder Route MCP import guidance:
 - The Admin UI is a separate operational HTTP interface, not an MCP transport.
 - Ask the user before importing files they provide.
 - Use upload_document_content for client-local/chat attachment content when available; it requires operator/admin token permission.
+- Do not use register_document or upload_document to bypass upload validation; local paths are only for files already server-visible and intentionally trusted.
 - Supported import formats are PDF, RTF, MDL RDfile/RDF, HTML/MHTML, Markdown, and plain text. ODF/ODT/ODS/ODP are not supported.
 - Uploads must pass size, extension, content-type sniffing, format-specific safety checks, and optional ClamAV scanning before writing to upload_dir.
 - RDF/RDfile is the preferred structured reaction source for CAS Reaction Number, molecule CTAB, CAS RN fields, yield, reagents, catalysts, solvents, and references.
-- RDF may not contain full experimental procedures. Link RDF-derived records to PDF/RTF/HTML readable or visual provenance when available.
+- RDF may not contain full experimental procedures. Warn before final chemical claims when RDF lacks linked PDF/RTF/HTML readable or visual provenance.
+- MCP list/read tools may ask the client to retry shortly during transient SQLite writer locks; status/single-record tools return status=degraded with database_error.
 - Auto-merge export batches only with explainable high-confidence signals; keep low-confidence matches as candidates and ask for confirmation.
 """
 

@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .auth import authenticate_token, role_allows
 from .service import RouteService
+from .storage import is_sqlite_locked_error
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,11 @@ class AdminHandler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             if self._send_static_asset("index.html"):
                 return
-            self._send_html(render_dashboard(self.server.service))
+            try:
+                self._send_html(render_dashboard(self.server.service))
+            except Exception as exc:
+                if not self._send_lock_error(exc):
+                    raise
             return
         if parsed.path.startswith("/assets/"):
             if self._send_static_asset(parsed.path.lstrip("/")):
@@ -58,7 +63,11 @@ class AdminHandler(BaseHTTPRequestHandler):
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
                 return
-            self._send_json(admin_state(self.server.service))
+            try:
+                self._send_json(admin_state(self.server.service))
+            except Exception as exc:
+                if not self._send_lock_error(exc):
+                    raise
             return
         if parsed.path == "/api/rdf/reactions":
             try:
@@ -68,7 +77,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._send_error_json(exc)
             return
         if parsed.path == "/api/rdf/structures":
             try:
@@ -78,7 +87,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._send_error_json(exc)
             return
         if parsed.path.startswith("/api/rdf/reactions/"):
             try:
@@ -88,7 +97,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._send_error_json(exc)
             return
         if parsed.path == "/api/chem/status":
             try:
@@ -96,6 +105,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._send_json(self.server.service.get_chem_status())
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_error_json(exc)
             return
         if parsed.path == "/api/trash":
             try:
@@ -105,7 +116,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._send_error_json(exc)
             return
         if parsed.path == "/api/zotero/endpoints":
             try:
@@ -114,7 +125,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._send_error_json(exc)
             return
         if parsed.path == "/api/literature/jobs":
             try:
@@ -124,7 +135,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._send_error_json(exc)
             return
         if parsed.path == "/api/literature/links":
             try:
@@ -141,7 +152,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._send_error_json(exc)
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -196,7 +207,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._send_json(self.server.service.list_integration_models(str(payload.get("kind") or ""), overrides=overrides))
                 return
             if parsed.path == "/api/zotero/endpoints":
-                self._require_role("operator")
+                self._require_role("admin")
                 payload = self._read_json()
                 self._send_json(self.server.service.upsert_zotero_mcp_endpoint(payload))
                 return
@@ -206,7 +217,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._send_json(self.server.service.test_zotero_mcp_endpoint(str(payload.get("id") or "")))
                 return
             if parsed.path == "/api/zotero/endpoints/delete":
-                self._require_role("operator")
+                self._require_role("admin")
                 payload = self._read_json()
                 self._send_json(self.server.service.delete_zotero_mcp_endpoint(str(payload.get("id") or "")))
                 return
@@ -262,7 +273,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             return
         except Exception as exc:
-            self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            self._send_error_json(exc)
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -303,6 +314,17 @@ class AdminHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_error_json(self, exc: Exception) -> None:
+        if self._send_lock_error(exc):
+            return
+        self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+    def _send_lock_error(self, exc: Exception) -> bool:
+        if not is_sqlite_locked_error(exc):
+            return False
+        self._send_json({"error": "database is locked", "status": "degraded"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+        return True
 
     def _send_html(self, body: str) -> None:
         encoded = body.encode("utf-8")
@@ -351,12 +373,18 @@ def start_admin_server(service: RouteService, config: AdminRunConfig | None = No
 
 
 def admin_state(service: RouteService) -> dict[str, Any]:
+    try:
+        jobs = service.list_parse_jobs(limit=20)
+    except Exception as exc:
+        if not is_sqlite_locked_error(exc):
+            raise
+        jobs = []
     return {
         "auth_required": bool(service.config.auth_token or service.config.users),
         "health": service.health_check(),
         "config": service.get_config(),
         "validation": service.validate_config(),
-        "jobs": service.list_parse_jobs(limit=20),
+        "jobs": jobs,
         "production": service.get_production_status(),
     }
 
@@ -438,11 +466,12 @@ def render_dashboard(service: RouteService) -> str:
           <section id="secure-changes" class="panel glass"><div class="panel-title"><div><p class="eyebrow">安全变更</p><h2>受保护操作</h2></div><button type="button" onclick="scanInbox()">扫描收件箱</button></div><p class="hint">端口、卷挂载等 Docker-owned 设置仍在 .env / Docker Compose 中修改。</p></section>
           <section class="grid two">
             <form id="integrations" class="panel glass" onsubmit="saveConfig(event)"><div class="panel-title"><div><p class="eyebrow">集成服务</p><h2>API 设置</h2></div><button type="submit">保存并重载</button></div><div class="form-grid"><label>LLM 提供商 <select name="llm_provider" data-section="integrations" data-type="enum"><option value="openai_compatible">OpenAI 兼容</option><option value="openai_chat">OpenAI Chat Completions</option><option value="openai_responses">OpenAI Responses</option><option value="gemini">Gemini</option><option value="claude">Claude</option></select></label><label>LLM API Token <input name="llm_api_key" data-section="integrations" data-secret="true" type="password" placeholder="留空则不变"></label><label>LLM 端点 <input name="llm_endpoint" data-section="integrations" placeholder="https://api.openai.com/v1 / https://generativelanguage.googleapis.com/v1beta / https://api.anthropic.com/v1"><button type="button" class="inline-button" onclick="testEndpoint('llm')">测试 LLM</button></label><label>LLM 模型 <input name="llm_model" data-section="integrations" list="llmModelOptions" placeholder="gpt-4o-mini / gemini-2.5-pro / claude-3-5-sonnet"><datalist id="llmModelOptions"></datalist><button type="button" class="inline-button" onclick="loadModels('llm','llmModelOptions','llmModelStatus')">拉取模型</button><span id="llmModelStatus" class="field-status"></span></label><label>嵌入 API Token <input name="embedding_api_key" data-section="integrations" data-secret="true" type="password" placeholder="留空则不变"></label><label>嵌入端点 <input name="embedding_endpoint" data-section="integrations" placeholder="http://embedding:8000/v1"><button type="button" class="inline-button" onclick="testEndpoint('embedding')">测试 Embedding</button></label><label>嵌入模型 <input name="embedding_model" data-section="integrations" list="embeddingModelOptions" placeholder="bge-m3"><datalist id="embeddingModelOptions"></datalist><button type="button" class="inline-button" onclick="loadModels('embedding','embeddingModelOptions','embeddingModelStatus')">拉取模型</button><span id="embeddingModelStatus" class="field-status"></span></label><label>OCR 提供商 <select name="ocr_provider" data-section="integrations" data-type="enum"><option value="generic">通用 HTTP OCR</option><option value="mineru">MinerU API</option><option value="paddleocr_vl">PaddleOCR-VL Job API</option></select><span class="field-status">MinerU 文档: https://mineru.net/apiManage/docs；PaddleOCR 端点示例: https://paddleocr.aistudio-app.com/api/v2/ocr/jobs</span></label><label>OCR API Token <input name="ocr_api_key" data-section="integrations" data-secret="true" type="password" placeholder="留空则不变"></label><label>OCR 端点 <input name="ocr_endpoint" data-section="integrations" placeholder="http://mineru:9000 或 PaddleOCR JOB_URL"><button type="button" class="inline-button" onclick="testEndpoint('ocr')">测试 OCR</button></label><label>OCR 模型 <input name="ocr_model" data-section="integrations" list="ocrModelOptions" placeholder="mineru-layout / PaddleOCR-VL-1.6"><datalist id="ocrModelOptions"></datalist><button type="button" class="inline-button" onclick="loadModels('ocr','ocrModelOptions','ocrModelStatus')">拉取模型</button><span id="ocrModelStatus" class="field-status"></span></label><label>文档解析 API Token <input name="document_parser_api_key" data-section="integrations" data-secret="true" type="password" placeholder="留空则不变"></label><label>文档解析端点 <input name="document_parser_endpoint" data-section="integrations" placeholder="http://parser:9100"><button type="button" class="inline-button" onclick="testEndpoint('document_parser')">测试文档解析</button></label><label>文档解析模型 <input name="document_parser_model" data-section="integrations" list="parserModelOptions" placeholder="pymupdf|mineru"><datalist id="parserModelOptions"></datalist><button type="button" class="inline-button" onclick="loadModels('document_parser','parserModelOptions','parserModelStatus')">拉取模型</button><span id="parserModelStatus" class="field-status"></span></label><label>解析失败回退 <select name="document_parser_fallback" data-section="integrations" data-type="bool"><option value="true">启用</option><option value="false">停用</option></select></label><label>PostgreSQL URL <input name="postgres_url" data-section="integrations" data-secret="true" placeholder="留空则不变"><button type="button" class="inline-button" onclick="testEndpoint('postgres')">测试 Postgres</button></label><label>结构识别 API Token <input name="structure_recognition_api_key" data-section="integrations" data-secret="true" type="password" placeholder="留空则不变"></label><label>结构识别端点 <input name="structure_recognition_endpoint" data-section="integrations" placeholder="http://decimer:9300"><button type="button" class="inline-button" onclick="testEndpoint('structure_recognition')">测试结构识别</button></label><label>结构识别模型 <input name="structure_recognition_model" data-section="integrations" list="structureModelOptions" placeholder="decimer|molscribe|osra"><datalist id="structureModelOptions"></datalist><button type="button" class="inline-button" onclick="loadModels('structure_recognition','structureModelOptions','structureModelStatus')">拉取模型</button><span id="structureModelStatus" class="field-status"></span></label><label>启用 LLM <select name="llm_enabled" data-section="integrations" data-type="bool"><option value="false">停用</option><option value="true">启用</option></select></label><label>Zotero 文献链接 <select name="zotero_linking_enabled" data-section="integrations" data-type="bool"><option value="false">停用</option><option value="true">启用</option></select></label><label>导入后链接 Zotero <select name="zotero_linking_on_import" data-section="integrations" data-type="bool"><option value="true">启用</option><option value="false">停用</option></select></label><label>Zotero 抽取策略 <select name="zotero_extraction_strategy" data-section="integrations" data-type="enum"><option value="rules_first">规则优先</option><option value="llm_first">LLM 优先</option><option value="rules_only">仅规则</option></select></label><label>LLM 优先术语 <input name="zotero_llm_priority_terms" data-section="integrations" data-type="list" placeholder="scale,purification,SI"></label></div><p class="hint">Web UI 变更会保存到 {escape((state['config'].get('paths') or {}).get('webui_config_path'))}。</p></form>
-            <form id="runtime" class="panel glass" onsubmit="saveConfig(event)"><div class="panel-title"><div><p class="eyebrow">运行时</p><h2>扫描与阈值</h2></div><button type="submit">保存并重载</button></div><div class="form-grid"><label>扫描扩展名 <input name="scan_extensions" data-section="ingest" data-type="list" placeholder=".pdf,.html,.mhtml"></label><label>最大工作线程 <input name="max_workers" data-section="server" type="number" min="1"></label><label>异步任务 <select name="async_jobs" data-section="server" data-type="bool"><option value="true">启用</option><option value="false">停用</option></select></label><label>允许外部路径 <select name="allow_external_paths" data-section="security" data-type="bool"><option value="false">禁止</option><option value="true">允许</option></select></label><label>配置令牌 <input name="token" data-section="security" data-secret="true" type="password" placeholder="留空则不变"></label><label>验证置信阈值 <input name="verification_confidence_threshold" data-section="thresholds" type="number" min="0" max="1" step="0.01"></label><label>队列后端 <select name="backend" data-section="queue" data-type="enum"><option value="sqlite">sqlite</option><option value="redis">redis</option></select></label><label>Redis URL <input name="redis_url" data-section="queue" data-secret="true" placeholder="留空则不变"></label><label>存储后端 <select name="storage_backend" data-section="server" data-type="enum"><option value="sqlite">sqlite</option><option value="postgres">postgres</option></select></label><label>LLM Schema 版本 <input name="llm_schema_version" data-section="extraction" placeholder="reaction_step.v1"></label><label>LLM 提示词配置 <input name="llm_prompt_profile" data-section="extraction" placeholder="strict-reaction-json"></label><label>LLM 成本上限 USD <input name="llm_cost_limit_usd" data-section="extraction" type="number" min="0" step="0.01"></label><label>证据保留天数 <input name="evidence_retention_days" data-section="retention" type="number" min="1"></label><label>缓存保留天数 <input name="cache_retention_days" data-section="retention" type="number" min="1"></label></div></form>
+            <form id="runtime" class="panel glass" onsubmit="saveConfig(event)"><div class="panel-title"><div><p class="eyebrow">运行时</p><h2>扫描与阈值</h2></div><button type="submit">保存并重载</button></div><div class="form-grid"><label>扫描扩展名 <input name="scan_extensions" data-section="ingest" data-type="list" placeholder=".pdf,.rtf,.rdf,.html,.htm,.mhtml,.mht,.md,.markdown,.txt"></label><label>最大工作线程 <input name="max_workers" data-section="server" type="number" min="1"></label><label>异步任务 <select name="async_jobs" data-section="server" data-type="bool"><option value="true">启用</option><option value="false">停用</option></select></label><label>允许外部路径 <select name="allow_external_paths" data-section="security" data-type="bool"><option value="false">禁止</option><option value="true">允许</option></select></label><label>配置令牌 <input name="token" data-section="security" data-secret="true" type="password" placeholder="留空则不变"></label><label>验证置信阈值 <input name="verification_confidence_threshold" data-section="thresholds" type="number" min="0" max="1" step="0.01"></label><label>队列后端 <select name="backend" data-section="queue" data-type="enum"><option value="sqlite">sqlite</option><option value="redis">redis</option></select></label><label>Redis URL <input name="redis_url" data-section="queue" data-secret="true" placeholder="留空则不变"></label><label>存储后端 <select name="storage_backend" data-section="server" data-type="enum"><option value="sqlite">sqlite</option><option value="postgres">postgres</option></select></label><label>LLM Schema 版本 <input name="llm_schema_version" data-section="extraction" placeholder="reaction_step.v1"></label><label>LLM 提示词配置 <input name="llm_prompt_profile" data-section="extraction" placeholder="strict-reaction-json"></label><label>LLM 成本上限 USD <input name="llm_cost_limit_usd" data-section="extraction" type="number" min="0" step="0.01"></label><label>证据保留天数 <input name="evidence_retention_days" data-section="retention" type="number" min="1"></label><label>缓存保留天数 <input name="cache_retention_days" data-section="retention" type="number" min="1"></label></div></form>
           </section>
         </section>
 
         <section id="data-viewers" class="view-panel" data-view="data-viewers" data-title="数据查看">
+          <p class="hint warning">RDF/RDfile 是结构化证据，但可能不含完整实验步骤；最终化学结论前请结合 PDF/RTF/HTML 可读或视觉证据核验。</p>
           <section id="rdf-viewer" class="panel glass featured-panel"><div class="panel-title"><div><p class="eyebrow">RDF 查看器</p><h2>反应记录</h2></div><button type="button" onclick="loadRdfReactions()">加载 RDF 反应</button></div><div class="form-grid"><label>CAS / 文件名 / 标题 <input id="rdfQuery" placeholder="CAS 反应号、结构 CAS RN、PDF/RDF 文件名或标题"></label><label>数量限制 <input id="rdfLimit" type="number" value="25" min="1"></label></div><p class="hint">不需要知道 document_id；可用 CAS、SciFinder 反应号、PDF/RDF 文件名、标题或 DOI 模糊检索。</p><div id="rdfReactions" class="table-wrap"></div><pre id="rdfDetail">选择一个反应以查看 molfile 块。</pre></section>
           <section class="grid two"><section id="chem-search" class="panel glass"><div class="panel-title"><div><p class="eyebrow">化学检索</p><h2>RDKit 结构</h2></div><button type="button" onclick="installRdkit()">安装 RDKit</button></div><pre>{escape(json.dumps(chem, indent=2))}</pre><div class="form-grid"><label>查询 <input id="chemQuery" placeholder="SMILES、SMARTS、CAS 或名称"></label><label>模式 <select id="chemMode"><option value="similarity">相似度</option><option value="substructure">子结构</option><option value="text">文本过滤</option></select></label></div><button type="button" onclick="runChemSearch()">检索结构</button><div id="chemResults" class="table-wrap"></div></section><section id="zotero" class="panel glass"><div class="panel-title"><div><p class="eyebrow">Zotero MCP</p><h2>文献源地址</h2></div><div class="button-row compact"><button type="button" onclick="saveZoteroEndpoint()">保存地址</button><button type="button" onclick="loadZoteroEndpoints()">重新加载</button></div></div><p class="hint">同一个文献源组名下可以添加多个地址，例如 LAN、VPN、反代地址；系统按优先级选择可用地址。</p><div class="form-grid"><label>地址别名 <input id="zoteroAlias" placeholder="lab-zotero-lan"></label><label>文献源组名 <input id="zoteroGroup" placeholder="primary-library"></label><label>地址 URL <input id="zoteroUrl" placeholder="http://host:23120/mcp"></label><label>优先级 <input id="zoteroPriority" type="number" value="100"></label><label>超时秒数 <input id="zoteroTimeout" type="number" value="10" step="0.5"></label><label>启用 <select id="zoteroEnabled"><option value="true">启用</option><option value="false">停用</option></select></label><label>允许写回笔记 <select id="zoteroWriteNote"><option value="false">禁止</option><option value="true">允许</option></select></label><label>请求头 JSON <input id="zoteroHeaders" placeholder='{{"Authorization":"Bearer ..."}}'></label></div><div id="zoteroEndpoints" class="table-wrap"></div></section></section>
         </section>
