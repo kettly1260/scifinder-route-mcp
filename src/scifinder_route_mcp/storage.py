@@ -628,18 +628,36 @@ class RouteStorage:
                     inserted_structures += 1
         return {"records": inserted_records, "structures": inserted_structures}
 
-    def list_rdf_reactions(self, *, document_id: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
+    def list_rdf_reactions(self, *, document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
         clauses = [] if include_deleted else ["r.deleted_at IS NULL"]
         params: list[Any] = []
         if document_id:
             clauses.append("r.source_document_id = ?")
             params.append(document_id)
+        if query:
+            like = f"%{query}%"
+            clauses.append(
+                """
+                (
+                    r.cas_reaction_number LIKE ? OR r.scheme_id LIKE ? OR r.step_id LIKE ? OR r.reference LIKE ?
+                    OR d.id LIKE ? OR d.file_path LIKE ? OR d.title LIKE ? OR d.doi LIKE ?
+                    OR EXISTS (
+                        SELECT 1 FROM rdf_structure rs
+                        WHERE rs.rdf_reaction_id = r.id
+                          AND (? OR rs.deleted_at IS NULL)
+                          AND (rs.cas_rn LIKE ? OR rs.name LIKE ? OR rs.formula LIKE ?)
+                    )
+                )
+                """
+            )
+            params.extend([like, like, like, like, like, like, like, like, 1 if include_deleted else 0, like, like, like])
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT r.*, COUNT(s.id) AS structure_count
+                SELECT r.*, d.file_path AS source_file_path, d.title AS source_title, COUNT(s.id) AS structure_count
                 FROM rdf_reaction_record r
+                JOIN source_document d ON d.id = r.source_document_id
                 LEFT JOIN rdf_structure s ON s.rdf_reaction_id = r.id AND (? OR s.deleted_at IS NULL)
                 {where}
                 GROUP BY r.id

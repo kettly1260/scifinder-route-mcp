@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import base64
+import http.client
 import json
 import time
 
 import pytest
 
-from scifinder_route_mcp.admin import AdminRunConfig, admin_state, render_dashboard
+from scifinder_route_mcp.admin import AdminRunConfig, admin_state, render_dashboard, start_admin_server
 from scifinder_route_mcp.config import AppConfig, merge_hot_config, read_config_yaml, write_config_yaml
 from scifinder_route_mcp.server import ServerRunConfig, create_dual_transport_app, create_mcp, run_mcp_server
 from scifinder_route_mcp.service import RouteService
@@ -519,6 +520,47 @@ def test_admin_dashboard_contains_modern_config_controls(tmp_path: Path) -> None
     assert "@media (max-width: 699px)" in html
     assert "@media (hover: none) and (pointer: coarse)" in html
     assert state["production"]
+
+
+def admin_request(port: int, method: str, path: str, payload: dict[str, object] | None = None) -> tuple[int, str]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"} if payload is not None else {}
+    conn.request(method, path, body=body, headers=headers)
+    response = conn.getresponse()
+    text = response.read().decode("utf-8")
+    conn.close()
+    return response.status, text
+
+
+def test_admin_server_serves_react_webui_and_management_apis(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    server = start_admin_server(service, AdminRunConfig(host="127.0.0.1", port=0))
+    assert server is not None
+    port = server.server_address[1]
+    try:
+        status, body = admin_request(port, "GET", "/")
+        assert status == 200
+        assert '<div id="root"></div>' in body
+
+        status, body = admin_request(port, "POST", "/api/zotero/endpoints", {"alias": "lab", "group_name": "main", "url": "http://zotero:23120/mcp"})
+        assert status == 200
+        assert json.loads(body)["alias"] == "lab"
+
+        status, body = admin_request(port, "GET", "/api/zotero/endpoints")
+        assert status == 200
+        assert json.loads(body)[0]["headers"] == {}
+
+        status, body = admin_request(port, "GET", "/api/literature/jobs?limit=5")
+        assert status == 200
+        assert json.loads(body) == []
+
+        status, body = admin_request(port, "GET", "/api/literature/links?status=candidate&limit=5")
+        assert status == 200
+        assert json.loads(body) == []
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_admin_run_config_defaults_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None:

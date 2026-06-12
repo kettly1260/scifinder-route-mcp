@@ -1,3 +1,12 @@
+FROM node:24-slim AS webui-build
+
+WORKDIR /app/webui
+COPY webui/package*.json ./
+RUN npm ci
+COPY webui ./
+COPY src/scifinder_route_mcp/admin_webui ../src/scifinder_route_mcp/admin_webui
+RUN npm run build
+
 FROM python:3.12-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -24,6 +33,7 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY --from=webui-build /app/src/scifinder_route_mcp/admin_webui ./src/scifinder_route_mcp/admin_webui
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install .

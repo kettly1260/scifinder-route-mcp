@@ -15,7 +15,7 @@ from typing import Any
 from .chem import fingerprint_from_query, install_rdkit, rdkit_info, substructure_match, tanimoto
 from .config import AppConfig
 from .extractor import extract_reaction_steps
-from .integrations import EmbeddingAdapter, ExternalParserAdapter, LLMStructuringAdapter, OCRAdapter, StructureRecognitionAdapter, test_http_endpoint
+from .integrations import EmbeddingAdapter, ExternalParserAdapter, LLMStructuringAdapter, OCRAdapter, StructureRecognitionAdapter, list_http_models, test_http_endpoint
 from .literature import ZoteroMcpClient, build_query, diff_reaction_fields, extract_method_fields, item_doi, item_key, item_title, item_year, normalize_doi, title_similarity, trim_text
 from .parsers import ParsedDocument, TextChunk, detect_file_type, parse_document, sniff_document_type
 from .rdfile import parse_rdfile_reactions
@@ -306,7 +306,7 @@ class RouteService:
         return {"latest": self.storage.latest_evaluation_metrics()}
 
     def rebuild_vector_index(self, limit: int = 10000) -> dict[str, Any]:
-        adapter = EmbeddingAdapter(self.config.embedding_endpoint, self.config.embedding_model)
+        adapter = EmbeddingAdapter(self.config.embedding_endpoint, self.config.embedding_model, self.config.embedding_api_key)
         if not adapter.configured:
             return {"configured": False, "status": "skipped", "reason": "embedding endpoint is not configured", **self.storage.vector_index_status()}
         indexed = 0
@@ -327,7 +327,7 @@ class RouteService:
         return {"configured": bool(self.config.embedding_endpoint), **self.storage.vector_index_status()}
 
     def semantic_search_reaction_steps(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        adapter = EmbeddingAdapter(self.config.embedding_endpoint, self.config.embedding_model)
+        adapter = EmbeddingAdapter(self.config.embedding_endpoint, self.config.embedding_model, self.config.embedding_api_key)
         if not adapter.configured:
             return []
         vector = adapter.embed([query])[0]
@@ -335,11 +335,11 @@ class RouteService:
 
     def test_integration_endpoint(self, kind: str) -> dict[str, Any]:
         endpoints = {
-            "llm": (self.config.llm_endpoint, self.config.llm_model),
-            "embedding": (self.config.embedding_endpoint, self.config.embedding_model),
-            "ocr": (self.config.ocr_endpoint, self.config.ocr_model),
-            "document_parser": (self.config.document_parser_endpoint, self.config.document_parser_model),
-            "structure_recognition": (self.config.structure_recognition_endpoint, self.config.structure_recognition_model),
+            "llm": (self.config.llm_endpoint, self.config.llm_model, self.config.llm_provider, self.config.llm_api_key),
+            "embedding": (self.config.embedding_endpoint, self.config.embedding_model, "openai_compatible", self.config.embedding_api_key),
+            "ocr": (self.config.ocr_endpoint, self.config.ocr_model, "openai_compatible", self.config.ocr_api_key),
+            "document_parser": (self.config.document_parser_endpoint, self.config.document_parser_model, "openai_compatible", self.config.document_parser_api_key),
+            "structure_recognition": (self.config.structure_recognition_endpoint, self.config.structure_recognition_model, "openai_compatible", self.config.structure_recognition_api_key),
         }
         if kind == "postgres":
             result = self._test_postgres()
@@ -354,9 +354,24 @@ class RouteService:
             return self.storage.record_integration_status("zotero_mcp", configured=True, status="ok" if ok else "error", detail=detail[:1000])
         if kind not in endpoints:
             raise ValueError(f"Unknown integration kind: {kind}")
-        endpoint, model = endpoints[kind]
-        result = test_http_endpoint(endpoint, model=model)
+        endpoint, model, provider, api_key = endpoints[kind]
+        result = test_http_endpoint(endpoint, model=model, provider=provider, api_key=api_key)
         return self.storage.record_integration_status(kind, configured=result.configured, status=result.status, detail=result.detail)
+
+    def list_integration_models(self, kind: str) -> dict[str, Any]:
+        endpoints = {
+            "llm": (self.config.llm_endpoint, self.config.llm_provider, self.config.llm_api_key),
+            "embedding": (self.config.embedding_endpoint, "openai_compatible", self.config.embedding_api_key),
+            "ocr": (self.config.ocr_endpoint, "openai_compatible", self.config.ocr_api_key),
+            "document_parser": (self.config.document_parser_endpoint, "openai_compatible", self.config.document_parser_api_key),
+            "structure_recognition": (self.config.structure_recognition_endpoint, "openai_compatible", self.config.structure_recognition_api_key),
+        }
+        if kind not in endpoints:
+            raise ValueError(f"Unknown integration kind: {kind}")
+        endpoint, provider, api_key = endpoints[kind]
+        result = list_http_models(endpoint, provider=provider, api_key=api_key)
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        return {"kind": kind, "configured": result.configured, "status": result.status, "detail": result.detail, "models": payload.get("models", [])}
 
     def search_compounds(self, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
         return [compound.to_dict() for compound in self.storage.search_compounds(query=query, limit=limit)]
@@ -398,8 +413,8 @@ class RouteService:
                 self._rdkit_install_job["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
                 self._rdkit_install_job["result"] = result
 
-    def list_rdf_reactions(self, document_id: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
-        return self.storage.list_rdf_reactions(document_id=document_id, limit=limit, offset=offset, include_deleted=include_deleted)
+    def list_rdf_reactions(self, document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
+        return self.storage.list_rdf_reactions(document_id=document_id, query=query, limit=limit, offset=offset, include_deleted=include_deleted)
 
     def get_rdf_reaction(self, reaction_id: str, include_deleted: bool = False) -> dict[str, Any]:
         reaction = self.storage.get_rdf_reaction(reaction_id, include_deleted=include_deleted)
@@ -451,7 +466,7 @@ class RouteService:
         return self.storage.empty_trash()
 
     def recognize_structure_image(self, image_path: str, reaction_step_id: str | None = None) -> dict[str, Any]:
-        adapter = StructureRecognitionAdapter(self.config.structure_recognition_endpoint, self.config.structure_recognition_model)
+        adapter = StructureRecognitionAdapter(self.config.structure_recognition_endpoint, self.config.structure_recognition_model, self.config.structure_recognition_api_key)
         if not adapter.configured:
             return {"configured": False, "status": "skipped", "reason": "structure recognition endpoint is not configured", "compounds": []}
         structures = adapter.recognize(image_path)
@@ -831,7 +846,7 @@ class RouteService:
         return self.storage.upsert_rdf_reaction_records(document_id, records)
 
     def _parse_with_optional_external(self, path: Path) -> ParsedDocument:
-        adapter = ExternalParserAdapter(self.config.document_parser_endpoint, self.config.document_parser_model)
+        adapter = ExternalParserAdapter(self.config.document_parser_endpoint, self.config.document_parser_model, self.config.document_parser_api_key)
         if adapter.configured:
             try:
                 return adapter.parse(str(path))
@@ -884,7 +899,7 @@ class RouteService:
         return parsed.file_type == "pdf" and len(parsed.full_text.strip()) < 80
 
     def _augment_with_ocr(self, file_path: str, parsed: ParsedDocument) -> ParsedDocument:
-        adapter = OCRAdapter(self.config.ocr_endpoint, self.config.ocr_model)
+        adapter = OCRAdapter(self.config.ocr_endpoint, self.config.ocr_model, self.config.ocr_api_key, self.config.ocr_provider)
         payload = adapter.ocr_document(file_path)
         text = str(payload.get("text") or "")
         confidence = payload.get("confidence")
@@ -900,6 +915,8 @@ class RouteService:
             enabled=self.config.llm_enabled,
             schema_version=self.config.llm_schema_version,
             prompt_profile=self.config.llm_prompt_profile,
+            provider=self.config.llm_provider,
+            api_key=self.config.llm_api_key,
         )
         step.setdefault("extraction_method", "rules")
         step.setdefault("schema_version", self.config.llm_schema_version)

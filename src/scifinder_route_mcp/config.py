@@ -17,16 +17,23 @@ HOT_CONFIG_KEYS = {
     "ingest": {"scan_extensions", "upload_extensions", "upload_max_bytes", "reject_file_type_mismatch", "extract_visual_evidence", "render_visual_pages", "visual_page_dpi", "max_visual_pages_per_document", "max_embedded_images_per_document"},
     "queue": {"backend", "redis_url"},
     "integrations": {
+        "llm_provider",
         "llm_endpoint",
+        "llm_api_key",
         "llm_model",
         "llm_enabled",
+        "embedding_api_key",
         "embedding_endpoint",
         "embedding_model",
+        "ocr_provider",
+        "ocr_api_key",
         "ocr_endpoint",
         "ocr_model",
+        "document_parser_api_key",
         "document_parser_endpoint",
         "document_parser_model",
         "document_parser_fallback",
+        "structure_recognition_api_key",
         "structure_recognition_endpoint",
         "structure_recognition_model",
         "postgres_url",
@@ -73,20 +80,27 @@ class AppConfig:
     upload_av_fail_closed: bool = True
     storage_backend: str = "sqlite"
     queue_backend: str = "sqlite"
+    llm_provider: str = "openai_compatible"
     llm_endpoint: str | None = None
+    llm_api_key: str | None = None
     llm_model: str | None = None
     llm_enabled: bool = False
     llm_schema_version: str = "reaction_step.v1"
     llm_prompt_profile: str = "strict-reaction-json"
     llm_cost_limit_usd: float = 0.0
     embedding_endpoint: str | None = None
+    embedding_api_key: str | None = None
     embedding_model: str | None = None
+    ocr_provider: str = "generic"
     ocr_endpoint: str | None = None
+    ocr_api_key: str | None = None
     ocr_model: str | None = None
     document_parser_endpoint: str | None = None
+    document_parser_api_key: str | None = None
     document_parser_model: str | None = None
     parser_fallback: bool = True
     structure_recognition_endpoint: str | None = None
+    structure_recognition_api_key: str | None = None
     structure_recognition_model: str | None = None
     postgres_url: str | None = None
     zotero_mcp_endpoints: tuple[dict[str, Any], ...] = ()
@@ -139,20 +153,27 @@ class AppConfig:
             upload_av_fail_closed=parse_bool(os.getenv("SCIFINDER_ROUTE_UPLOAD_AV_FAIL_CLOSED"), default=True),
             storage_backend=os.getenv("SCIFINDER_ROUTE_BACKEND", "sqlite").strip().lower() or "sqlite",
             queue_backend=os.getenv("SCIFINDER_ROUTE_QUEUE_BACKEND", "sqlite").strip().lower() or "sqlite",
+            llm_provider=os.getenv("SCIFINDER_ROUTE_LLM_PROVIDER", "openai_compatible").strip() or "openai_compatible",
             llm_endpoint=os.getenv("SCIFINDER_ROUTE_LLM_ENDPOINT") or None,
+            llm_api_key=os.getenv("SCIFINDER_ROUTE_LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY") or os.getenv("GEMINI_API_KEY") or None,
             llm_model=os.getenv("SCIFINDER_ROUTE_LLM_MODEL") or None,
             llm_enabled=parse_bool(os.getenv("SCIFINDER_ROUTE_LLM_ENABLED"), default=False),
             llm_schema_version=os.getenv("SCIFINDER_ROUTE_LLM_SCHEMA_VERSION", "reaction_step.v1"),
             llm_prompt_profile=os.getenv("SCIFINDER_ROUTE_LLM_PROMPT_PROFILE", "strict-reaction-json"),
             llm_cost_limit_usd=float(os.getenv("SCIFINDER_ROUTE_LLM_COST_LIMIT_USD", "0")),
             embedding_endpoint=os.getenv("SCIFINDER_ROUTE_EMBEDDING_ENDPOINT") or None,
+            embedding_api_key=os.getenv("SCIFINDER_ROUTE_EMBEDDING_API_KEY") or None,
             embedding_model=os.getenv("SCIFINDER_ROUTE_EMBEDDING_MODEL") or None,
+            ocr_provider=os.getenv("SCIFINDER_ROUTE_OCR_PROVIDER", "generic").strip() or "generic",
             ocr_endpoint=os.getenv("SCIFINDER_ROUTE_OCR_ENDPOINT") or None,
+            ocr_api_key=os.getenv("SCIFINDER_ROUTE_OCR_API_KEY") or None,
             ocr_model=os.getenv("SCIFINDER_ROUTE_OCR_MODEL") or None,
             document_parser_endpoint=os.getenv("SCIFINDER_ROUTE_DOCUMENT_PARSER_ENDPOINT") or None,
+            document_parser_api_key=os.getenv("SCIFINDER_ROUTE_DOCUMENT_PARSER_API_KEY") or None,
             document_parser_model=os.getenv("SCIFINDER_ROUTE_DOCUMENT_PARSER_MODEL") or None,
             parser_fallback=parse_bool(os.getenv("SCIFINDER_ROUTE_DOCUMENT_PARSER_FALLBACK"), default=True),
             structure_recognition_endpoint=os.getenv("SCIFINDER_ROUTE_STRUCTURE_RECOGNITION_ENDPOINT") or None,
+            structure_recognition_api_key=os.getenv("SCIFINDER_ROUTE_STRUCTURE_RECOGNITION_API_KEY") or None,
             structure_recognition_model=os.getenv("SCIFINDER_ROUTE_STRUCTURE_RECOGNITION_MODEL") or None,
             postgres_url=os.getenv("SCIFINDER_ROUTE_POSTGRES_URL") or None,
             zotero_mcp_endpoints=parse_json_list(os.getenv("SCIFINDER_ROUTE_ZOTERO_MCP_ENDPOINTS")),
@@ -193,6 +214,11 @@ class AppConfig:
         token = self.auth_token if include_secrets else mask_secret(self.auth_token)
         postgres_url = self.postgres_url if include_secrets else mask_secret(self.postgres_url)
         redis_url = self.redis_url if include_secrets else mask_secret(self.redis_url)
+        llm_api_key = self.llm_api_key if include_secrets else mask_secret(self.llm_api_key)
+        embedding_api_key = self.embedding_api_key if include_secrets else mask_secret(self.embedding_api_key)
+        ocr_api_key = self.ocr_api_key if include_secrets else mask_secret(self.ocr_api_key)
+        document_parser_api_key = self.document_parser_api_key if include_secrets else mask_secret(self.document_parser_api_key)
+        structure_recognition_api_key = self.structure_recognition_api_key if include_secrets else mask_secret(self.structure_recognition_api_key)
         return {
             "paths": {
                 "data_dir": str(self.data_dir),
@@ -233,17 +259,24 @@ class AppConfig:
                 "redis_url": redis_url,
             },
             "integrations": {
+                "llm_provider": self.llm_provider,
                 "llm_endpoint": self.llm_endpoint,
+                "llm_api_key": llm_api_key,
                 "llm_model": self.llm_model,
                 "llm_enabled": self.llm_enabled,
                 "embedding_endpoint": self.embedding_endpoint,
+                "embedding_api_key": embedding_api_key,
                 "embedding_model": self.embedding_model,
+                "ocr_provider": self.ocr_provider,
                 "ocr_endpoint": self.ocr_endpoint,
+                "ocr_api_key": ocr_api_key,
                 "ocr_model": self.ocr_model,
                 "document_parser_endpoint": self.document_parser_endpoint,
+                "document_parser_api_key": document_parser_api_key,
                 "document_parser_model": self.document_parser_model,
                 "document_parser_fallback": self.parser_fallback,
                 "structure_recognition_endpoint": self.structure_recognition_endpoint,
+                "structure_recognition_api_key": structure_recognition_api_key,
                 "structure_recognition_model": self.structure_recognition_model,
                 "postgres_url": postgres_url,
                 "zotero_mcp_endpoints": mask_zotero_endpoints(self.zotero_mcp_endpoints, include_secrets=include_secrets),
@@ -289,6 +322,10 @@ class AppConfig:
             warnings.append("queue.backend must be sqlite or redis")
         if self.queue_backend == "redis" and not self.redis_url:
             warnings.append("queue.backend=redis requires queue.redis_url; sqlite queue remains the safe fallback")
+        if self.llm_provider not in {"openai_compatible", "openai_chat", "openai_responses", "gemini", "claude"}:
+            warnings.append("integrations.llm_provider must be openai_compatible, openai_chat, openai_responses, gemini, or claude")
+        if self.ocr_provider not in {"generic", "mineru", "paddleocr_vl"}:
+            warnings.append("integrations.ocr_provider must be generic, mineru, or paddleocr_vl")
         if not self.scan_extensions:
             warnings.append("ingest.scan_extensions is empty; scan_inbox will skip every file")
         for extension in self.scan_extensions:
@@ -421,17 +458,24 @@ def apply_config_overrides(config: AppConfig, raw: dict[str, Any]) -> AppConfig:
         max_embedded_images_per_document=max(0, int(ingest.get("max_embedded_images_per_document", config.max_embedded_images_per_document))),
         queue_backend=str(queue.get("backend", config.queue_backend)).strip().lower() or "sqlite",
         redis_url=none_if_empty(queue.get("redis_url", config.redis_url)),
+        llm_provider=str(integrations.get("llm_provider", config.llm_provider)).strip() or "openai_compatible",
         llm_endpoint=none_if_empty(integrations.get("llm_endpoint", config.llm_endpoint)),
+        llm_api_key=none_if_empty(integrations.get("llm_api_key", config.llm_api_key)),
         llm_model=none_if_empty(integrations.get("llm_model", config.llm_model)),
         llm_enabled=coerce_bool(integrations.get("llm_enabled"), config.llm_enabled),
         embedding_endpoint=none_if_empty(integrations.get("embedding_endpoint", config.embedding_endpoint)),
+        embedding_api_key=none_if_empty(integrations.get("embedding_api_key", config.embedding_api_key)),
         embedding_model=none_if_empty(integrations.get("embedding_model", config.embedding_model)),
+        ocr_provider=str(integrations.get("ocr_provider", config.ocr_provider)).strip() or "generic",
         ocr_endpoint=none_if_empty(integrations.get("ocr_endpoint", config.ocr_endpoint)),
+        ocr_api_key=none_if_empty(integrations.get("ocr_api_key", config.ocr_api_key)),
         ocr_model=none_if_empty(integrations.get("ocr_model", config.ocr_model)),
         document_parser_endpoint=none_if_empty(integrations.get("document_parser_endpoint", config.document_parser_endpoint)),
+        document_parser_api_key=none_if_empty(integrations.get("document_parser_api_key", config.document_parser_api_key)),
         document_parser_model=none_if_empty(integrations.get("document_parser_model", config.document_parser_model)),
         parser_fallback=coerce_bool(integrations.get("document_parser_fallback"), config.parser_fallback),
         structure_recognition_endpoint=none_if_empty(integrations.get("structure_recognition_endpoint", config.structure_recognition_endpoint)),
+        structure_recognition_api_key=none_if_empty(integrations.get("structure_recognition_api_key", config.structure_recognition_api_key)),
         structure_recognition_model=none_if_empty(integrations.get("structure_recognition_model", config.structure_recognition_model)),
         postgres_url=none_if_empty(integrations.get("postgres_url", config.postgres_url)),
         zotero_mcp_endpoints=normalize_endpoint_list(integrations.get("zotero_mcp_endpoints", config.zotero_mcp_endpoints)),

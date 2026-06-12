@@ -16,3 +16,5 @@ venv/
 dist/
 build/
 *.egg-info/
+node_modules/
+webui/node_modules/

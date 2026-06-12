@@ -302,10 +302,10 @@ def create_mcp(service: RouteService | None = None) -> Any:
         return get_service().get_chem_status()
 
     @mcp.tool()
-    def list_rdf_reactions(document_id: str = "", limit: int = 50, offset: int = 0, token: str | None = None) -> list[dict[str, Any]]:
+    def list_rdf_reactions(document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, token: str | None = None) -> list[dict[str, Any]]:
         """List indexed SciFinder RDF reaction records with scheme/step metadata."""
         require_role(token, "viewer")
-        return get_service().list_rdf_reactions(document_id=document_id, limit=limit, offset=offset)
+        return get_service().list_rdf_reactions(document_id=document_id, query=query, limit=limit, offset=offset)
 
     @mcp.tool()
     def get_rdf_reaction(reaction_id: str, token: str | None = None) -> dict[str, Any]:

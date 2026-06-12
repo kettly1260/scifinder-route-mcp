@@ -26,6 +26,12 @@ scifinder-route-sidecar = "scifinder_route_mcp.sidecar:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/scifinder_route_mcp"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/scifinder_route_mcp/admin_webui" = "scifinder_route_mcp/admin_webui"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

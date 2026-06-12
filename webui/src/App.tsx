@@ -1,0 +1,505 @@
+import { useEffect, useState, type FormEvent } from 'react';
+import { clearToken, getJson, getStoredToken, hasTrustedToken, loadState, postJson, storeToken, uploadFile } from './api';
+import { Button, Card, DataTable, Input, JsonBlock, StatCard } from './components';
+import type { AdminState, ConfigField, JsonObject } from './types';
+
+type PageId = 'dashboard' | 'ingest' | 'config' | 'rdf' | 'structures' | 'literature' | 'ops';
+type ThemeId = 'aurora' | 'graphite' | 'emerald' | 'rose' | 'light';
+
+const THEME_KEY = 'scifinderRouteAdminTheme';
+
+const themes: Array<{ id: ThemeId; label: string }> = [
+  { id: 'aurora', label: 'Aurora' },
+  { id: 'graphite', label: 'Graphite' },
+  { id: 'emerald', label: 'Emerald' },
+  { id: 'rose', label: 'Rose' },
+  { id: 'light', label: 'Light' }
+];
+
+function initialTheme(): ThemeId {
+  const saved = localStorage.getItem(THEME_KEY);
+  return themes.some((theme) => theme.id === saved) ? (saved as ThemeId) : 'aurora';
+}
+
+const pages: Array<{ id: PageId; label: string; description: string }> = [
+  { id: 'dashboard', label: 'Dashboard', description: '运行状态与关键指标' },
+  { id: 'ingest', label: '导入与任务', description: '上传、扫描、解析队列' },
+  { id: 'config', label: '配置', description: '集成、运行时、热配置' },
+  { id: 'rdf', label: 'RDF 反应', description: 'CAS 反应记录与 molfile' },
+  { id: 'structures', label: '结构检索', description: '相似度、子结构、文本过滤' },
+  { id: 'literature', label: '文献 / Zotero', description: '端点、候选链接、写回' },
+  { id: 'ops', label: '运维诊断', description: '索引、备份、回收站、配置警告' }
+];
+
+const configFields: ConfigField[] = [
+  { section: 'integrations', name: 'llm_provider', label: 'LLM 提供商', type: 'select', options: ['openai_compatible', 'openai_chat', 'openai_responses', 'gemini', 'claude'] },
+  { section: 'integrations', name: 'llm_api_key', label: 'LLM API Token', type: 'password', secret: true, placeholder: '留空则不变' },
+  { section: 'integrations', name: 'llm_endpoint', label: 'LLM 端点', placeholder: 'https://api.openai.com/v1' },
+  { section: 'integrations', name: 'llm_model', label: 'LLM 模型', placeholder: 'gpt-4o-mini / gemini-2.5-pro' },
+  { section: 'integrations', name: 'embedding_api_key', label: '嵌入 API Token', type: 'password', secret: true, placeholder: '留空则不变' },
+  { section: 'integrations', name: 'embedding_endpoint', label: '嵌入端点', placeholder: 'http://embedding:8000/v1' },
+  { section: 'integrations', name: 'embedding_model', label: '嵌入模型', placeholder: 'bge-m3' },
+  { section: 'integrations', name: 'ocr_endpoint', label: 'OCR 端点' },
+  { section: 'integrations', name: 'document_parser_endpoint', label: '文档解析端点' },
+  { section: 'integrations', name: 'structure_recognition_endpoint', label: '结构识别端点' },
+  { section: 'server', name: 'max_workers', label: '最大工作线程', type: 'number', min: '1' },
+  { section: 'server', name: 'async_jobs', label: '异步任务', type: 'bool' },
+  { section: 'server', name: 'storage_backend', label: '存储后端', type: 'select', options: ['sqlite', 'postgres'] },
+  { section: 'queue', name: 'backend', label: '队列后端', type: 'select', options: ['sqlite', 'redis'] },
+  { section: 'queue', name: 'redis_url', label: 'Redis URL', type: 'password', secret: true, placeholder: '留空则不变' },
+  { section: 'security', name: 'allow_external_paths', label: '允许外部路径', type: 'bool' },
+  { section: 'security', name: 'token', label: '配置令牌', type: 'password', secret: true, placeholder: '留空则不变' },
+  { section: 'ingest', name: 'scan_extensions', label: '扫描扩展名', type: 'list', placeholder: '.pdf,.html,.mhtml,.rdf' },
+  { section: 'thresholds', name: 'verification_confidence_threshold', label: '验证置信阈值', type: 'number', min: '0', max: '1', step: '0.01' },
+  { section: 'extraction', name: 'llm_schema_version', label: 'LLM Schema 版本' },
+  { section: 'extraction', name: 'llm_prompt_profile', label: 'LLM 提示词配置' },
+  { section: 'extraction', name: 'llm_cost_limit_usd', label: 'LLM 成本上限 USD', type: 'number', min: '0', step: '0.01' },
+  { section: 'retention', name: 'evidence_retention_days', label: '证据保留天数', type: 'number', min: '1' },
+  { section: 'retention', name: 'cache_retention_days', label: '缓存保留天数', type: 'number', min: '1' },
+  { section: 'integrations', name: 'zotero_linking_enabled', label: 'Zotero 自动链接', type: 'bool' }
+];
+
+function authError(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.includes('Invalid or missing admin token') ? '需要管理令牌：请登录后重试' : text;
+}
+
+function valueAt(config: JsonObject, section: string, name: string): unknown {
+  const group = config[section];
+  return group && typeof group === 'object' ? (group as JsonObject)[name] : undefined;
+}
+
+function shortName(path: unknown): string {
+  return String(path || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() || String(path || '');
+}
+
+function bytes(value: unknown): string {
+  const n = Number(value || 0);
+  if (n > 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  if (n > 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${n} B`;
+}
+
+export function App() {
+  const [token, setToken] = useState(getStoredToken());
+  const [trusted, setTrusted] = useState(hasTrustedToken());
+  const [state, setState] = useState<AdminState | null>(null);
+  const [page, setPage] = useState<PageId>('dashboard');
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [authRequired, setAuthRequired] = useState(true);
+  const [theme, setTheme] = useState<ThemeId>(initialTheme);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  async function refresh(nextToken = token, silent = false) {
+    try {
+      const data = await loadState(nextToken);
+      setState(data);
+      setAuthRequired(Boolean(data.auth_required));
+      setError('');
+      if (!silent) setMessage('状态已刷新');
+      return data;
+    } catch (err) {
+      setError(authError(err));
+      throw err;
+    }
+  }
+
+  useEffect(() => {
+    refresh(token, true).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    setMessage('');
+    setError('');
+    setSidebarOpen(false);
+  }, [page]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+
+  async function login(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      await refresh(token, true);
+      storeToken(token, trusted);
+      setMessage(trusted ? '已登录，并信任此设备' : '已登录，本次会话有效');
+    } catch (err) {
+      clearToken();
+      setError(authError(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function logout() {
+    clearToken();
+    setToken('');
+    setState(null);
+    setMessage('已退出登录');
+  }
+
+  async function guarded<T>(action: () => Promise<T>, success?: string): Promise<T | undefined> {
+    setBusy(true);
+    try {
+      const result = await action();
+      if (success) setMessage(success);
+      setError('');
+      return result;
+    } catch (err) {
+      setError(authError(err));
+      return undefined;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!state) {
+    return <LoginScreen token={token} setToken={setToken} trusted={trusted} setTrusted={setTrusted} login={login} busy={busy} error={error} />;
+  }
+
+  const active = pages.find((item) => item.id === page) || pages[0];
+
+  return (
+    <div className="app-shell">
+      {sidebarOpen && <button className="sidebar-backdrop" aria-label="关闭菜单" onClick={() => setSidebarOpen(false)} />}
+      <aside className={sidebarOpen ? 'sidebar open' : 'sidebar'}>
+        <div className="brand-block">
+          <div className="brand-mark">SR</div>
+          <div>
+            <strong>SciFinder Route</strong>
+            <span>Admin Console</span>
+          </div>
+        </div>
+        <nav className="nav-list" aria-label="管理控制台分区导航">
+          {pages.map((item) => (
+            <button key={item.id} className={page === item.id ? 'nav-item active' : 'nav-item'} onClick={() => setPage(item.id)}>
+              <span>{item.label}</span>
+              <small>{item.description}</small>
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-footer">
+          <span className="status-pill">{String(state.health.status || 'unknown').toUpperCase()}</span>
+          <Button variant="ghost" size="sm" onClick={logout}>退出</Button>
+        </div>
+      </aside>
+
+      <main className="workspace">
+        <header className="topbar">
+          <Button className="mobile-menu-button" variant="ghost" onClick={() => setSidebarOpen(true)}>菜单</Button>
+          <div>
+            <p className="eyebrow">{active.description}</p>
+            <h1>{active.label}</h1>
+          </div>
+          <div className="topbar-actions">
+            <span className="subtle">{authRequired ? 'Token protected' : 'Trusted local mode'}</span>
+            <label className="theme-select" aria-label="主题颜色">
+              <span>Theme</span>
+              <select value={theme} onChange={(event) => setTheme(event.target.value as ThemeId)}>
+                {themes.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+              </select>
+            </label>
+            <Button variant="secondary" onClick={() => guarded(() => refresh(), '状态已刷新')} loading={busy}>刷新</Button>
+          </div>
+        </header>
+        {(message || error) && <div className={error ? 'notice error' : 'notice'}>{error || message}</div>}
+        {page === 'dashboard' && <Dashboard state={state} />}
+        {page === 'ingest' && <IngestPage token={token} state={state} guarded={guarded} refresh={refresh} />}
+        {page === 'config' && <ConfigPage token={token} state={state} guarded={guarded} refresh={refresh} />}
+        {page === 'rdf' && <RdfPage token={token} guarded={guarded} />}
+        {page === 'structures' && <StructurePage token={token} state={state} guarded={guarded} />}
+        {page === 'literature' && <LiteraturePage token={token} state={state} guarded={guarded} />}
+        {page === 'ops' && <OpsPage token={token} state={state} guarded={guarded} refresh={refresh} />}
+      </main>
+    </div>
+  );
+}
+
+function LoginScreen({ token, setToken, trusted, setTrusted, login, busy, error }: { token: string; setToken: (value: string) => void; trusted: boolean; setTrusted: (value: boolean) => void; login: (event: FormEvent) => void; busy: boolean; error: string }) {
+  return (
+    <main className="login-layout">
+      <section className="login-card card">
+        <div className="brand-block large">
+          <div className="brand-mark">SR</div>
+          <div>
+            <p className="eyebrow">NAS 控制台</p>
+            <h1>SciFinder Route MCP</h1>
+          </div>
+        </div>
+        <p className="muted">输入管理令牌以访问配置、导入、RDF 反应和文献链接面板。未配置鉴权的本地可信部署会自动进入。</p>
+        <form onSubmit={login} className="login-form">
+          <Input label="管理令牌" type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="X-Scifinder-Route-Token" autoComplete="current-password" />
+          <label className="check-row">
+            <input type="checkbox" checked={trusted} onChange={(event) => setTrusted(event.target.checked)} />
+            <span>信任此设备，重启浏览器后仍保持登录</span>
+          </label>
+          {error && <div className="error-box">{error}</div>}
+          <Button loading={busy} fullWidth>进入控制台</Button>
+        </form>
+      </section>
+    </main>
+  );
+}
+
+function Dashboard({ state }: { state: AdminState }) {
+  const health = state.health;
+  const production = state.production;
+  const storage = (production.storage_usage as JsonObject | undefined) || {};
+  return (
+    <div className="page-stack">
+      <section className="metrics-grid">
+        <StatCard label="文档数" value={String(health.documents ?? 0)} />
+        <StatCard label="反应步骤" value={String(health.reaction_steps ?? 0)} />
+        <StatCard label="OCR 积压" value={String(health.ocr_backlog ?? 0)} tone={Number(health.ocr_backlog || 0) ? 'warn' : 'good'} />
+        <StatCard label="异步任务" value={health.async_jobs ? '启用' : '停用'} tone={health.async_jobs ? 'good' : 'warn'} />
+      </section>
+      <div className="grid two">
+        <Card eyebrow="Runtime" title="基础运行信息">
+          <div className="info-list">
+            <Info label="配置文件" value={shortName(health.config_path)} />
+            <Info label="存储后端" value={String((state.config.server as JsonObject | undefined)?.storage_backend ?? '')} />
+            <Info label="队列后端" value={String((state.config.queue as JsonObject | undefined)?.backend ?? '')} />
+            <Info label="化合物" value={String(production.compound_count ?? 0)} />
+          </div>
+        </Card>
+        <Card eyebrow="Storage" title="NAS 存储使用">
+          <DataTable<JsonObject> rows={Object.entries(storage).map(([name, item]) => ({ name, ...(item as JsonObject) }))} columns={[{ key: 'name', label: '路径' }, { key: 'files', label: '文件数' }, { key: 'bytes', label: '大小', render: (row) => bytes(row.bytes) }]} />
+        </Card>
+      </div>
+      <Card eyebrow="Production" title="诊断快照">
+        <JsonBlock value={production} maxHeight={420} />
+      </Card>
+    </div>
+  );
+}
+
+function IngestPage({ token, state, guarded, refresh }: PageProps & { refresh: () => Promise<AdminState> }) {
+  const [file, setFile] = useState<File | null>(null);
+  return (
+    <div className="page-stack">
+      <div className="grid two">
+        <Card eyebrow="Upload" title="上传并导入" extra={<Button disabled={!file} onClick={() => guarded(async () => { if (!file) return {}; const result = await uploadFile(token, file); await refresh(); return result; }, '上传完成')}>上传</Button>}>
+          <input className="file-input" type="file" onChange={(event) => setFile(event.target.files?.[0] || null)} />
+          <p className="muted">支持 PDF/RTF/RDF/HTML/MHTML/Markdown/TXT。上传仍会经过后端扩展名、嗅探和安全校验。</p>
+        </Card>
+        <Card eyebrow="Inbox" title="扫描收件箱" extra={<Button onClick={() => guarded(async () => { const result = await postJson<JsonObject>('/api/scan', token); await refresh(); return result; }, '扫描完成')}>扫描</Button>}>
+          <p className="muted">从服务端可见 inbox 中登记新增 SciFinder 导出文件。不会绕过导入规则。</p>
+        </Card>
+      </div>
+      <Card eyebrow="Jobs" title="最近解析任务" extra={<Button variant="secondary" onClick={() => guarded(() => postJson('/api/retry-failed', token), '已提交失败任务重试')}>重试失败任务</Button>}>
+        <DataTable rows={state.jobs} columns={[{ key: 'id', label: 'ID' }, { key: 'status', label: '状态' }, { key: 'stage', label: '阶段' }, { key: 'error', label: '错误' }]} />
+      </Card>
+    </div>
+  );
+}
+
+function ConfigPage({ token, state, guarded, refresh }: PageProps & { refresh: () => Promise<AdminState> }) {
+  const [values, setValues] = useState<Record<string, string>>(() => buildConfigValues(state.config));
+  const [models, setModels] = useState<Record<string, string[]>>({});
+
+  function update(key: string, value: string) {
+    setValues((current) => ({ ...current, [key]: value }));
+  }
+
+  async function save() {
+    const payload: JsonObject = {};
+    for (const field of configFields) {
+      const key = `${field.section}.${field.name}`;
+      const raw = values[key]?.trim() ?? '';
+      if (field.secret && !raw) continue;
+      const section = (payload[field.section] ||= {}) as JsonObject;
+      if (field.type === 'list') section[field.name] = raw.split(',').map((item) => item.trim()).filter(Boolean);
+      else if (field.type === 'number') section[field.name] = raw === '' ? undefined : Number(raw);
+      else if (field.type === 'bool') section[field.name] = raw === 'true';
+      else section[field.name] = raw || null;
+    }
+    await postJson('/api/config', token, payload);
+    const next = await refresh();
+    setValues(buildConfigValues(next.config));
+  }
+
+  async function loadModels(kind: string) {
+    const data = await postJson<{ models?: string[] }>('/api/integration/models', token, { kind });
+    setModels((current) => ({ ...current, [kind]: data.models || [] }));
+  }
+
+  return (
+    <div className="page-stack">
+      <Card eyebrow="Hot Config" title="热配置编辑" extra={<Button onClick={() => guarded(save, '配置已保存并重载')}>保存并重载</Button>}>
+        <div className="form-grid">
+          {configFields.map((field) => <ConfigControl key={`${field.section}.${field.name}`} field={field} value={values[`${field.section}.${field.name}`] ?? ''} onChange={update} />)}
+        </div>
+        <p className="muted">端口、卷挂载、Docker 网络和重启策略仍应在 `.env` / Docker Compose 中修改。</p>
+      </Card>
+      <Card eyebrow="Endpoint Checks" title="集成端点测试">
+        <div className="button-grid">
+          {['llm', 'embedding', 'ocr', 'document_parser', 'structure_recognition', 'postgres', 'zotero_mcp'].map((kind) => <Button key={kind} variant="secondary" onClick={() => guarded(() => postJson('/api/integration/test', token, { kind }), `${kind} 测试完成`)}>测试 {kind}</Button>)}
+          <Button variant="ghost" onClick={() => guarded(() => loadModels('llm'), 'LLM 模型已拉取')}>拉取 LLM 模型</Button>
+          <Button variant="ghost" onClick={() => guarded(() => loadModels('embedding'), 'Embedding 模型已拉取')}>拉取 Embedding 模型</Button>
+        </div>
+        <JsonBlock value={models} />
+      </Card>
+    </div>
+  );
+}
+
+function RdfPage({ token, guarded }: Pick<PageProps, 'token' | 'guarded'>) {
+  const [query, setQuery] = useState('');
+  const [limit, setLimit] = useState('25');
+  const [rows, setRows] = useState<JsonObject[]>([]);
+  const [detail, setDetail] = useState<JsonObject | null>(null);
+  async function load() {
+    const url = `/api/rdf/reactions?limit=${encodeURIComponent(limit)}${query ? `&q=${encodeURIComponent(query)}` : ''}`;
+    const data = await getJson<JsonObject[]>(url, token);
+    setRows(data);
+  }
+  async function open(id: unknown) {
+    const data = await getJson<JsonObject>(`/api/rdf/reactions/${encodeURIComponent(String(id))}`, token);
+    setDetail(data);
+  }
+  return (
+    <div className="page-stack">
+      <Card eyebrow="RDF Viewer" title="反应记录" extra={<Button onClick={() => guarded(load, 'RDF 反应已加载')}>加载 RDF 反应</Button>}>
+        <div className="form-grid compact-form">
+          <Input label="CAS / 文件名 / 标题" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="CAS 反应号、结构 CAS RN、PDF/RDF 文件名或标题" />
+          <Input label="数量限制" type="number" min="1" value={limit} onChange={(event) => setLimit(event.target.value)} />
+        </div>
+        <DataTable rows={rows} columns={[{ key: 'source_file_path', label: '来源文件', render: (row) => shortName(row.source_file_path || row.source_title || row.source_document_id) }, { key: 'record_index', label: '记录' }, { key: 'scheme_id', label: '方案' }, { key: 'step_id', label: '步骤' }, { key: 'cas_reaction_number', label: 'CAS 反应号' }, { key: 'yield_text', label: '收率' }, { key: 'structure_count', label: '结构数' }, { key: 'open', label: '打开', render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => open(row.id), '反应详情已加载')}>打开</Button> }]} />
+      </Card>
+      <Card eyebrow="Detail" title="反应详情与结构">
+        <JsonBlock value={detail || { hint: '选择一条反应以查看 molfile、试剂、催化剂、溶剂和引用。' }} maxHeight={560} />
+      </Card>
+    </div>
+  );
+}
+
+function StructurePage({ token, state, guarded }: PageProps) {
+  const [query, setQuery] = useState('');
+  const [mode, setMode] = useState('similarity');
+  const [rows, setRows] = useState<JsonObject[]>([]);
+  async function search() {
+    if (mode === 'text') {
+      setRows(await getJson<JsonObject[]>(`/api/rdf/structures?q=${encodeURIComponent(query)}&limit=50`, token));
+      return;
+    }
+    const endpoint = mode === 'similarity' ? '/api/chem/similarity-search' : '/api/chem/substructure-search';
+    const data = await postJson<{ results?: JsonObject[] }>(endpoint, token, { query, query_type: mode === 'similarity' ? 'smiles' : 'smarts', min_similarity: 0.2, limit: 50 });
+    setRows(data.results || []);
+  }
+  return (
+    <div className="page-stack">
+      <div className="grid two">
+        <Card eyebrow="RDKit" title="结构检索" extra={<Button onClick={() => guarded(search, '结构检索完成')}>检索</Button>}>
+          <div className="form-grid compact-form">
+            <Input label="查询" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="SMILES、SMARTS、CAS 或名称" />
+            <label className="form-group">模式<select value={mode} onChange={(event) => setMode(event.target.value)}><option value="similarity">相似度</option><option value="substructure">子结构</option><option value="text">文本过滤</option></select></label>
+          </div>
+        </Card>
+        <Card eyebrow="Chem Status" title="化学索引状态" extra={<Button variant="secondary" onClick={() => guarded(() => postJson('/api/chem/install-rdkit', token), 'RDKit 安装任务已启动')}>安装 RDKit</Button>}>
+          <JsonBlock value={(state.production.chem as JsonObject | undefined) || {}} maxHeight={260} />
+        </Card>
+      </div>
+      <Card eyebrow="Results" title="结构结果">
+        <DataTable rows={rows} columns={[{ key: 'name', label: '名称' }, { key: 'role', label: '角色' }, { key: 'cas_rn', label: 'CAS' }, { key: 'molfile_version', label: '版本' }, { key: 'similarity', label: '评分' }, { key: 'rdf_reaction_id', label: '反应 ID' }]} />
+      </Card>
+    </div>
+  );
+}
+
+function LiteraturePage({ token, state, guarded }: PageProps) {
+  const [endpoint, setEndpoint] = useState({ alias: '', group_name: '', url: '', priority: '100', timeout_seconds: '10', enabled: 'true', write_note_enabled: 'false', headers: '' });
+  const [endpoints, setEndpoints] = useState<JsonObject[]>([]);
+  const [documentId, setDocumentId] = useState('');
+  const [jobs, setJobs] = useState<JsonObject[]>([]);
+  const [links, setLinks] = useState<JsonObject[]>([]);
+  async function loadEndpoints() { setEndpoints(await getJson<JsonObject[]>('/api/zotero/endpoints', token)); }
+  async function saveEndpoint() {
+    await postJson('/api/zotero/endpoints', token, { ...endpoint, priority: Number(endpoint.priority || 100), timeout_seconds: Number(endpoint.timeout_seconds || 10), enabled: endpoint.enabled === 'true', write_note_enabled: endpoint.write_note_enabled === 'true', headers: endpoint.headers ? JSON.parse(endpoint.headers) : {} });
+    await loadEndpoints();
+  }
+  async function loadLiterature() {
+    const qs = documentId ? `?document_id=${encodeURIComponent(documentId)}&limit=50` : '?status=candidate&limit=50';
+    setLinks(await getJson<JsonObject[]>(`/api/literature/links${qs}`, token));
+    setJobs(await getJson<JsonObject[]>('/api/literature/jobs?limit=20', token));
+  }
+  return (
+    <div className="page-stack">
+      <Card eyebrow="Zotero MCP" title="文献源地址" extra={<div className="button-row"><Button onClick={() => guarded(saveEndpoint, 'Zotero 端点已保存')}>保存地址</Button><Button variant="secondary" onClick={() => guarded(loadEndpoints, '端点已加载')}>加载端点</Button></div>}>
+        <div className="form-grid">
+          <Input label="地址别名" value={endpoint.alias} onChange={(e) => setEndpoint({ ...endpoint, alias: e.target.value })} placeholder="lab-zotero-lan" />
+          <Input label="文献源组名" value={endpoint.group_name} onChange={(e) => setEndpoint({ ...endpoint, group_name: e.target.value })} placeholder="primary-library" />
+          <Input label="地址 URL" value={endpoint.url} onChange={(e) => setEndpoint({ ...endpoint, url: e.target.value })} placeholder="http://host:23120/mcp" />
+          <Input label="优先级" type="number" value={endpoint.priority} onChange={(e) => setEndpoint({ ...endpoint, priority: e.target.value })} />
+          <Input label="超时秒数" type="number" step="0.5" value={endpoint.timeout_seconds} onChange={(e) => setEndpoint({ ...endpoint, timeout_seconds: e.target.value })} />
+          <Input label="请求头 JSON" value={endpoint.headers} onChange={(e) => setEndpoint({ ...endpoint, headers: e.target.value })} placeholder='{"Authorization":"Bearer ..."}' />
+          <label className="form-group">启用<select value={endpoint.enabled} onChange={(e) => setEndpoint({ ...endpoint, enabled: e.target.value })}><option value="true">启用</option><option value="false">停用</option></select></label>
+          <label className="form-group">允许写回笔记<select value={endpoint.write_note_enabled} onChange={(e) => setEndpoint({ ...endpoint, write_note_enabled: e.target.value })}><option value="false">禁止</option><option value="true">允许</option></select></label>
+        </div>
+        <DataTable rows={endpoints} columns={[{ key: 'alias', label: '别名' }, { key: 'group_name', label: '组名' }, { key: 'url', label: 'URL' }, { key: 'enabled', label: '启用' }, { key: 'priority', label: '优先级' }, { key: 'last_status', label: '状态' }, { key: 'test', label: '测试', render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => postJson('/api/zotero/endpoints/test', token, { id: row.id }), '端点测试完成')}>测试</Button> }]} />
+      </Card>
+      <Card eyebrow="Literature" title="候选链接与任务" extra={<div className="button-row"><Button onClick={() => guarded(() => postJson('/api/literature/jobs/start', token, { document_id: documentId }), 'Zotero 链接任务已启动')}>启动链接</Button><Button variant="secondary" onClick={() => guarded(loadLiterature, '文献链接已加载')}>加载链接</Button></div>}>
+        <Input label="文档 ID" value={documentId} onChange={(e) => setDocumentId(e.target.value)} placeholder="可选；留空查看 candidate" />
+        <div className="summary-strip"><span>OCR 积压: {String(state.health.ocr_backlog ?? 0)}</span><span>低置信 DOI: {String(((state.production.doi_low_confidence_queue as unknown[]) || []).length)}</span><span>文献候选: {String(((state.production.literature_candidates as unknown[]) || []).length)}</span></div>
+        <h3>文献任务</h3>
+        <DataTable rows={jobs} columns={[{ key: 'id', label: 'ID' }, { key: 'document_id', label: '文档' }, { key: 'status', label: '状态' }, { key: 'stage', label: '阶段' }, { key: 'error', label: '错误' }]} />
+        <h3>候选链接</h3>
+        <DataTable rows={links} columns={[{ key: 'status', label: '状态' }, { key: 'reaction_step_id', label: '反应' }, { key: 'endpoint_alias', label: '端点' }, { key: 'doi', label: 'DOI' }, { key: 'title', label: '标题' }, { key: 'confidence', label: '评分' }, { key: 'confirm', label: '确认', render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => postJson('/api/literature/links/confirm', token, { id: row.id }), '已确认链接')}>确认</Button> }]} />
+      </Card>
+    </div>
+  );
+}
+
+function OpsPage({ token, state, guarded, refresh }: PageProps & { refresh: () => Promise<AdminState> }) {
+  const [trash, setTrash] = useState<JsonObject[]>([]);
+  return (
+    <div className="page-stack">
+      <div className="grid two">
+        <Card eyebrow="Vector" title="向量索引" extra={<Button onClick={() => guarded(async () => { const result = await postJson('/api/vector/rebuild', token); await refresh(); return result; }, '向量索引已提交重建')}>重建</Button>}><JsonBlock value={state.production.vector_index} /></Card>
+        <Card eyebrow="Backup" title="备份与清理" extra={<div className="button-row"><Button onClick={() => guarded(() => postJson('/api/backup', token), '数据库已备份')}>备份</Button><Button variant="secondary" onClick={() => guarded(() => postJson('/api/cleanup', token, { dry_run: true }), '清理试运行完成')}>清理试运行</Button></div>}><p className="muted">备份和保留清理只操作服务管理的数据目录，不修改 Docker-owned 配置。</p></Card>
+      </div>
+      <Card eyebrow="Trash" title="回收站" extra={<div className="button-row"><Button variant="secondary" onClick={() => guarded(async () => setTrash(await getJson<JsonObject[]>('/api/trash?limit=100', token)), '回收站已加载')}>加载</Button><Button variant="danger" onClick={() => guarded(() => postJson('/api/trash/empty', token), '回收站已清空')}>清空</Button></div>}>
+        <DataTable rows={trash} columns={[{ key: 'entity_type', label: '类型' }, { key: 'id', label: 'ID' }, { key: 'title', label: '标题' }, { key: 'deleted_at', label: '删除时间' }, { key: 'restore', label: '还原', render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => postJson('/api/trash/restore', token, { entity_type: row.entity_type, entity_id: row.id }), '项目已还原')}>还原</Button> }]} />
+      </Card>
+      <div className="grid two">
+        <Card eyebrow="Validation" title="配置警告"><ul className="warning-list">{(state.validation.warnings || ['暂无配置警告']).map((item) => <li key={item}>{item}</li>)}</ul></Card>
+        <Card eyebrow="Jobs" title="最近解析任务"><DataTable rows={state.jobs} columns={[{ key: 'id', label: 'ID' }, { key: 'status', label: '状态' }, { key: 'stage', label: '阶段' }, { key: 'error', label: '错误' }]} /></Card>
+      </div>
+    </div>
+  );
+}
+
+interface PageProps {
+  token: string;
+  state: AdminState;
+  guarded: <T>(action: () => Promise<T>, success?: string) => Promise<T | undefined>;
+}
+
+function Info({ label, value }: { label: string; value: string }) {
+  return <div className="info-item"><span>{label}</span><strong>{value}</strong></div>;
+}
+
+function buildConfigValues(config: JsonObject): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const field of configFields) {
+    if (field.secret) continue;
+    const value = valueAt(config, field.section, field.name);
+    values[`${field.section}.${field.name}`] = Array.isArray(value) ? value.join(',') : value === undefined || value === null ? '' : String(value);
+  }
+  return values;
+}
+
+function ConfigControl({ field, value, onChange }: { field: ConfigField; value: string; onChange: (key: string, value: string) => void }) {
+  const key = `${field.section}.${field.name}`;
+  if (field.type === 'select') {
+    return <label className="form-group">{field.label}<select value={value} onChange={(event) => onChange(key, event.target.value)}>{(field.options || []).map((option) => <option key={option} value={option}>{option}</option>)}</select></label>;
+  }
+  if (field.type === 'bool') {
+    return <label className="form-group">{field.label}<select value={value || 'false'} onChange={(event) => onChange(key, event.target.value)}><option value="true">启用</option><option value="false">停用</option></select></label>;
+  }
+  return <Input label={field.label} type={field.type === 'password' ? 'password' : field.type === 'number' ? 'number' : 'text'} value={value} onChange={(event) => onChange(key, event.target.value)} placeholder={field.placeholder} min={field.min} max={field.max} step={field.step} />;
+}

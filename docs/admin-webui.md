@@ -24,9 +24,23 @@ operator scan/retry/reparse/vector/evaluation/integration checks
 admin    config/backup/cleanup/secrets
 ```
 
+## Frontend Build
+
+The Admin Web UI source lives in `webui/` and is built with npm, Vite, React, and TypeScript. The production build writes static assets into `src/scifinder_route_mcp/admin_webui/`, which the Python Admin server serves from `/` and `/assets/*`.
+
+Development commands:
+
+```text
+cd webui
+npm ci
+npm run build
+```
+
+The Docker image uses a Node build stage for the Web UI and keeps the final runtime image Python-only. If built assets are missing in a local checkout, the Admin server falls back to the legacy inline dashboard so the service can still start.
+
 ## Pages and Panels
 
-The single-page UI currently includes:
+The task-oriented UI currently includes:
 
 ```text
 - health metrics
