@@ -94,7 +94,9 @@ class RouteService:
                 "SCIFINDER_ROUTE_SSE_PATH",
                 "volume mounts",
                 "container network",
+                "runtime pip-installed packages such as RDKit",
             ],
+            "runtime_install_note": "Packages installed from the Web UI are applied to the running container only. Re-pulling or recreating the container can remove them unless the image itself includes the package or the Python package directory is persistently mounted.",
         }
 
     def register_document(self, file_path: str, reparse: bool = False) -> dict[str, Any]:
@@ -197,6 +199,7 @@ class RouteService:
         return {"retried": [job.to_dict() for job in jobs], "count": len(jobs)}
 
     def health_check(self) -> dict[str, Any]:
+        webui_config_path = self.config.webui_config_path or self.config.data_dir / "webui-config.yaml"
         health: dict[str, Any] = {
             "status": "ok",
             "database": str(self.config.database_path),
@@ -204,6 +207,8 @@ class RouteService:
             "inbox_dir": str(self.config.inbox_dir),
             "upload_dir": str(self.config.upload_dir),
             "config_path": str(self.config.config_path),
+            "webui_config_path": str(webui_config_path),
+            "active_config_path": str(webui_config_path if webui_config_path.exists() else self.config.config_path),
             "async_jobs": self.config.async_jobs,
             "queue_backend": self.config.queue_backend,
             "storage_backend": self.config.storage_backend,
@@ -471,7 +476,22 @@ class RouteService:
         return self.search_compounds(query=query, limit=limit)
 
     def get_chem_status(self) -> dict[str, Any]:
-        status = {"rdkit": rdkit_info().to_dict(), "install_job": self._rdkit_install_job}
+        status = {
+            "rdkit": rdkit_info().to_dict(),
+            "install_job": self._rdkit_install_job,
+            "runtime_install_persistence": {
+                "mode": "ephemeral_container_filesystem",
+                "message": "Current images install RDKit during build. The Web UI install button is only a temporary repair for older images or broken environments; runtime installs are stored in the current container filesystem, not in /data, and can be lost after docker pull/recreate.",
+                "durable_options": [
+                    "Use this application image version or newer, which includes rdkit by default.",
+                    "Rebuild/re-pull the image instead of relying on Web UI pip installs for production NAS deployments.",
+                    "If you deliberately use runtime installs, persist the exact site-packages/user-base path and restart after installation.",
+                ],
+            },
+        }
+        if self._rdkit_install_job and self._rdkit_install_job.get("status") == "installed_restart_required":
+            status["restart_required"] = True
+            status["restart_message"] = "RDKit installation finished, but the container should be restarted so every worker imports the installed package from a clean process."
         try:
             status["rdf_structure_index"] = self.storage.rdf_structure_index_status()
         except Exception as exc:
@@ -677,6 +697,9 @@ class RouteService:
     def similarity_search_structures(self, query: str, query_type: str = "smiles", min_similarity: float = 0.2, limit: int = 20) -> dict[str, Any]:
         fp, error = fingerprint_from_query(query, query_type)
         if error:
+            fallback = self._metadata_structure_search(query, limit=limit)
+            if fallback:
+                return {"configured": True, "query_type": query_type, "fallback": "metadata", "warning": f"{error}; returned RDF metadata matches instead", "results": fallback}
             return {"configured": False, "error": error, "results": []}
         scored: list[dict[str, Any]] = []
         for structure in self.storage.list_rdf_structures_for_search(limit=10000):
@@ -700,7 +723,16 @@ class RouteService:
                 results.append(structure)
                 if len(results) >= limit:
                     break
+        if not results and any("query structure" in error for error in errors):
+            fallback = self._metadata_structure_search(query, limit=limit)
+            if fallback:
+                return {"configured": True, "query_type": query_type, "fallback": "metadata", "warning": f"{errors[0]}; returned RDF metadata matches instead", "errors": [], "results": fallback}
         return {"configured": not errors or bool(results), "query_type": query_type, "errors": errors[:5], "results": results}
+
+    def _metadata_structure_search(self, query: str, *, limit: int) -> list[dict[str, Any]]:
+        if not query.strip():
+            return []
+        return self.list_rdf_structures(query=query, limit=limit)
 
     def trash_item(self, entity_type: str, entity_id: str) -> dict[str, Any]:
         return self.storage.soft_delete(entity_type, entity_id)
@@ -822,6 +854,13 @@ class RouteService:
         endpoint_id = str(endpoint.get("id") or endpoint.get("alias") or "").strip()
         if not endpoint_id:
             endpoint_id = str(endpoint.get("alias") or f"zotero-{len(endpoints) + 1}").strip()
+        url = str(endpoint.get("url") or "").strip()
+        enabled = endpoint.get("enabled", True)
+        if enabled and not url:
+            raise ValueError("Zotero MCP endpoint URL is required when the endpoint is enabled")
+        if url and not url.startswith(("http://", "https://")):
+            raise ValueError("Zotero MCP endpoint URL must start with http:// or https://")
+        endpoint = {**endpoint, "url": url}
         endpoint = {**endpoint, "id": endpoint_id}
         replaced = False
         for index, item in enumerate(endpoints):

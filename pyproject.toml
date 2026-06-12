@@ -7,6 +7,7 @@ dependencies = [
   "fastmcp>=2.0.0",
   "beautifulsoup4>=4.12.0",
   "pymupdf>=1.24.0",
+  "rdkit>=2024.3.0",
   "uvicorn>=0.30.0",
 ]
 
@@ -15,7 +16,8 @@ dev = [
   "pytest>=8.0.0",
 ]
 chem = [
-  "rdkit>=2024.3.0",
+  # RDKit is installed by default for Docker/NAS deployments; this extra is kept
+  # so older install commands using .[chem] continue to resolve.
 ]
 
 [project.scripts]

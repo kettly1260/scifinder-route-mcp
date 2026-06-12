@@ -7,6 +7,7 @@ import http.client
 import json
 import sqlite3
 import time
+import tomllib
 
 import pytest
 
@@ -47,6 +48,12 @@ def create_fallback_mcp(service: RouteService, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
     return create_mcp(service)
+
+
+def test_rdkit_is_default_project_dependency() -> None:
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert any(dependency.startswith("rdkit") for dependency in pyproject["project"]["dependencies"])
 
 
 def test_register_search_provenance_and_export(tmp_path: Path) -> None:
@@ -200,6 +207,32 @@ def test_rdf_import_indexes_structures_and_trash(tmp_path: Path) -> None:
     assert service.list_trash()
     service.restore_trash_item("rdf_structure", structures[0]["id"])
     assert any(item["id"] == structures[0]["id"] for item in service.list_rdf_structures(document_id=document_id))
+
+
+def test_similarity_search_falls_back_to_rdf_metadata_for_cas_rn(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
+    service.register_document(str(fixture))
+
+    result = service.similarity_search_structures("19694-02-1", query_type="smiles")
+
+    assert result["configured"] is True
+    assert result["fallback"] == "metadata"
+    assert result["results"]
+    assert result["results"][0]["cas_rn"] == "19694-02-1"
+
+
+def test_substructure_search_falls_back_to_rdf_metadata_for_cas_rn(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
+    service.register_document(str(fixture))
+
+    result = service.substructure_search_structures("19694-02-1", query_type="smarts")
+
+    assert result["configured"] is True
+    assert result["fallback"] == "metadata"
+    assert result["results"]
+    assert result["results"][0]["cas_rn"] == "19694-02-1"
 
 
 def test_rdf_v2000_import_is_viewable_without_rdkit(tmp_path: Path) -> None:
@@ -576,6 +609,10 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
     webui_config = read_config_yaml(service.config.data_dir / "webui-config.yaml")
     assert webui_config["queue"]["backend"] == "redis"
     assert webui_config["queue"]["redis_url"] == "redis://queue:6379/0"
+    health = service.health_check()
+    assert health["config_path"].endswith("config.yaml")
+    assert health["webui_config_path"].endswith("webui-config.yaml")
+    assert health["active_config_path"] == health["webui_config_path"]
 
     fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.html"
     html_target = service.config.inbox_dir / "sample.html"
@@ -747,6 +784,13 @@ def test_webui_config_manages_zotero_endpoints_separately(tmp_path: Path) -> Non
     listed = service.list_zotero_mcp_endpoints()
     assert listed[0]["headers"]["Authorization"] == "****"
     assert service.get_config()["paths"]["webui_config_path"].endswith("webui-config.yaml")
+
+
+def test_zotero_endpoint_upsert_rejects_invalid_url(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+
+    with pytest.raises(ValueError, match="must start with http:// or https://"):
+        service.upsert_zotero_mcp_endpoint({"alias": "bad", "group_name": "lab", "url": "http:/zotero:23120/mcp"})
 
 
 def test_zotero_mcp_defaults_to_single_local_streamable_http_endpoint(tmp_path: Path) -> None:

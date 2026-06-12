@@ -30,8 +30,8 @@ def rdkit_info() -> RdkitInfo:
     try:
         import rdkit  # type: ignore[import-not-found]
     except Exception as exc:
-        return RdkitInfo(False, None, 'Install with: pip install -e ".[chem]" or pip install rdkit, then restart the service/container.', f"{type(exc).__name__}: {exc}")
-    return RdkitInfo(True, getattr(rdkit, "__version__", None), "RDKit is available.")
+        return RdkitInfo(False, None, "RDKit should be included in the application image. Rebuild/re-pull the current image; use the Web UI install only as a temporary repair, then restart the container.", f"{type(exc).__name__}: {exc}")
+    return RdkitInfo(True, getattr(rdkit, "__version__", None), "RDKit is available from the installed application environment.")
 
 
 def normalize_molfile(molfile: str | None) -> StructureNormalization:
@@ -107,11 +107,16 @@ def tanimoto(left: str | None, right: str | None) -> float:
 def install_rdkit() -> dict[str, Any]:
     command = [sys.executable, "-m", "pip", "install", "rdkit"]
     completed = subprocess.run(command, capture_output=True, text=True, timeout=900, check=False)
+    installed = completed.returncode == 0
     return {
         "command": " ".join(command),
         "returncode": completed.returncode,
         "stdout": completed.stdout[-4000:],
         "stderr": completed.stderr[-4000:],
-        "status": "installed_restart_required" if completed.returncode == 0 else "failed",
-        "restart_required": completed.returncode == 0,
+        "status": "installed_restart_required" if installed else "failed",
+        "restart_required": installed,
+        "restart_message": "RDKit was installed into the running container. Restart the container before relying on all workers and long-lived imports." if installed else None,
+        "persistence": "runtime_install_ephemeral" if installed else None,
+        "persistence_message": "This Web UI installation is inside the current container filesystem. It can be lost when the image is re-pulled or the container is recreated; keep RDKit by using an image/build that includes rdkit or a persistent Python package layer." if installed else None,
+        "recommended_action": "Restart this container now, then rebuild/use an image with RDKit preinstalled for durable deployments." if installed else None,
     }

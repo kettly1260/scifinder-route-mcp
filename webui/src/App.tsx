@@ -15,6 +15,28 @@ type UploadResultRow = {
   job_id?: string;
   deduplicated?: boolean;
 };
+type ZoteroEndpointForm = {
+  id?: string;
+  alias: string;
+  group_name: string;
+  url: string;
+  priority: string;
+  timeout_seconds: string;
+  enabled: string;
+  write_note_enabled: string;
+  headers: string;
+};
+
+const defaultZoteroEndpoint: ZoteroEndpointForm = {
+  alias: 'local-zotero',
+  group_name: 'local-zotero',
+  url: 'http://127.0.0.1:23120/mcp',
+  priority: '100',
+  timeout_seconds: '10',
+  enabled: 'true',
+  write_note_enabled: 'false',
+  headers: ''
+};
 
 const THEME_KEY = 'scifinderRouteAdminTheme';
 
@@ -700,6 +722,11 @@ function StructurePage({ token, state, guarded }: PageProps) {
   const [query, setQuery] = useState('');
   const [mode, setMode] = useState('similarity');
   const [rows, setRows] = useState<JsonObject[]>([]);
+  const chem = (state.production.chem as JsonObject | undefined) || {};
+  const installJob = chem.install_job as JsonObject | undefined;
+  const restartRequired = chem.restart_required === true || installJob?.status === 'installed_restart_required' || (installJob?.result as JsonObject | undefined)?.restart_required === true;
+  const persistence = chem.runtime_install_persistence as JsonObject | undefined;
+  const persistenceMessage = typeof persistence?.message === 'string' ? persistence.message : '';
   async function search() {
     if (mode === 'text') {
       setRows(await getJson<JsonObject[]>(`/api/rdf/structures?q=${encodeURIComponent(query)}&limit=50`, token));
@@ -718,8 +745,11 @@ function StructurePage({ token, state, guarded }: PageProps) {
             <label className="form-group">模式<select value={mode} onChange={(event) => setMode(event.target.value)}><option value="similarity">相似度</option><option value="substructure">子结构</option><option value="text">文本过滤</option></select></label>
           </div>
         </Card>
-        <Card eyebrow="Chem Status" title="化学索引状态" extra={<Button variant="secondary" onClick={() => guarded(() => postJson('/api/chem/install-rdkit', token), 'RDKit 安装任务已启动')}>安装 RDKit</Button>}>
-          <JsonBlock value={(state.production.chem as JsonObject | undefined) || {}} maxHeight={260} />
+        <Card eyebrow="Chem Status" title="化学索引状态" extra={<Button variant="secondary" onClick={() => guarded(() => postJson('/api/chem/install-rdkit', token), '临时 RDKit 安装任务已启动；完成后若提示需要重启，请重启容器')}>临时安装 RDKit</Button>}>
+          {restartRequired && <div className="notice warn"><strong>需要重启容器。</strong> RDKit 安装已完成或部分完成，但长驻 worker 需要通过容器重启获得干净导入环境。</div>}
+          {persistenceMessage && <div className="notice"><strong>持久化提醒。</strong> {persistenceMessage}</div>}
+          <div className="notice"><strong>推荐方式。</strong> 当前镜像构建默认包含 RDKit；如果此处显示 RDKit 缺失，请优先重新拉取/重建镜像。按钮只用于旧镜像或异常环境的临时修复。</div>
+          <JsonBlock value={chem} maxHeight={260} />
         </Card>
       </div>
       <Card eyebrow="Results" title="结构结果">
@@ -730,14 +760,55 @@ function StructurePage({ token, state, guarded }: PageProps) {
 }
 
 function LiteraturePage({ token, state, guarded }: PageProps) {
-  const [endpoint, setEndpoint] = useState({ alias: 'local-zotero', group_name: 'local-zotero', url: 'http://127.0.0.1:23120/mcp', priority: '100', timeout_seconds: '10', enabled: 'true', write_note_enabled: 'false', headers: '' });
+  const [endpoint, setEndpoint] = useState<ZoteroEndpointForm>(defaultZoteroEndpoint);
   const [endpoints, setEndpoints] = useState<JsonObject[]>([]);
   const [documentId, setDocumentId] = useState('');
   const [jobs, setJobs] = useState<JsonObject[]>([]);
   const [links, setLinks] = useState<JsonObject[]>([]);
   async function loadEndpoints() { setEndpoints(await getJson<JsonObject[]>('/api/zotero/endpoints', token)); }
   async function saveEndpoint() {
-    await postJson('/api/zotero/endpoints', token, { ...endpoint, priority: Number(endpoint.priority || 100), timeout_seconds: Number(endpoint.timeout_seconds || 10), enabled: endpoint.enabled === 'true', write_note_enabled: endpoint.write_note_enabled === 'true', headers: endpoint.headers ? JSON.parse(endpoint.headers) : {} });
+    const url = endpoint.url.trim();
+    if (endpoint.enabled === 'true' && !url) {
+      throw new Error('启用的 Zotero MCP 端点必须填写 URL');
+    }
+    if (url && !/^https?:\/\//.test(url)) {
+      throw new Error('Zotero MCP URL 必须以 http:// 或 https:// 开头，例如 http://192.168.99.3:23120/mcp');
+    }
+    const payload: JsonObject = {
+      ...endpoint,
+      url,
+      priority: Number(endpoint.priority || 100),
+      timeout_seconds: Number(endpoint.timeout_seconds || 10),
+      enabled: endpoint.enabled === 'true',
+      write_note_enabled: endpoint.write_note_enabled === 'true'
+    };
+    if (endpoint.headers.trim()) {
+      payload.headers = JSON.parse(endpoint.headers);
+    }
+    await postJson('/api/zotero/endpoints', token, payload);
+    await loadEndpoints();
+  }
+  function editEndpoint(row: JsonObject) {
+    const headers = row.headers && typeof row.headers === 'object' ? JSON.stringify(row.headers, null, 2) : '';
+    setEndpoint({
+      id: String(row.id || ''),
+      alias: String(row.alias || ''),
+      group_name: String(row.group_name || ''),
+      url: String(row.url || ''),
+      priority: String(row.priority ?? 100),
+      timeout_seconds: String(row.timeout_seconds ?? 10),
+      enabled: String(row.enabled !== false),
+      write_note_enabled: String(row.write_note_enabled === true),
+      headers
+    });
+  }
+  async function deleteEndpoint(row: JsonObject) {
+    const id = String(row.id || '');
+    if (!id || !window.confirm(`删除 Zotero 端点 ${String(row.alias || id)}？`)) return;
+    await postJson('/api/zotero/endpoints/delete', token, { id });
+    if (endpoint.id === id) {
+      setEndpoint(defaultZoteroEndpoint);
+    }
     await loadEndpoints();
   }
   async function loadLiterature() {
@@ -747,8 +818,8 @@ function LiteraturePage({ token, state, guarded }: PageProps) {
   }
   return (
     <div className="page-stack">
-      <Card eyebrow="Zotero MCP" title="文献源地址" extra={<div className="button-row"><Button onClick={() => guarded(saveEndpoint, 'Zotero 端点已保存')}>保存地址</Button><Button variant="secondary" onClick={() => guarded(loadEndpoints, '端点已加载')}>加载端点</Button></div>}>
-        <p className="muted">默认使用本机 Streamable HTTP 端点 http://127.0.0.1:23120/mcp；通常无需添加 LAN/VPN/反代多地址。保存或删除端点会修改 Web UI 热配置，需要 admin 权限。</p>
+      <Card eyebrow="Zotero MCP" title={endpoint.id ? `编辑文献源地址：${endpoint.id}` : '文献源地址'} extra={<div className="button-row"><Button onClick={() => guarded(saveEndpoint, 'Zotero 端点已保存')}>{endpoint.id ? '保存修改' : '保存地址'}</Button><Button variant="secondary" onClick={() => setEndpoint(defaultZoteroEndpoint)}>新建</Button><Button variant="secondary" onClick={() => guarded(loadEndpoints, '端点已加载')}>加载端点</Button></div>}>
+        <p className="muted">默认使用本机 Streamable HTTP 端点 http://127.0.0.1:23120/mcp；远程 Zotero 必须填写完整 URL，例如 http://192.168.99.3:23120/mcp。保存或删除端点会修改 Web UI 热配置，需要 admin 权限。</p>
         <div className="form-grid">
           <Input label="地址别名" value={endpoint.alias} onChange={(e) => setEndpoint({ ...endpoint, alias: e.target.value })} placeholder="local-zotero" />
           <Input label="文献源组名" value={endpoint.group_name} onChange={(e) => setEndpoint({ ...endpoint, group_name: e.target.value })} placeholder="local-zotero" />
@@ -759,7 +830,7 @@ function LiteraturePage({ token, state, guarded }: PageProps) {
           <label className="form-group">启用<select value={endpoint.enabled} onChange={(e) => setEndpoint({ ...endpoint, enabled: e.target.value })}><option value="true">启用</option><option value="false">停用</option></select></label>
           <label className="form-group">允许写回笔记<select value={endpoint.write_note_enabled} onChange={(e) => setEndpoint({ ...endpoint, write_note_enabled: e.target.value })}><option value="false">禁止</option><option value="true">允许</option></select></label>
         </div>
-        <DataTable rows={endpoints} columns={[{ key: 'alias', label: '别名' }, { key: 'group_name', label: '组名' }, { key: 'url', label: 'URL' }, { key: 'enabled', label: '启用' }, { key: 'priority', label: '优先级' }, { key: 'last_status', label: '状态' }, { key: 'test', label: '测试', render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => postJson('/api/zotero/endpoints/test', token, { id: row.id }), '端点测试完成')}>测试</Button> }]} />
+        <DataTable rows={endpoints} columns={[{ key: 'alias', label: '别名' }, { key: 'group_name', label: '组名' }, { key: 'url', label: 'URL' }, { key: 'enabled', label: '启用' }, { key: 'priority', label: '优先级' }, { key: 'last_status', label: '状态' }, { key: 'edit', label: '编辑', render: (row) => <Button size="sm" variant="ghost" onClick={() => editEndpoint(row)}>编辑</Button> }, { key: 'test', label: '测试', render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => postJson('/api/zotero/endpoints/test', token, { id: row.id }), '端点测试完成')}>测试</Button> }, { key: 'delete', label: '删除', render: (row) => <Button size="sm" variant="danger" onClick={() => guarded(() => deleteEndpoint(row), '端点已删除')}>删除</Button> }]} />
       </Card>
       <Card eyebrow="Literature" title="候选链接与任务" extra={<div className="button-row"><Button onClick={() => guarded(() => postJson('/api/literature/jobs/start', token, { document_id: documentId }), 'Zotero 链接任务已启动')}>启动链接</Button><Button variant="secondary" onClick={() => guarded(loadLiterature, '文献链接已加载')}>加载链接</Button></div>}>
         <Input label="文档 ID" value={documentId} onChange={(e) => setDocumentId(e.target.value)} placeholder="可选；留空查看 candidate" />
