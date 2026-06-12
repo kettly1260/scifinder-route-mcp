@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+from scifinder_route_mcp.chem import normalize_molfile
 from scifinder_route_mcp.admin import AdminRunConfig, admin_state, render_dashboard, start_admin_server
 from scifinder_route_mcp.auth import UserCredential
 from scifinder_route_mcp.config import AppConfig, merge_hot_config, read_config_yaml, write_config_yaml
@@ -18,7 +19,7 @@ from scifinder_route_mcp.service import RouteService
 from scifinder_route_mcp.parsers import parse_document
 from scifinder_route_mcp.storage import RouteStorage
 from scifinder_route_mcp.rdfile import parse_rdfile_reactions
-from scifinder_route_mcp.literature import diff_reaction_fields, extract_method_fields
+from scifinder_route_mcp.literature import ZoteroMcpClient, diff_reaction_fields, extract_method_fields, parse_mcp_http_body
 from scifinder_route_mcp.integrations import EndpointResult
 
 
@@ -142,6 +143,42 @@ def test_rdfile_structure_parser_supports_v3000_and_v2000() -> None:
     assert second.molecules[1].role == "product"
 
 
+def test_rdkit_normalizes_scifinder_v3000_short_headers() -> None:
+    pytest.importorskip("rdkit")
+    counts_and_body = """  0  0  0     0  0            999 V3000
+M  V30 BEGIN CTAB
+M  V30 COUNTS 2 1 0 0 0
+M  V30 BEGIN ATOM
+M  V30 1 C 0.0 0.0 0.0 0
+M  V30 2 O 1.2 0.0 0.0 0
+M  V30 END ATOM
+M  V30 BEGIN BOND
+M  V30 1 1 1 2
+M  V30 END BOND
+M  V30 END CTAB
+M  END
+"""
+
+    for prefix in ("", "methanol\n", "methanol\nCH4O\n"):
+        normalized = normalize_molfile(prefix + counts_and_body)
+
+        assert normalized.status == "indexed"
+        assert normalized.smiles
+        assert normalized.fingerprint
+
+
+def test_rdkit_normalizes_scifinder_v2000_excess_headers() -> None:
+    pytest.importorskip("rdkit")
+    text = (Path(__file__).parent / "fixtures" / "sample_scifinder_export_v2000.rdf").read_text(encoding="utf-8")
+    molfile = parse_rdfile_reactions(text)[0].molecules[0].molfile
+
+    normalized = normalize_molfile(molfile)
+
+    assert normalized.status == "indexed"
+    assert normalized.smiles
+    assert normalized.fingerprint
+
+
 def test_rdf_import_indexes_structures_and_trash(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
@@ -188,6 +225,24 @@ def test_rdf_reader_api_includes_provenance_warning(tmp_path: Path) -> None:
     assert "RDF/RDfile records are structured SciFinder evidence" in reactions[0]["provenance_warning"]
     assert reactions[0]["provenance_warning"] in reactions[0]["warnings"]
     assert detail["provenance_warning"] in detail["warnings"]
+
+
+def test_rdf_reaction_detail_includes_chinese_readable_structures(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
+
+    result = service.register_document(str(fixture))
+    reaction = service.list_rdf_reactions(document_id=result["document"]["id"])[0]
+    detail = service.get_rdf_reaction(reaction["id"])
+
+    assert "CAS 反应号 31-614-CAS-40557461" in detail["human_summary"]
+    assert "反应式：" in detail["human_readable_text_zh"]
+    assert "C17H10O2" in detail["human_readable_text_zh"]
+    assert "C17H12N2O" in detail["human_readable_text_zh"]
+    reactant = next(item for item in detail["readable"]["structures"] if item["role"] == "reactant")
+    assert reactant["role_label_zh"] == "反应物"
+    assert reactant["formula"] == "C17H10O2"
+    assert detail["readable"]["fields_explained"]["RXN:VAR(1):CAS_Reaction_Number"] == "CAS 反应号"
 
 
 def test_scan_inbox_deduplicates_registered_files(tmp_path: Path) -> None:
@@ -538,8 +593,8 @@ def test_integration_model_listing_uses_unsaved_form_overrides(tmp_path: Path, m
     service = make_service(tmp_path)
     seen: dict[str, object] = {}
 
-    def fake_list_models(endpoint: str | None, *, provider: str = "openai_compatible", api_key: str | None = None) -> EndpointResult:
-        seen.update({"endpoint": endpoint, "provider": provider, "api_key": api_key})
+    def fake_list_models(endpoint: str | None, *, provider: str = "openai_compatible", api_key: str | None = None, kind: str = "generic", model: str | None = None) -> EndpointResult:
+        seen.update({"endpoint": endpoint, "provider": provider, "api_key": api_key, "kind": kind, "model": model})
         return EndpointResult(True, "ok", "Loaded 1 models", {"models": ["gpt-test"]})
 
     monkeypatch.setattr("scifinder_route_mcp.service.list_http_models", fake_list_models)
@@ -549,8 +604,81 @@ def test_integration_model_listing_uses_unsaved_form_overrides(tmp_path: Path, m
         overrides={"integrations": {"llm_endpoint": "https://llm.example/v1", "llm_provider": "gemini", "llm_api_key": "new-secret"}},
     )
 
-    assert seen == {"endpoint": "https://llm.example/v1", "provider": "gemini", "api_key": "new-secret"}
+    assert seen == {"endpoint": "https://llm.example/v1", "provider": "gemini", "api_key": "new-secret", "kind": "llm", "model": None}
     assert result["models"] == ["gpt-test"]
+
+
+def test_integration_endpoint_uses_saved_ocr_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    service.config = service.config.__class__(**{**service.config.__dict__, "ocr_provider": "paddleocr_vl", "ocr_endpoint": "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs", "ocr_model": "PaddleOCR-VL-1.6", "ocr_api_key": "secret"})
+    seen: dict[str, object] = {}
+
+    def fake_test_endpoint(endpoint: str | None, *, model: str | None = None, provider: str = "openai_compatible", api_key: str | None = None, kind: str = "generic") -> EndpointResult:
+        seen.update({"endpoint": endpoint, "model": model, "provider": provider, "api_key": api_key, "kind": kind})
+        return EndpointResult(True, "ok", "configured")
+
+    monkeypatch.setattr("scifinder_route_mcp.service.test_http_endpoint", fake_test_endpoint)
+
+    result = service.test_integration_endpoint("ocr")
+
+    assert seen == {
+        "endpoint": "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs",
+        "model": "PaddleOCR-VL-1.6",
+        "provider": "paddleocr_vl",
+        "api_key": "secret",
+        "kind": "ocr",
+    }
+    assert result["status"] == "ok"
+
+
+def test_paddleocr_model_listing_uses_configured_model_without_http() -> None:
+    from scifinder_route_mcp.integrations import list_http_models
+
+    result = list_http_models(
+        "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs",
+        provider="paddleocr_vl",
+        kind="ocr",
+        model="PaddleOCR-VL-1.6",
+    )
+
+    assert result.status == "ok"
+    assert result.payload == {"models": ["PaddleOCR-VL-1.6"]}
+    assert "does not expose a model-list endpoint" in (result.detail or "")
+
+
+def test_paddleocr_endpoint_test_does_not_probe_health() -> None:
+    from scifinder_route_mcp.integrations import test_http_endpoint
+
+    result = test_http_endpoint(
+        "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs",
+        provider="paddleocr_vl",
+        kind="ocr",
+        model="PaddleOCR-VL-1.6",
+    )
+
+    assert result.status == "ok"
+    assert "no lightweight health endpoint" in (result.detail or "")
+
+
+def test_embedding_endpoint_test_posts_to_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scifinder_route_mcp.integrations import test_http_endpoint
+
+    seen: dict[str, object] = {}
+
+    def fake_post_json(url: str, payload: dict[str, object], *, timeout: float = 30.0, headers: dict[str, str] | None = None) -> dict[str, object]:
+        seen.update({"url": url, "payload": payload, "headers": headers})
+        return {"data": [{"embedding": [0.1]}]}
+
+    monkeypatch.setattr("scifinder_route_mcp.integrations.post_json", fake_post_json)
+
+    result = test_http_endpoint("https://embed.example/v1", kind="embedding", model="bge-m3-fp16", api_key="secret")
+
+    assert result.status == "ok"
+    assert seen == {
+        "url": "https://embed.example/v1/embeddings",
+        "payload": {"model": "bge-m3-fp16", "input": ["ping"]},
+        "headers": {"Authorization": "Bearer secret"},
+    }
 
 
 def test_auto_batch_links_similar_scifinder_exports(tmp_path: Path) -> None:
@@ -619,6 +747,41 @@ def test_webui_config_manages_zotero_endpoints_separately(tmp_path: Path) -> Non
     listed = service.list_zotero_mcp_endpoints()
     assert listed[0]["headers"]["Authorization"] == "****"
     assert service.get_config()["paths"]["webui_config_path"].endswith("webui-config.yaml")
+
+
+def test_zotero_mcp_defaults_to_single_local_streamable_http_endpoint(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+
+    endpoints = service.list_zotero_mcp_endpoints()
+
+    assert len(endpoints) == 1
+    assert endpoints[0]["id"] == "local-zotero"
+    assert endpoints[0]["url"] == "http://127.0.0.1:23120/mcp"
+    assert endpoints[0]["headers"] == {}
+
+
+def test_zotero_mcp_ping_uses_json_rpc_ping(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_post_rpc(self: ZoteroMcpClient, payload: dict[str, object]) -> dict[str, object]:
+        seen.update(payload)
+        return {}
+
+    monkeypatch.setattr(ZoteroMcpClient, "_post_rpc", fake_post_rpc)
+
+    result = ZoteroMcpClient({"url": "http://127.0.0.1:23120/mcp"}).test()
+
+    assert seen["method"] == "ping"
+    assert seen["params"] == {}
+    assert result["status"] == "ok"
+
+
+def test_parse_mcp_http_body_accepts_event_stream_json() -> None:
+    body = 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"status":"ok"}}\n\n'
+
+    parsed = parse_mcp_http_body(body)
+
+    assert parsed == {"jsonrpc": "2.0", "id": 1, "result": {"status": "ok"}}
 
 
 def test_nested_webui_yaml_round_trips_zotero_endpoints(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import base64
 import json
+import logging
 import os
 import re
 import shutil
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .chem import fingerprint_from_query, install_rdkit, rdkit_info, substructure_match, tanimoto
-from .config import AppConfig
+from .config import AppConfig, DEFAULT_ZOTERO_MCP_ENDPOINTS
 from .extractor import extract_reaction_steps
 from .integrations import EmbeddingAdapter, ExternalParserAdapter, LLMStructuringAdapter, OCRAdapter, StructureRecognitionAdapter, list_http_models, test_http_endpoint
 from .literature import ZoteroMcpClient, build_query, diff_reaction_fields, extract_method_fields, item_doi, item_key, item_title, item_year, normalize_doi, title_similarity, trim_text
@@ -24,6 +25,25 @@ from .storage import RouteStorage, is_sqlite_locked_error
 
 
 RDF_PROVENANCE_WARNING = "RDF/RDfile records are structured SciFinder evidence but may not include complete experimental procedures; verify RDF-derived chemical claims against linked PDF/RTF/HTML readable or visual provenance before final use."
+LOGGER = logging.getLogger(__name__)
+
+RDF_ROLE_LABELS_ZH = {
+    "reactant": "反应物",
+    "product": "产物",
+    "reagent": "试剂",
+    "catalyst": "催化剂",
+    "solvent": "溶剂",
+    "unknown": "未知角色",
+}
+
+RDF_ROLE_LABELS_EN = {
+    "reactant": "Reactant",
+    "product": "Product",
+    "reagent": "Reagent",
+    "catalyst": "Catalyst",
+    "solvent": "Solvent",
+    "unknown": "Unknown",
+}
 
 
 class RouteService:
@@ -370,12 +390,18 @@ class RouteService:
             detail = json.dumps(results, ensure_ascii=False)
             return self.storage.record_integration_status("zotero_mcp", configured=True, status="ok" if ok else "error", detail=detail[:1000])
         endpoint, model, provider, api_key = self._integration_endpoint_settings(kind, overrides)
-        result = test_http_endpoint(endpoint, model=model, provider=provider, api_key=api_key)
+        result = test_http_endpoint(endpoint, model=model, provider=provider, api_key=api_key, kind=kind)
+        if result.status != "ok":
+            LOGGER.warning("Integration endpoint test failed kind=%s provider=%s configured=%s detail=%s", kind, provider, result.configured, result.detail)
+        else:
+            LOGGER.info("Integration endpoint test succeeded kind=%s provider=%s", kind, provider)
         return self.storage.record_integration_status(kind, configured=result.configured, status=result.status, detail=result.detail)
 
     def list_integration_models(self, kind: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-        endpoint, _model, provider, api_key = self._integration_endpoint_settings(kind, overrides)
-        result = list_http_models(endpoint, provider=provider, api_key=api_key)
+        endpoint, model, provider, api_key = self._integration_endpoint_settings(kind, overrides)
+        result = list_http_models(endpoint, provider=provider, api_key=api_key, kind=kind, model=model)
+        if result.status != "ok":
+            LOGGER.warning("Integration model listing failed kind=%s provider=%s configured=%s detail=%s", kind, provider, result.configured, result.detail)
         payload = result.payload if isinstance(result.payload, dict) else {}
         return {"kind": kind, "configured": result.configured, "status": result.status, "detail": result.detail, "models": payload.get("models", [])}
 
@@ -396,7 +422,7 @@ class RouteService:
             "ocr": (
                 self._override_value(overrides, "integrations", "ocr_endpoint", self.config.ocr_endpoint),
                 self._override_value(overrides, "integrations", "ocr_model", self.config.ocr_model),
-                self._override_value(overrides, "integrations", "ocr_provider", "openai_compatible") or "openai_compatible",
+                self._override_value(overrides, "integrations", "ocr_provider", self.config.ocr_provider) or "generic",
                 self._override_value(overrides, "integrations", "ocr_api_key", self.config.ocr_api_key),
             ),
             "document_parser": (
@@ -475,22 +501,178 @@ class RouteService:
                 self._rdkit_install_job["result"] = result
 
     def list_rdf_reactions(self, document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
-        return [self._with_rdf_provenance_warning(item) for item in self.storage.list_rdf_reactions(document_id=document_id, query=query, limit=limit, offset=offset, include_deleted=include_deleted)]
+        return [self._with_rdf_readable_view(item) for item in self.storage.list_rdf_reactions(document_id=document_id, query=query, limit=limit, offset=offset, include_deleted=include_deleted)]
 
     def get_rdf_reaction(self, reaction_id: str, include_deleted: bool = False) -> dict[str, Any]:
         reaction = self.storage.get_rdf_reaction(reaction_id, include_deleted=include_deleted)
         if not reaction:
             raise KeyError(f"RDF reaction not found: {reaction_id}")
-        return self._with_rdf_provenance_warning(reaction)
+        return self._with_rdf_readable_view(reaction)
 
     def list_rdf_structures(self, document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
         return [self._with_rdf_provenance_warning(item) for item in self.storage.list_rdf_structures(document_id=document_id, query=query, limit=limit, offset=offset, include_deleted=include_deleted)]
+
+    def _with_rdf_readable_view(self, reaction: dict[str, Any]) -> dict[str, Any]:
+        data = self._with_rdf_provenance_warning(reaction)
+        data["readable"] = self._rdf_reaction_readable_view(data)
+        data["human_summary"] = data["readable"]["zh"]["summary"]
+        data["human_readable_text_zh"] = data["readable"]["zh"]["text"]
+        return data
 
     def _with_rdf_provenance_warning(self, item: dict[str, Any]) -> dict[str, Any]:
         warnings = list(item.get("warnings") or [])
         if RDF_PROVENANCE_WARNING not in warnings:
             warnings.append(RDF_PROVENANCE_WARNING)
         return {**item, "warnings": warnings, "provenance_warning": RDF_PROVENANCE_WARNING}
+
+    def _rdf_reaction_readable_view(self, reaction: dict[str, Any]) -> dict[str, Any]:
+        structures = [self._rdf_structure_readable_view(item) for item in reaction.get("structures") or []]
+        by_role: dict[str, list[dict[str, Any]]] = {role: [] for role in RDF_ROLE_LABELS_ZH}
+        for structure in structures:
+            by_role.setdefault(str(structure.get("role") or "unknown"), []).append(structure)
+
+        equation_zh = self._rdf_equation(by_role, language="zh")
+        equation_en = self._rdf_equation(by_role, language="en")
+        summary_zh = self._rdf_summary(reaction, by_role, language="zh")
+        summary_en = self._rdf_summary(reaction, by_role, language="en")
+        return {
+            "language": "zh-CN",
+            "zh": {
+                "title": "RDF 反应详情",
+                "summary": summary_zh,
+                "equation": equation_zh,
+                "participants": self._rdf_participants(by_role, language="zh"),
+                "reference": self._rdf_reference_text(reaction, language="zh"),
+                "text": self._rdf_readable_text(reaction, summary_zh, equation_zh, by_role, language="zh"),
+            },
+            "en": {
+                "title": "RDF reaction detail",
+                "summary": summary_en,
+                "equation": equation_en,
+                "participants": self._rdf_participants(by_role, language="en"),
+                "reference": self._rdf_reference_text(reaction, language="en"),
+                "text": self._rdf_readable_text(reaction, summary_en, equation_en, by_role, language="en"),
+            },
+            "structures": structures,
+            "fields_explained": self._rdf_field_explanations(reaction.get("fields") or {}),
+        }
+
+    def _rdf_structure_readable_view(self, structure: dict[str, Any]) -> dict[str, Any]:
+        role = str(structure.get("role") or "unknown")
+        label = self._rdf_structure_label(structure)
+        return {
+            "id": structure.get("id"),
+            "role": role,
+            "role_label_zh": RDF_ROLE_LABELS_ZH.get(role, role),
+            "role_label_en": RDF_ROLE_LABELS_EN.get(role, role.title()),
+            "role_index": structure.get("role_index"),
+            "label": label,
+            "name": structure.get("name"),
+            "formula": structure.get("formula"),
+            "cas_rn": structure.get("cas_rn"),
+            "smiles": structure.get("smiles"),
+            "inchikey": structure.get("inchikey"),
+            "molfile_version": structure.get("molfile_version"),
+            "rdkit_status": structure.get("rdkit_status"),
+            "rdkit_error": structure.get("rdkit_error"),
+            "warnings": structure.get("warnings") or [],
+            "has_molfile": bool(structure.get("molfile")),
+            "display": self._rdf_structure_display(structure),
+        }
+
+    def _rdf_structure_label(self, structure: dict[str, Any]) -> str:
+        return str(structure.get("name") or structure.get("formula") or structure.get("cas_rn") or structure.get("id") or "unknown structure")
+
+    def _rdf_structure_display(self, structure: dict[str, Any]) -> str:
+        parts = [self._rdf_structure_label(structure)]
+        if structure.get("formula") and structure.get("formula") not in parts:
+            parts.append(f"formula {structure['formula']}")
+        if structure.get("cas_rn") and structure.get("cas_rn") not in parts:
+            parts.append(f"CAS {structure['cas_rn']}")
+        return " | ".join(parts)
+
+    def _rdf_equation(self, by_role: dict[str, list[dict[str, Any]]], *, language: str) -> str:
+        reactants = " + ".join(item["display"] for item in by_role.get("reactant", [])) or ("未记录反应物" if language == "zh" else "Reactants not recorded")
+        products = " + ".join(item["display"] for item in by_role.get("product", [])) or ("未记录产物" if language == "zh" else "Products not recorded")
+        conditions: list[str] = []
+        for role in ["reagent", "catalyst", "solvent"]:
+            items = by_role.get(role, [])
+            if items:
+                label = RDF_ROLE_LABELS_ZH[role] if language == "zh" else RDF_ROLE_LABELS_EN[role]
+                conditions.append(f"{label}: " + ", ".join(item["display"] for item in items))
+        suffix = f" ({'; '.join(conditions)})" if conditions else ""
+        return f"{reactants} -> {products}{suffix}"
+
+    def _rdf_summary(self, reaction: dict[str, Any], by_role: dict[str, list[dict[str, Any]]], *, language: str) -> str:
+        cas = reaction.get("cas_reaction_number") or ("未记录" if language == "zh" else "not recorded")
+        scheme = reaction.get("scheme_id") or "-"
+        step = reaction.get("step_id") or "-"
+        yield_text = reaction.get("yield_text") or ("未记录" if language == "zh" else "not recorded")
+        reactant_count = len(by_role.get("reactant", [])) or reaction.get("reactant_count") or 0
+        product_count = len(by_role.get("product", [])) or reaction.get("product_count") or 0
+        if language == "zh":
+            return f"CAS 反应号 {cas}，方案 {scheme}，步骤 {step}；包含 {reactant_count} 个反应物、{product_count} 个产物，收率 {yield_text}。"
+        return f"CAS reaction number {cas}, scheme {scheme}, step {step}; {reactant_count} reactant(s), {product_count} product(s), yield {yield_text}."
+
+    def _rdf_participants(self, by_role: dict[str, list[dict[str, Any]]], *, language: str) -> dict[str, list[dict[str, Any]]]:
+        labels = RDF_ROLE_LABELS_ZH if language == "zh" else RDF_ROLE_LABELS_EN
+        return {labels.get(role, role): items for role, items in by_role.items() if items}
+
+    def _rdf_reference_text(self, reaction: dict[str, Any], *, language: str) -> str:
+        reference = reaction.get("reference") or {}
+        title = reference.get("title") or ""
+        author = reference.get("author") or ""
+        citation = reference.get("citation") or ""
+        if not any([title, author, citation]):
+            return "未记录参考文献" if language == "zh" else "Reference not recorded"
+        if language == "zh":
+            return "；".join(part for part in [f"题名：{title}" if title else "", f"作者：{author}" if author else "", f"出处：{citation}" if citation else ""] if part)
+        return "; ".join(part for part in [f"Title: {title}" if title else "", f"Author: {author}" if author else "", f"Citation: {citation}" if citation else ""] if part)
+
+    def _rdf_readable_text(self, reaction: dict[str, Any], summary: str, equation: str, by_role: dict[str, list[dict[str, Any]]], *, language: str) -> str:
+        if language == "zh":
+            lines = [summary, f"反应式：{equation}", f"参考文献：{self._rdf_reference_text(reaction, language=language)}"]
+            for role in ["reactant", "product", "reagent", "catalyst", "solvent", "unknown"]:
+                items = by_role.get(role, [])
+                if items:
+                    lines.append(f"{RDF_ROLE_LABELS_ZH.get(role, role)}：" + "；".join(item["display"] for item in items))
+            if not reaction.get("experimental_procedure"):
+                lines.append("实验步骤：RDF 未提供完整实验步骤，请结合 PDF/RTF/HTML 原始出处核验。")
+            return "\n".join(lines)
+        lines = [summary, f"Equation: {equation}", f"Reference: {self._rdf_reference_text(reaction, language=language)}"]
+        for role in ["reactant", "product", "reagent", "catalyst", "solvent", "unknown"]:
+            items = by_role.get(role, [])
+            if items:
+                lines.append(f"{RDF_ROLE_LABELS_EN.get(role, role.title())}: " + "; ".join(item["display"] for item in items))
+        if not reaction.get("experimental_procedure"):
+            lines.append("Experimental procedure: not provided by RDF; verify with linked PDF/RTF/HTML provenance.")
+        return "\n".join(lines)
+
+    def _rdf_field_explanations(self, fields: dict[str, Any]) -> dict[str, str]:
+        explanations = {
+            "RXN:VAR(1):CAS_Reaction_Number": "CAS 反应号",
+            "RXN:VAR(1):PRO(1):YIELD": "产物收率",
+            "RXN:VAR(1):STAGES": "反应阶段数",
+            "RXN:VAR(1):STEPS": "反应步骤数",
+            "RXN:VAR(1):REFERENCE(1):TITLE": "参考文献题名",
+            "RXN:VAR(1):REFERENCE(1):AUTHOR": "参考文献作者",
+            "RXN:VAR(1):REFERENCE(1):CITATION": "参考文献出处",
+        }
+        result: dict[str, str] = {}
+        for key in fields:
+            if key in explanations:
+                result[key] = explanations[key]
+            elif key.startswith("RXN:RCT") and key.endswith(":CAS_RN"):
+                result[key] = "反应物 CAS RN"
+            elif key.startswith("RXN:PRO") and key.endswith(":CAS_RN"):
+                result[key] = "产物 CAS RN"
+            elif key.startswith("RXN:VAR(1):RGT") and key.endswith(":CAS_RN"):
+                result[key] = "试剂 CAS RN"
+            elif key.startswith("RXN:VAR(1):CAT") and key.endswith(":CAS_RN"):
+                result[key] = "催化剂 CAS RN"
+            elif key.startswith("RXN:VAR(1):SOL") and key.endswith(":CAS_RN"):
+                result[key] = "溶剂 CAS RN"
+        return result
 
     def similarity_search_structures(self, query: str, query_type: str = "smiles", min_similarity: float = 0.2, limit: int = 20) -> dict[str, Any]:
         fp, error = fingerprint_from_query(query, query_type)
@@ -714,7 +896,8 @@ class RouteService:
 
     def _configured_zotero_endpoints(self, *, include_headers: bool = True) -> list[dict[str, Any]]:
         endpoints = []
-        for endpoint in self.config.zotero_mcp_endpoints:
+        configured = self.config.zotero_mcp_endpoints or DEFAULT_ZOTERO_MCP_ENDPOINTS
+        for endpoint in configured:
             item = dict(endpoint)
             headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
             if not include_headers:

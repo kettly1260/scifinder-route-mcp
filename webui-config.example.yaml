@@ -6,23 +6,15 @@ integrations:
     - scale
     - purification
     - SI
+  # Default project connection: one local Streamable HTTP MCP endpoint.
+  # If Zotero MCP runs on the same host, this is the only endpoint users need.
   zotero_mcp_endpoints:
-    - id: lab-zotero-lan
-      alias: lab-zotero-lan
-      group_name: lab-zotero
-      url: http://zotero-host:23120/mcp
+    - id: local-zotero
+      alias: local-zotero
+      group_name: local-zotero
+      url: http://127.0.0.1:23120/mcp
       enabled: true
-      priority: 10
+      priority: 100
       timeout_seconds: 10
       write_note_enabled: false
       headers: {}
-    - id: lab-zotero-vpn
-      alias: lab-zotero-vpn
-      group_name: lab-zotero
-      url: http://zotero-vpn:23120/mcp
-      enabled: false
-      priority: 20
-      timeout_seconds: 15
-      write_note_enabled: false
-      headers:
-        Authorization: Bearer replace-me

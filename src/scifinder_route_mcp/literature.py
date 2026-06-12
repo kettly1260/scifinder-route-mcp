@@ -39,18 +39,25 @@ class ZoteroMcpClient:
             return {"configured": False, "status": "unknown", "detail": "Zotero MCP URL is not configured"}
         started = time.perf_counter()
         try:
-            self.call("semantic_status", {})
+            self.rpc("ping", {})
         except Exception as exc:
             return {"configured": True, "status": "error", "detail": f"{type(exc).__name__}: {exc}", "latency_ms": int((time.perf_counter() - started) * 1000)}
-        return {"configured": True, "status": "ok", "detail": "Zotero MCP endpoint responded", "latency_ms": int((time.perf_counter() - started) * 1000)}
+        return {"configured": True, "status": "ok", "detail": "Zotero MCP Streamable HTTP endpoint responded to JSON-RPC ping", "latency_ms": int((time.perf_counter() - started) * 1000)}
+
+    def rpc(self, method: str, params: dict[str, Any]) -> Any:
+        payload = {"jsonrpc": "2.0", "id": f"scifinder-{int(time.time() * 1000)}", "method": method, "params": params}
+        return self._post_rpc(payload)
 
     def call(self, tool: str, arguments: dict[str, Any]) -> Any:
         payload = {"jsonrpc": "2.0", "id": f"scifinder-{int(time.time() * 1000)}", "method": "tools/call", "params": {"name": tool, "arguments": arguments}}
-        headers = {"Content-Type": "application/json", "Accept": "application/json", **{str(k): str(v) for k, v in self.headers.items() if v is not None}}
+        return self._post_rpc(payload)
+
+    def _post_rpc(self, payload: dict[str, Any]) -> Any:
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", **{str(k): str(v) for k, v in self.headers.items() if v is not None}}
         request = urllib.request.Request(self.url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - user-configured LAN/VPN endpoint
-                data = json.loads(response.read().decode("utf-8"))
+                data = parse_mcp_http_body(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"HTTP {exc.code}: {body[:300]}") from exc
@@ -106,6 +113,24 @@ def parse_mcp_content(content: Any) -> Any:
                     texts.append(text)
         return "\n".join(texts)
     return content
+
+
+def parse_mcp_http_body(body: str) -> Any:
+    text = body.strip()
+    if not text:
+        return {}
+    if text.startswith("{") or text.startswith("["):
+        return json.loads(text)
+    data_lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            value = line.removeprefix("data:").strip()
+            if value and value != "[DONE]":
+                data_lines.append(value)
+    if data_lines:
+        return json.loads("\n".join(data_lines))
+    return json.loads(text)
 
 
 def normalize_items(result: Any) -> list[dict[str, Any]]:

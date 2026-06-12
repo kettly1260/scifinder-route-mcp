@@ -36,7 +36,7 @@ COPY src ./src
 COPY --from=webui-build /app/src/scifinder_route_mcp/admin_webui ./src/scifinder_route_mcp/admin_webui
 
 RUN python -m pip install --upgrade pip \
-    && python -m pip install .
+    && python -m pip install ".[chem]"
 
 RUN useradd --create-home --uid 10001 appuser \
     && mkdir -p /data /data/uploads /data/evidence /inbox \

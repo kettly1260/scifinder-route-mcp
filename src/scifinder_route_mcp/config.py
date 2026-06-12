@@ -10,6 +10,20 @@ from .auth import UserCredential, mask_secret, parse_users
 
 
 DEFAULT_SCAN_EXTENSIONS = (".pdf", ".rtf", ".rdf", ".html", ".htm", ".mhtml", ".mht", ".md", ".markdown", ".txt")
+DEFAULT_ZOTERO_MCP_ENDPOINT = "http://127.0.0.1:23120/mcp"
+DEFAULT_ZOTERO_MCP_ENDPOINTS = (
+    {
+        "id": "local-zotero",
+        "alias": "local-zotero",
+        "group_name": "local-zotero",
+        "url": DEFAULT_ZOTERO_MCP_ENDPOINT,
+        "enabled": True,
+        "priority": 100,
+        "timeout_seconds": 10,
+        "headers": {},
+        "write_note_enabled": False,
+    },
+)
 HOT_CONFIG_SECTIONS = {"server", "security", "ingest", "integrations", "thresholds", "queue", "extraction", "retention"}
 HOT_CONFIG_KEYS = {
     "server": {"async_jobs", "max_workers", "storage_backend"},

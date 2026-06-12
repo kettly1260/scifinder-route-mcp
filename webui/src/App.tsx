@@ -620,6 +620,51 @@ function ActionResult({ title, result }: { title?: string; result?: JsonObject }
   );
 }
 
+function asObject(value: unknown): JsonObject {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : {};
+}
+
+function asObjectArray(value: unknown): JsonObject[] {
+  return Array.isArray(value) ? value.filter((item): item is JsonObject => Boolean(item) && typeof item === 'object' && !Array.isArray(item)) : [];
+}
+
+function rdfRoleOrder(role: unknown): number {
+  const order = ['reactant', 'product', 'reagent', 'catalyst', 'solvent', 'unknown'];
+  const index = order.indexOf(String(role || 'unknown'));
+  return index === -1 ? order.length : index;
+}
+
+function RdfDetailView({ detail }: { detail: JsonObject | null }) {
+  if (!detail) {
+    return <JsonBlock value={{ hint: '选择一条反应以查看中文解读、结构名称、CAS RN 与化学式。' }} maxHeight={560} />;
+  }
+  const readable = asObject(detail.readable);
+  const zh = asObject(readable.zh);
+  const structures = asObjectArray(readable.structures).sort((a, b) => rdfRoleOrder(a.role) - rdfRoleOrder(b.role) || Number(a.role_index || 0) - Number(b.role_index || 0));
+  const equation = String(zh.equation || '');
+  const reference = String(zh.reference || '');
+  return (
+    <div className="page-stack">
+      <pre>{String(zh.text || detail.human_readable_text_zh || '暂无中文解读')}</pre>
+      {equation && <p><strong>反应式：</strong>{equation}</p>}
+      <DataTable rows={structures} columns={[
+        { key: 'role', label: '角色', render: (row) => `${String(row.role_label_zh || row.role || '')} ${String(row.role_index || '')}` },
+        { key: 'name', label: '名称', render: (row) => String(row.name || row.label || '') },
+        { key: 'formula', label: '化学式' },
+        { key: 'cas_rn', label: 'CAS RN' },
+        { key: 'smiles', label: 'SMILES' },
+        { key: 'molfile_version', label: '结构' },
+        { key: 'rdkit_status', label: 'RDKit' }
+      ]} empty="该 RDF 反应没有可展示结构" />
+      {reference && <p><strong>参考文献：</strong>{reference}</p>}
+      <details>
+        <summary>原始 RDF 字段与调试 JSON</summary>
+        <JsonBlock value={{ id: detail.id, fields: detail.fields, reference: detail.reference, structures: detail.structures, warnings: detail.warnings }} maxHeight={420} />
+      </details>
+    </div>
+  );
+}
+
 function RdfPage({ token, guarded }: Pick<PageProps, 'token' | 'guarded'>) {
   const [query, setQuery] = useState('');
   const [limit, setLimit] = useState('25');
@@ -645,7 +690,7 @@ function RdfPage({ token, guarded }: Pick<PageProps, 'token' | 'guarded'>) {
         <DataTable rows={rows} columns={[{ key: 'source_file_path', label: '来源文件', render: (row) => shortName(row.source_file_path || row.source_title || row.source_document_id) }, { key: 'record_index', label: '记录' }, { key: 'scheme_id', label: '方案' }, { key: 'step_id', label: '步骤' }, { key: 'cas_reaction_number', label: 'CAS 反应号' }, { key: 'yield_text', label: '收率' }, { key: 'structure_count', label: '结构数' }, { key: 'open', label: '打开', render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => open(row.id), '反应详情已加载')}>打开</Button> }]} />
       </Card>
       <Card eyebrow="Detail" title="反应详情与结构">
-        <JsonBlock value={detail || { hint: '选择一条反应以查看 molfile、试剂、催化剂、溶剂和引用。' }} maxHeight={560} />
+        <RdfDetailView detail={detail} />
       </Card>
     </div>
   );
@@ -685,7 +730,7 @@ function StructurePage({ token, state, guarded }: PageProps) {
 }
 
 function LiteraturePage({ token, state, guarded }: PageProps) {
-  const [endpoint, setEndpoint] = useState({ alias: '', group_name: '', url: '', priority: '100', timeout_seconds: '10', enabled: 'true', write_note_enabled: 'false', headers: '' });
+  const [endpoint, setEndpoint] = useState({ alias: 'local-zotero', group_name: 'local-zotero', url: 'http://127.0.0.1:23120/mcp', priority: '100', timeout_seconds: '10', enabled: 'true', write_note_enabled: 'false', headers: '' });
   const [endpoints, setEndpoints] = useState<JsonObject[]>([]);
   const [documentId, setDocumentId] = useState('');
   const [jobs, setJobs] = useState<JsonObject[]>([]);
@@ -703,11 +748,11 @@ function LiteraturePage({ token, state, guarded }: PageProps) {
   return (
     <div className="page-stack">
       <Card eyebrow="Zotero MCP" title="文献源地址" extra={<div className="button-row"><Button onClick={() => guarded(saveEndpoint, 'Zotero 端点已保存')}>保存地址</Button><Button variant="secondary" onClick={() => guarded(loadEndpoints, '端点已加载')}>加载端点</Button></div>}>
-        <p className="muted">保存或删除 Zotero MCP 端点会修改 Web UI 热配置，需要 admin 权限；operator 仅可测试端点和启动文献链接任务。</p>
+        <p className="muted">默认使用本机 Streamable HTTP 端点 http://127.0.0.1:23120/mcp；通常无需添加 LAN/VPN/反代多地址。保存或删除端点会修改 Web UI 热配置，需要 admin 权限。</p>
         <div className="form-grid">
-          <Input label="地址别名" value={endpoint.alias} onChange={(e) => setEndpoint({ ...endpoint, alias: e.target.value })} placeholder="lab-zotero-lan" />
-          <Input label="文献源组名" value={endpoint.group_name} onChange={(e) => setEndpoint({ ...endpoint, group_name: e.target.value })} placeholder="primary-library" />
-          <Input label="地址 URL" value={endpoint.url} onChange={(e) => setEndpoint({ ...endpoint, url: e.target.value })} placeholder="http://host:23120/mcp" />
+          <Input label="地址别名" value={endpoint.alias} onChange={(e) => setEndpoint({ ...endpoint, alias: e.target.value })} placeholder="local-zotero" />
+          <Input label="文献源组名" value={endpoint.group_name} onChange={(e) => setEndpoint({ ...endpoint, group_name: e.target.value })} placeholder="local-zotero" />
+          <Input label="地址 URL" value={endpoint.url} onChange={(e) => setEndpoint({ ...endpoint, url: e.target.value })} placeholder="http://127.0.0.1:23120/mcp" />
           <Input label="优先级" type="number" value={endpoint.priority} onChange={(e) => setEndpoint({ ...endpoint, priority: e.target.value })} />
           <Input label="超时秒数" type="number" step="0.5" value={endpoint.timeout_seconds} onChange={(e) => setEndpoint({ ...endpoint, timeout_seconds: e.target.value })} />
           <Input label="请求头 JSON" value={endpoint.headers} onChange={(e) => setEndpoint({ ...endpoint, headers: e.target.value })} placeholder='{"Authorization":"Bearer ..."}' />

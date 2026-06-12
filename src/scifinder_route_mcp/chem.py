@@ -43,7 +43,7 @@ def normalize_molfile(molfile: str | None) -> StructureNormalization:
     except Exception as exc:
         return StructureNormalization(None, None, None, "rdkit_unavailable", f"{type(exc).__name__}: {exc}")
     try:
-        mol = Chem.MolFromMolBlock(molfile, sanitize=True, removeHs=False)
+        mol = Chem.MolFromMolBlock(rdkit_molblock(molfile), sanitize=True, removeHs=False)
         if mol is None:
             return StructureNormalization(None, None, None, "rdkit_failed", "RDKit could not parse molfile")
         smiles = Chem.MolToSmiles(mol, canonical=True)
@@ -60,7 +60,7 @@ def fingerprint_from_query(query: str, query_type: str) -> tuple[str | None, str
         from rdkit.Chem import AllChem  # type: ignore[import-not-found]
     except Exception as exc:
         return None, f"RDKit is not installed: {exc}"
-    mol = Chem.MolFromMolBlock(query, sanitize=True, removeHs=False) if query_type == "molfile" else Chem.MolFromSmiles(query)
+    mol = Chem.MolFromMolBlock(rdkit_molblock(query), sanitize=True, removeHs=False) if query_type == "molfile" else Chem.MolFromSmiles(query)
     if mol is None:
         return None, "RDKit could not parse query structure"
     return AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048).ToBitString(), None
@@ -71,18 +71,29 @@ def substructure_match(query: str, molfile: str, query_type: str = "smarts") -> 
         from rdkit import Chem  # type: ignore[import-not-found]
     except Exception as exc:
         return False, f"RDKit is not installed: {exc}"
-    target = Chem.MolFromMolBlock(molfile, sanitize=True, removeHs=False)
+    target = Chem.MolFromMolBlock(rdkit_molblock(molfile), sanitize=True, removeHs=False)
     if target is None:
         return False, "RDKit could not parse target molfile"
     if query_type == "smiles":
         pattern = Chem.MolFromSmiles(query)
     elif query_type == "molfile":
-        pattern = Chem.MolFromMolBlock(query, sanitize=True, removeHs=False)
+        pattern = Chem.MolFromMolBlock(rdkit_molblock(query), sanitize=True, removeHs=False)
     else:
         pattern = Chem.MolFromSmarts(query)
     if pattern is None:
         return False, "RDKit could not parse query structure"
     return bool(target.HasSubstructMatch(pattern)), None
+
+
+def rdkit_molblock(molfile: str) -> str:
+    lines = molfile.splitlines()
+    counts_index = next((index for index, line in enumerate(lines) if "V2000" in line or "V3000" in line), None)
+    if counts_index is None:
+        return molfile
+    headers = lines[:counts_index]
+    if len(headers) != 3:
+        headers = headers[:3] + [""] * max(0, 3 - len(headers))
+    return "\n".join([*headers, *lines[counts_index:]]) + "\n"
 
 
 def tanimoto(left: str | None, right: str | None) -> float:

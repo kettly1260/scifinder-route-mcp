@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .parsers import ParsedDocument, TextChunk, detect_file_type, extract_doi, extract_title, normalize_text
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -43,34 +48,125 @@ def auth_headers(provider: str = "openai_compatible", api_key: str | None = None
     return {"Authorization": f"Bearer {api_key}"}
 
 
-def test_http_endpoint(endpoint: str | None, *, model: str | None = None, provider: str = "openai_compatible", api_key: str | None = None) -> EndpointResult:
+def _display_url(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit(parsed._replace(query="", fragment=""))
+
+
+def _http_error_detail(exc: Exception, *, url: str, model: str | None = None) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+        parts = [f"HTTPError: HTTP Error {exc.code}: {exc.reason}", f"url={_display_url(url)}"]
+        if model:
+            parts.append(f"model={model}")
+        if body:
+            parts.append(f"body={body[:500]}")
+        return "; ".join(parts)
+    parts = [f"{type(exc).__name__}: {exc}", f"url={_display_url(url)}"]
+    if model:
+        parts.append(f"model={model}")
+    return "; ".join(parts)
+
+
+def _openai_resource_url(endpoint: str, resource: str) -> str:
+    base = endpoint.rstrip("/")
+    for suffix in ("/chat/completions", "/responses", "/embeddings", "/models"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base + "/" + resource.lstrip("/")
+
+
+def _gemini_base_url(endpoint: str) -> str:
+    base = endpoint.rstrip("/")
+    if base.endswith("/models"):
+        return base[: -len("/models")]
+    return base
+
+
+def _looks_like_paddleocr_job_endpoint(endpoint: str | None, model: str | None = None) -> bool:
+    value = (endpoint or "").rstrip("/").lower()
+    return value.endswith("/ocr/jobs") or "paddleocr" in value or (model or "").lower().startswith("paddleocr")
+
+
+def _test_llm_endpoint(endpoint: str, *, model: str | None, provider: str, api_key: str | None) -> EndpointResult:
+    if not model:
+        return list_http_models(endpoint, provider=provider, api_key=api_key, kind="llm", model=model)
+    base = endpoint.rstrip("/")
+    if provider == "openai_responses":
+        url = _openai_resource_url(base, "responses")
+        payload = {"model": model, "input": "Reply with OK."}
+        response = post_json(url, payload, timeout=30, headers=auth_headers(provider, api_key))
+    elif provider == "gemini":
+        url = _gemini_base_url(base) + f"/models/{model}:generateContent"
+        if api_key:
+            url += "?" + urllib.parse.urlencode({"key": api_key})
+        response = post_json(url, {"contents": [{"role": "user", "parts": [{"text": "Reply with OK."}]}]}, timeout=30, headers={})
+    elif provider == "claude":
+        url = base + "/messages"
+        response = post_json(url, {"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with OK."}]}, timeout=30, headers=auth_headers(provider, api_key))
+    else:
+        url = _openai_resource_url(base, "chat/completions")
+        response = post_json(url, {"model": model, "messages": [{"role": "user", "content": "Reply with OK."}]}, timeout=30, headers=auth_headers(provider, api_key))
+    return EndpointResult(configured=True, status="ok", detail=f"LLM endpoint accepted a test request at {_display_url(url)}", payload=response)
+
+
+def test_http_endpoint(endpoint: str | None, *, model: str | None = None, provider: str = "openai_compatible", api_key: str | None = None, kind: str = "generic") -> EndpointResult:
     if not endpoint:
         return EndpointResult(configured=False, status="unknown", detail="Endpoint is not configured")
+    if kind == "ocr" and provider == "paddleocr_vl":
+        return EndpointResult(configured=True, status="ok", detail="PaddleOCR-VL job endpoint configured. This provider has no lightweight health endpoint; submit a document to verify job execution.")
+    if kind == "document_parser" and _looks_like_paddleocr_job_endpoint(endpoint, model):
+        return EndpointResult(configured=True, status="ok", detail="PaddleOCR-VL job endpoint configured. It does not expose /health or /models; document parsing will still fall back locally if external parsing fails.")
+    if kind == "llm":
+        try:
+            return _test_llm_endpoint(endpoint, model=model, provider=provider, api_key=api_key)
+        except Exception as exc:
+            url = model_list_url(endpoint, provider, api_key) if not model else endpoint
+            return EndpointResult(configured=True, status="error", detail=_http_error_detail(exc, url=url, model=model))
+    if kind == "embedding":
+        embeddings_url = _openai_resource_url(endpoint, "embeddings")
+        try:
+            payload = post_json(embeddings_url, {"model": model or "default", "input": ["ping"]}, timeout=30, headers=auth_headers("openai_compatible", api_key))
+            return EndpointResult(configured=True, status="ok", detail=f"Embedding endpoint accepted a test request at {_display_url(embeddings_url)}", payload=payload)
+        except Exception as exc:
+            return EndpointResult(configured=True, status="error", detail=_http_error_detail(exc, url=embeddings_url, model=model))
     health_url = endpoint.rstrip("/") + "/health"
     try:
         payload = get_json(health_url, headers=auth_headers(provider, api_key))
         return EndpointResult(configured=True, status="ok", detail=json.dumps(payload, ensure_ascii=False)[:500], payload=payload)
     except Exception as exc:
         # Some OpenAI-compatible APIs do not expose /health. A configured endpoint is still testable later.
-        return EndpointResult(configured=True, status="error", detail=f"{type(exc).__name__}: {exc}; model={model or ''}".strip())
+        return EndpointResult(configured=True, status="error", detail=_http_error_detail(exc, url=health_url, model=model))
 
 
 def model_list_url(endpoint: str, provider: str, api_key: str | None = None) -> str:
     base = endpoint.rstrip("/")
     if provider == "gemini":
-        url = base + "/models"
-        return url + (("?key=" + api_key) if api_key else "")
-    return base + "/models"
+        url = _gemini_base_url(base) + "/models"
+        return url + (("?" + urllib.parse.urlencode({"key": api_key})) if api_key else "")
+    return _openai_resource_url(base, "models")
 
 
-def list_http_models(endpoint: str | None, *, provider: str = "openai_compatible", api_key: str | None = None) -> EndpointResult:
+def list_http_models(endpoint: str | None, *, provider: str = "openai_compatible", api_key: str | None = None, kind: str = "generic", model: str | None = None) -> EndpointResult:
     if not endpoint:
         return EndpointResult(configured=False, status="unknown", detail="Endpoint is not configured", payload={"models": []})
+    if provider == "paddleocr_vl" or (kind in {"ocr", "document_parser"} and _looks_like_paddleocr_job_endpoint(endpoint, model)):
+        models = [model] if model else []
+        return EndpointResult(configured=True, status="ok", detail="Provider does not expose a model-list endpoint; using the configured model value.", payload={"models": models})
+    if kind in {"document_parser", "structure_recognition"}:
+        models = [model] if model else []
+        return EndpointResult(configured=True, status="ok", detail="This integration type does not define a standard model-list endpoint; using the configured model value.", payload={"models": models})
     models_url = model_list_url(endpoint, provider, api_key)
     try:
         payload = get_json(models_url, headers=auth_headers(provider, api_key))
     except Exception as exc:
-        return EndpointResult(configured=True, status="error", detail=f"{type(exc).__name__}: {exc}", payload={"models": []})
+        LOGGER.warning("Integration model listing failed provider=%s kind=%s url=%s detail=%s", provider, kind, _display_url(models_url), exc)
+        return EndpointResult(configured=True, status="error", detail=_http_error_detail(exc, url=models_url), payload={"models": []})
     raw_models = payload.get("data") if isinstance(payload, dict) else None
     if raw_models is None and isinstance(payload, dict):
         raw_models = payload.get("models")
