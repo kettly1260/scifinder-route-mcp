@@ -492,18 +492,27 @@ def test_admin_dashboard_contains_modern_config_controls(tmp_path: Path) -> None
     html = render_dashboard(service)
     state = admin_state(service)
 
-    assert "Embedding endpoint" in html
-    assert "OCR endpoint" in html
-    assert "Document parser endpoint" in html
-    assert "Queue backend" in html
+    assert "<html lang=\"zh-CN\">" in html
+    assert "嵌入端点" in html
+    assert "OCR 端点" in html
+    assert "文档解析端点" in html
+    assert "队列后端" in html
     assert "data-type=\"enum\"" in html
-    assert "LLM cost limit USD" in html
-    assert "Parser fallback" in html
+    assert "LLM 成本上限 USD" in html
+    assert "解析失败回退" in html
     assert "Zotero MCP" in html
     assert "webui-config.yaml" in html
-    assert "Start Zotero Linking" in html
+    assert "启动 Zotero 链接" in html
     assert "zotero_linking_enabled" in html
-    assert "Unchanged when blank" in html
+    assert "留空则不变" in html
+    assert "aria-label=\"管理控制台分区导航\"" in html
+    assert "href=\"#rdf-viewer\"" in html
+    assert "id=\"rdf-viewer\"" in html
+    assert "featured-panel" in html
+    assert "加载 RDF 反应" in html
+    assert "prefers-color-scheme: dark" in html
+    assert "color-scheme:light dark" in html
+    assert "position:sticky" in html
     assert "backdrop-filter" in html
     assert "@media (min-width: 1440px)" in html
     assert "@media (min-width: 700px) and (max-width: 1023px)" in html
