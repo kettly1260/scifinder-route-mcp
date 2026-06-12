@@ -16,6 +16,7 @@ from scifinder_route_mcp.parsers import parse_document
 from scifinder_route_mcp.storage import RouteStorage
 from scifinder_route_mcp.rdfile import parse_rdfile_reactions
 from scifinder_route_mcp.literature import diff_reaction_fields, extract_method_fields
+from scifinder_route_mcp.integrations import EndpointResult
 
 
 def make_service(tmp_path: Path) -> RouteService:
@@ -353,6 +354,25 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
 
     assert result["registered_count"] == 1
     assert result["registered"][0]["document"]["file_path"].endswith("sample.html")
+
+
+def test_integration_model_listing_uses_unsaved_form_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = make_service(tmp_path)
+    seen: dict[str, object] = {}
+
+    def fake_list_models(endpoint: str | None, *, provider: str = "openai_compatible", api_key: str | None = None) -> EndpointResult:
+        seen.update({"endpoint": endpoint, "provider": provider, "api_key": api_key})
+        return EndpointResult(True, "ok", "Loaded 1 models", {"models": ["gpt-test"]})
+
+    monkeypatch.setattr("scifinder_route_mcp.service.list_http_models", fake_list_models)
+
+    result = service.list_integration_models(
+        "llm",
+        overrides={"integrations": {"llm_endpoint": "https://llm.example/v1", "llm_provider": "gemini", "llm_api_key": "new-secret"}},
+    )
+
+    assert seen == {"endpoint": "https://llm.example/v1", "provider": "gemini", "api_key": "new-secret"}
+    assert result["models"] == ["gpt-test"]
 
 
 def test_auto_batch_links_similar_scifinder_exports(tmp_path: Path) -> None:

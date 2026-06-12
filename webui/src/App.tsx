@@ -33,15 +33,25 @@ const pages: Array<{ id: PageId; label: string; description: string }> = [
 
 const configFields: ConfigField[] = [
   { section: 'integrations', name: 'llm_provider', label: 'LLM 提供商', type: 'select', options: ['openai_compatible', 'openai_chat', 'openai_responses', 'gemini', 'claude'] },
+  { section: 'integrations', name: 'llm_enabled', label: '启用 LLM', type: 'bool' },
   { section: 'integrations', name: 'llm_api_key', label: 'LLM API Token', type: 'password', secret: true, placeholder: '留空则不变' },
   { section: 'integrations', name: 'llm_endpoint', label: 'LLM 端点', placeholder: 'https://api.openai.com/v1' },
   { section: 'integrations', name: 'llm_model', label: 'LLM 模型', placeholder: 'gpt-4o-mini / gemini-2.5-pro' },
   { section: 'integrations', name: 'embedding_api_key', label: '嵌入 API Token', type: 'password', secret: true, placeholder: '留空则不变' },
   { section: 'integrations', name: 'embedding_endpoint', label: '嵌入端点', placeholder: 'http://embedding:8000/v1' },
   { section: 'integrations', name: 'embedding_model', label: '嵌入模型', placeholder: 'bge-m3' },
+  { section: 'integrations', name: 'ocr_provider', label: 'OCR 提供商', type: 'select', options: ['generic', 'mineru', 'paddleocr_vl'] },
+  { section: 'integrations', name: 'ocr_api_key', label: 'OCR API Token', type: 'password', secret: true, placeholder: '留空则不变' },
   { section: 'integrations', name: 'ocr_endpoint', label: 'OCR 端点' },
+  { section: 'integrations', name: 'ocr_model', label: 'OCR 模型', placeholder: 'mineru-layout / PaddleOCR-VL-1.6' },
+  { section: 'integrations', name: 'document_parser_api_key', label: '文档解析 API Token', type: 'password', secret: true, placeholder: '留空则不变' },
   { section: 'integrations', name: 'document_parser_endpoint', label: '文档解析端点' },
+  { section: 'integrations', name: 'document_parser_model', label: '文档解析模型', placeholder: 'pymupdf / mineru' },
+  { section: 'integrations', name: 'document_parser_fallback', label: '解析失败回退', type: 'bool' },
+  { section: 'integrations', name: 'structure_recognition_api_key', label: '结构识别 API Token', type: 'password', secret: true, placeholder: '留空则不变' },
   { section: 'integrations', name: 'structure_recognition_endpoint', label: '结构识别端点' },
+  { section: 'integrations', name: 'structure_recognition_model', label: '结构识别模型', placeholder: 'decimer / molscribe / osra' },
+  { section: 'integrations', name: 'postgres_url', label: 'PostgreSQL URL', type: 'password', secret: true, placeholder: '留空则不变' },
   { section: 'server', name: 'max_workers', label: '最大工作线程', type: 'number', min: '1' },
   { section: 'server', name: 'async_jobs', label: '异步任务', type: 'bool' },
   { section: 'server', name: 'storage_backend', label: '存储后端', type: 'select', options: ['sqlite', 'postgres'] },
@@ -58,6 +68,23 @@ const configFields: ConfigField[] = [
   { section: 'retention', name: 'cache_retention_days', label: '缓存保留天数', type: 'number', min: '1' },
   { section: 'integrations', name: 'zotero_linking_enabled', label: 'Zotero 自动链接', type: 'bool' }
 ];
+
+const configFieldByKey = new Map(configFields.map((field) => [`${field.section}.${field.name}`, field]));
+
+const integrationGroups = [
+  { id: 'llm', eyebrow: 'LLM', title: 'LLM 结构化', description: '用于反应步骤结构化、证据整理和 Zotero 规则之外的补充判断。', fields: ['integrations.llm_provider', 'integrations.llm_enabled', 'integrations.llm_endpoint', 'integrations.llm_model', 'integrations.llm_api_key'], modelKey: 'integrations.llm_model' },
+  { id: 'embedding', eyebrow: 'Embedding', title: '嵌入模型', description: '用于语义召回和向量索引重建，通常需要 OpenAI 兼容 /embeddings 与 /models。', fields: ['integrations.embedding_endpoint', 'integrations.embedding_model', 'integrations.embedding_api_key'], modelKey: 'integrations.embedding_model' },
+  { id: 'ocr', eyebrow: 'OCR', title: 'OCR 识别', description: '用于扫描件和页面视觉证据抽取；不同提供商的端点形态可能不同。', fields: ['integrations.ocr_provider', 'integrations.ocr_endpoint', 'integrations.ocr_model', 'integrations.ocr_api_key'], modelKey: 'integrations.ocr_model' },
+  { id: 'document_parser', eyebrow: 'Parser', title: '文档解析', description: '用于 PDF/RTF/HTML 正文解析和失败回退策略。', fields: ['integrations.document_parser_endpoint', 'integrations.document_parser_model', 'integrations.document_parser_api_key', 'integrations.document_parser_fallback'], modelKey: 'integrations.document_parser_model' },
+  { id: 'structure_recognition', eyebrow: 'Structure', title: '结构识别', description: '用于图片结构识别和结构敏感证据补充。', fields: ['integrations.structure_recognition_endpoint', 'integrations.structure_recognition_model', 'integrations.structure_recognition_api_key'], modelKey: 'integrations.structure_recognition_model' }
+] as const;
+
+const runtimeGroups = [
+  { eyebrow: 'Runtime', title: '服务运行时', fields: ['server.storage_backend', 'server.max_workers', 'server.async_jobs', 'security.allow_external_paths', 'security.token'] },
+  { eyebrow: 'Queue', title: '队列与缓存', fields: ['queue.backend', 'queue.redis_url', 'retention.evidence_retention_days', 'retention.cache_retention_days'] },
+  { eyebrow: 'Ingest', title: '导入与抽取', fields: ['ingest.scan_extensions', 'thresholds.verification_confidence_threshold', 'extraction.llm_schema_version', 'extraction.llm_prompt_profile', 'extraction.llm_cost_limit_usd'] },
+  { eyebrow: 'Literature', title: 'Zotero 链接策略', fields: ['integrations.zotero_linking_enabled'] }
+] as const;
 
 function authError(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error);
@@ -301,49 +328,181 @@ function IngestPage({ token, state, guarded, refresh }: PageProps & { refresh: (
 function ConfigPage({ token, state, guarded, refresh }: PageProps & { refresh: () => Promise<AdminState> }) {
   const [values, setValues] = useState<Record<string, string>>(() => buildConfigValues(state.config));
   const [models, setModels] = useState<Record<string, string[]>>({});
+  const [actionResults, setActionResults] = useState<Record<string, JsonObject>>({});
 
   function update(key: string, value: string) {
     setValues((current) => ({ ...current, [key]: value }));
   }
 
-  async function save() {
+  function buildPayload(includeEmptySecrets = false) {
     const payload: JsonObject = {};
     for (const field of configFields) {
       const key = `${field.section}.${field.name}`;
       const raw = values[key]?.trim() ?? '';
-      if (field.secret && !raw) continue;
+      if (field.secret && !raw && !includeEmptySecrets) continue;
       const section = (payload[field.section] ||= {}) as JsonObject;
       if (field.type === 'list') section[field.name] = raw.split(',').map((item) => item.trim()).filter(Boolean);
       else if (field.type === 'number') section[field.name] = raw === '' ? undefined : Number(raw);
       else if (field.type === 'bool') section[field.name] = raw === 'true';
       else section[field.name] = raw || null;
     }
+    return payload;
+  }
+
+  async function save() {
+    const payload = buildPayload(false);
     await postJson('/api/config', token, payload);
     const next = await refresh();
     setValues(buildConfigValues(next.config));
   }
 
+  function rememberResult(key: string, data: JsonObject) {
+    setActionResults((current) => ({ ...current, [key]: data }));
+  }
+
+  async function runEndpointTest(kind: string) {
+    const data = await postJson<JsonObject>('/api/integration/test', token, { kind, overrides: buildPayload(false) });
+    rememberResult(kind, data);
+    return data;
+  }
+
   async function loadModels(kind: string) {
-    const data = await postJson<{ models?: string[] }>('/api/integration/models', token, { kind });
+    const data = await postJson<{ models?: string[] } & JsonObject>('/api/integration/models', token, { kind, overrides: buildPayload(false) });
     setModels((current) => ({ ...current, [kind]: data.models || [] }));
+    rememberResult(`${kind}:models`, data);
+    if (data.models?.length) {
+      const group = integrationGroups.find((item) => item.id === kind);
+      const modelKey = group?.modelKey;
+      if (modelKey && !values[modelKey]) update(modelKey, data.models[0]);
+    }
+    return data;
   }
 
   return (
     <div className="page-stack">
-      <Card eyebrow="Hot Config" title="热配置编辑" extra={<Button onClick={() => guarded(save, '配置已保存并重载')}>保存并重载</Button>}>
-        <div className="form-grid">
-          {configFields.map((field) => <ConfigControl key={`${field.section}.${field.name}`} field={field} value={values[`${field.section}.${field.name}`] ?? ''} onChange={update} />)}
+      <section className="config-hero card">
+        <div>
+          <p className="eyebrow">Hot Config</p>
+          <div className="title">热配置工作区</div>
+          <p className="muted">每个集成单独测试和拉取模型。按钮会使用当前表单内容，不需要先保存；保存后才会写入 `webui-config.yaml`。</p>
         </div>
-        <p className="muted">端口、卷挂载、Docker 网络和重启策略仍应在 `.env` / Docker Compose 中修改。</p>
-      </Card>
-      <Card eyebrow="Endpoint Checks" title="集成端点测试">
-        <div className="button-grid">
-          {['llm', 'embedding', 'ocr', 'document_parser', 'structure_recognition', 'postgres', 'zotero_mcp'].map((kind) => <Button key={kind} variant="secondary" onClick={() => guarded(() => postJson('/api/integration/test', token, { kind }), `${kind} 测试完成`)}>测试 {kind}</Button>)}
-          <Button variant="ghost" onClick={() => guarded(() => loadModels('llm'), 'LLM 模型已拉取')}>拉取 LLM 模型</Button>
-          <Button variant="ghost" onClick={() => guarded(() => loadModels('embedding'), 'Embedding 模型已拉取')}>拉取 Embedding 模型</Button>
+        <Button onClick={() => guarded(save, '配置已保存并重载')}>保存并重载</Button>
+      </section>
+
+      <section className="config-section">
+        <div className="section-heading"><p className="eyebrow">Model Providers</p><h2>模型与外部能力</h2></div>
+        <div className="config-grid">
+          {integrationGroups.map((group) => (
+            <ConfigIntegrationCard
+              key={group.id}
+              group={group}
+              values={values}
+              models={models[group.id] || []}
+              testResult={actionResults[group.id]}
+              modelResult={actionResults[`${group.id}:models`]}
+              onChange={update}
+              onTest={() => guarded(() => runEndpointTest(group.id), `${group.title} 测试完成`)}
+              onLoadModels={() => guarded(() => loadModels(group.id), `${group.title} 模型拉取完成`)}
+            />
+          ))}
         </div>
-        <JsonBlock value={models} />
-      </Card>
+      </section>
+
+      <section className="config-section">
+        <div className="section-heading"><p className="eyebrow">Service Controls</p><h2>服务、队列与抽取策略</h2></div>
+        <div className="config-grid two-column">
+          {runtimeGroups.map((group) => <ConfigFieldCard key={group.title} group={group} values={values} onChange={update} />)}
+          <Card eyebrow="Postgres" title="PostgreSQL 存储" extra={<Button variant="secondary" onClick={() => guarded(() => runEndpointTest('postgres'), 'Postgres 测试完成')}>测试 Postgres</Button>}>
+            <div className="form-grid single">
+              <ConfigControl field={configFieldByKey.get('integrations.postgres_url')!} value={values['integrations.postgres_url'] ?? ''} onChange={update} />
+            </div>
+            <ActionResult result={actionResults.postgres} />
+          </Card>
+          <Card eyebrow="Zotero MCP" title="文献源连通性" extra={<Button variant="secondary" onClick={() => guarded(() => runEndpointTest('zotero_mcp'), 'Zotero MCP 测试完成')}>测试 Zotero MCP</Button>}>
+            <p className="muted">Zotero 端点地址在“文献 / Zotero”页面维护，这里只测试已保存的端点组。</p>
+            <ActionResult result={actionResults.zotero_mcp} />
+          </Card>
+        </div>
+      </section>
+      <p className="muted">端口、卷挂载、Docker 网络和重启策略仍应在 `.env` / Docker Compose 中修改。</p>
+    </div>
+  );
+}
+
+type ConfigGroup = { eyebrow: string; title: string; fields: readonly string[] };
+type IntegrationGroup = ConfigGroup & { id: string; description: string; modelKey: string };
+
+function ConfigIntegrationCard({
+  group,
+  values,
+  models,
+  testResult,
+  modelResult,
+  onChange,
+  onTest,
+  onLoadModels
+}: {
+  group: IntegrationGroup;
+  values: Record<string, string>;
+  models: string[];
+  testResult?: JsonObject;
+  modelResult?: JsonObject;
+  onChange: (key: string, value: string) => void;
+  onTest: () => void;
+  onLoadModels: () => void;
+}) {
+  return (
+    <Card eyebrow={group.eyebrow} title={group.title} extra={<div className="button-row"><Button variant="secondary" onClick={onTest}>测试端点</Button><Button variant="ghost" onClick={onLoadModels}>拉取模型</Button></div>}>
+      <p className="muted config-description">{group.description}</p>
+      <div className="form-grid single">
+        {group.fields.map((key) => {
+          const field = configFieldByKey.get(key);
+          if (!field) return null;
+          return <ConfigControl key={key} field={field} value={values[key] ?? ''} onChange={onChange} suggestions={key === group.modelKey ? models : undefined} />;
+        })}
+      </div>
+      <ModelSuggestions models={models} modelKey={group.modelKey} onChange={onChange} />
+      <div className="result-grid">
+        <ActionResult title="端点测试" result={testResult} />
+        <ActionResult title="模型拉取" result={modelResult} />
+      </div>
+    </Card>
+  );
+}
+
+function ConfigFieldCard({ group, values, onChange }: { group: ConfigGroup; values: Record<string, string>; onChange: (key: string, value: string) => void }) {
+  return (
+    <Card eyebrow={group.eyebrow} title={group.title}>
+      <div className="form-grid single">
+        {group.fields.map((key) => {
+          const field = configFieldByKey.get(key);
+          return field ? <ConfigControl key={key} field={field} value={values[key] ?? ''} onChange={onChange} /> : null;
+        })}
+      </div>
+    </Card>
+  );
+}
+
+function ModelSuggestions({ models, modelKey, onChange }: { models: string[]; modelKey: string; onChange: (key: string, value: string) => void }) {
+  if (!models.length) return null;
+  return (
+    <div className="model-list" aria-label="已拉取模型列表">
+      {models.slice(0, 12).map((model) => <button key={model} type="button" onClick={() => onChange(modelKey, model)}>{model}</button>)}
+      {models.length > 12 && <span>+{models.length - 12} more</span>}
+    </div>
+  );
+}
+
+function ActionResult({ title, result }: { title?: string; result?: JsonObject }) {
+  if (!result) return <div className="action-result empty">{title && <strong>{title}</strong>}<span>尚未执行</span></div>;
+  const status = String(result.status || (result.error ? 'error' : 'ok'));
+  const detail = String(result.detail || result.error || JSON.stringify(result));
+  const tone = status === 'ok' ? 'ok' : status === 'unknown' ? 'unknown' : 'error';
+  return (
+    <div className={`action-result ${tone}`}>
+      {title && <strong>{title}</strong>}
+      <span>{status}</span>
+      <p>{detail}</p>
     </div>
   );
 }
@@ -493,7 +652,7 @@ function buildConfigValues(config: JsonObject): Record<string, string> {
   return values;
 }
 
-function ConfigControl({ field, value, onChange }: { field: ConfigField; value: string; onChange: (key: string, value: string) => void }) {
+function ConfigControl({ field, value, onChange, suggestions }: { field: ConfigField; value: string; onChange: (key: string, value: string) => void; suggestions?: string[] }) {
   const key = `${field.section}.${field.name}`;
   if (field.type === 'select') {
     return <label className="form-group">{field.label}<select value={value} onChange={(event) => onChange(key, event.target.value)}>{(field.options || []).map((option) => <option key={option} value={option}>{option}</option>)}</select></label>;
@@ -501,5 +660,11 @@ function ConfigControl({ field, value, onChange }: { field: ConfigField; value: 
   if (field.type === 'bool') {
     return <label className="form-group">{field.label}<select value={value || 'false'} onChange={(event) => onChange(key, event.target.value)}><option value="true">启用</option><option value="false">停用</option></select></label>;
   }
-  return <Input label={field.label} type={field.type === 'password' ? 'password' : field.type === 'number' ? 'number' : 'text'} value={value} onChange={(event) => onChange(key, event.target.value)} placeholder={field.placeholder} min={field.min} max={field.max} step={field.step} />;
+  const listId = suggestions?.length ? `list-${field.section}-${field.name}` : undefined;
+  return (
+    <>
+      <Input label={field.label} type={field.type === 'password' ? 'password' : field.type === 'number' ? 'number' : 'text'} value={value} onChange={(event) => onChange(key, event.target.value)} placeholder={field.placeholder} min={field.min} max={field.max} step={field.step} list={listId} />
+      {listId && <datalist id={listId}>{suggestions?.map((item) => <option key={item} value={item} />)}</datalist>}
+    </>
+  );
 }

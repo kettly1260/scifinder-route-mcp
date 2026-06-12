@@ -186,12 +186,14 @@ class AdminHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/integration/test":
                 self._require_role("operator")
                 payload = self._read_json()
-                self._send_json(self.server.service.test_integration_endpoint(str(payload.get("kind") or "")))
+                overrides = payload.get("overrides") if isinstance(payload.get("overrides"), dict) else None
+                self._send_json(self.server.service.test_integration_endpoint(str(payload.get("kind") or ""), overrides=overrides))
                 return
             if parsed.path == "/api/integration/models":
                 self._require_role("viewer")
                 payload = self._read_json()
-                self._send_json(self.server.service.list_integration_models(str(payload.get("kind") or "")))
+                overrides = payload.get("overrides") if isinstance(payload.get("overrides"), dict) else None
+                self._send_json(self.server.service.list_integration_models(str(payload.get("kind") or ""), overrides=overrides))
                 return
             if parsed.path == "/api/zotero/endpoints":
                 self._require_role("operator")
@@ -511,7 +513,7 @@ ADMIN_CSS = r"""
   --bg:#f4f7fb;--surface:#ffffff;--text:#172033;--muted:#67748e;--line:rgba(20,33,61,.1);
   --glass:rgba(255,255,255,.84);--glass-strong:rgba(255,255,255,.96);
   --primary:#5e72e4;--primary-2:#11cdef;--accent:#2dce89;--danger:#f5365c;
-  --button-text:#fff;--field-bg:#fff;--pre-bg:#f8fafc;--pre-text:#263449;--row-line:rgba(20,33,61,.08);--mini-bg:#f8fafc;
+  --button-text:#06101c;--field-bg:#fff;--pre-bg:#f8fafc;--pre-text:#263449;--row-line:rgba(20,33,61,.08);--mini-bg:#f8fafc;
   --body-bg:radial-gradient(circle at 82% 12%,rgba(17,205,239,.20),transparent 26%),linear-gradient(145deg,#eef3ff 0,#f7fafc 42%,#edf6ff 100%);
   --mobile-bg:linear-gradient(160deg,#eef3ff 0,#f7fafc 55%,#edf6ff 100%);
   --shadow:0 18px 45px rgba(50,50,93,.12),0 8px 18px rgba(0,0,0,.06);

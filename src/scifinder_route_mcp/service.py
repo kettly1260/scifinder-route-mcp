@@ -333,16 +333,9 @@ class RouteService:
         vector = adapter.embed([query])[0]
         return [{**step.to_dict(), "semantic_score": score} for step, score in self.storage.semantic_search(vector, limit=limit)]
 
-    def test_integration_endpoint(self, kind: str) -> dict[str, Any]:
-        endpoints = {
-            "llm": (self.config.llm_endpoint, self.config.llm_model, self.config.llm_provider, self.config.llm_api_key),
-            "embedding": (self.config.embedding_endpoint, self.config.embedding_model, "openai_compatible", self.config.embedding_api_key),
-            "ocr": (self.config.ocr_endpoint, self.config.ocr_model, "openai_compatible", self.config.ocr_api_key),
-            "document_parser": (self.config.document_parser_endpoint, self.config.document_parser_model, "openai_compatible", self.config.document_parser_api_key),
-            "structure_recognition": (self.config.structure_recognition_endpoint, self.config.structure_recognition_model, "openai_compatible", self.config.structure_recognition_api_key),
-        }
+    def test_integration_endpoint(self, kind: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         if kind == "postgres":
-            result = self._test_postgres()
+            result = self._test_postgres(self._override_value(overrides, "integrations", "postgres_url", self.config.postgres_url))
             return self.storage.record_integration_status("postgres", **result)
         if kind == "zotero_mcp":
             endpoints = self._configured_zotero_endpoints()
@@ -352,26 +345,63 @@ class RouteService:
             ok = [item for item in results if item.get("status") == "ok"]
             detail = json.dumps(results, ensure_ascii=False)
             return self.storage.record_integration_status("zotero_mcp", configured=True, status="ok" if ok else "error", detail=detail[:1000])
-        if kind not in endpoints:
-            raise ValueError(f"Unknown integration kind: {kind}")
-        endpoint, model, provider, api_key = endpoints[kind]
+        endpoint, model, provider, api_key = self._integration_endpoint_settings(kind, overrides)
         result = test_http_endpoint(endpoint, model=model, provider=provider, api_key=api_key)
         return self.storage.record_integration_status(kind, configured=result.configured, status=result.status, detail=result.detail)
 
-    def list_integration_models(self, kind: str) -> dict[str, Any]:
-        endpoints = {
-            "llm": (self.config.llm_endpoint, self.config.llm_provider, self.config.llm_api_key),
-            "embedding": (self.config.embedding_endpoint, "openai_compatible", self.config.embedding_api_key),
-            "ocr": (self.config.ocr_endpoint, "openai_compatible", self.config.ocr_api_key),
-            "document_parser": (self.config.document_parser_endpoint, "openai_compatible", self.config.document_parser_api_key),
-            "structure_recognition": (self.config.structure_recognition_endpoint, "openai_compatible", self.config.structure_recognition_api_key),
-        }
-        if kind not in endpoints:
-            raise ValueError(f"Unknown integration kind: {kind}")
-        endpoint, provider, api_key = endpoints[kind]
+    def list_integration_models(self, kind: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+        endpoint, _model, provider, api_key = self._integration_endpoint_settings(kind, overrides)
         result = list_http_models(endpoint, provider=provider, api_key=api_key)
         payload = result.payload if isinstance(result.payload, dict) else {}
         return {"kind": kind, "configured": result.configured, "status": result.status, "detail": result.detail, "models": payload.get("models", [])}
+
+    def _integration_endpoint_settings(self, kind: str, overrides: dict[str, Any] | None = None) -> tuple[str | None, str | None, str, str | None]:
+        settings = {
+            "llm": (
+                self._override_value(overrides, "integrations", "llm_endpoint", self.config.llm_endpoint),
+                self._override_value(overrides, "integrations", "llm_model", self.config.llm_model),
+                self._override_value(overrides, "integrations", "llm_provider", self.config.llm_provider) or "openai_compatible",
+                self._override_value(overrides, "integrations", "llm_api_key", self.config.llm_api_key),
+            ),
+            "embedding": (
+                self._override_value(overrides, "integrations", "embedding_endpoint", self.config.embedding_endpoint),
+                self._override_value(overrides, "integrations", "embedding_model", self.config.embedding_model),
+                "openai_compatible",
+                self._override_value(overrides, "integrations", "embedding_api_key", self.config.embedding_api_key),
+            ),
+            "ocr": (
+                self._override_value(overrides, "integrations", "ocr_endpoint", self.config.ocr_endpoint),
+                self._override_value(overrides, "integrations", "ocr_model", self.config.ocr_model),
+                self._override_value(overrides, "integrations", "ocr_provider", "openai_compatible") or "openai_compatible",
+                self._override_value(overrides, "integrations", "ocr_api_key", self.config.ocr_api_key),
+            ),
+            "document_parser": (
+                self._override_value(overrides, "integrations", "document_parser_endpoint", self.config.document_parser_endpoint),
+                self._override_value(overrides, "integrations", "document_parser_model", self.config.document_parser_model),
+                "openai_compatible",
+                self._override_value(overrides, "integrations", "document_parser_api_key", self.config.document_parser_api_key),
+            ),
+            "structure_recognition": (
+                self._override_value(overrides, "integrations", "structure_recognition_endpoint", self.config.structure_recognition_endpoint),
+                self._override_value(overrides, "integrations", "structure_recognition_model", self.config.structure_recognition_model),
+                "openai_compatible",
+                self._override_value(overrides, "integrations", "structure_recognition_api_key", self.config.structure_recognition_api_key),
+            ),
+        }
+        if kind not in settings:
+            raise ValueError(f"Unknown integration kind: {kind}")
+        return settings[kind]
+
+    @staticmethod
+    def _override_value(overrides: dict[str, Any] | None, section: str, key: str, default: str | None) -> str | None:
+        section_values = overrides.get(section, {}) if isinstance(overrides, dict) else {}
+        if not isinstance(section_values, dict) or key not in section_values:
+            return default
+        value = section_values.get(key)
+        if value is None:
+            return default
+        text = str(value).strip()
+        return text or default
 
     def search_compounds(self, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
         return [compound.to_dict() for compound in self.storage.search_compounds(query=query, limit=limit)]
@@ -1000,13 +1030,14 @@ class RouteService:
                 return {"configured": True, "active": "sqlite", "status": "degraded", "detail": f"PostgreSQL unavailable; SQLite fallback active: {exc}"}
         return {"configured": False, "active": "sqlite", "status": "degraded", "detail": f"Unknown backend {self.config.storage_backend}; SQLite fallback active"}
 
-    def _test_postgres(self) -> dict[str, Any]:
-        if not self.config.postgres_url:
+    def _test_postgres(self, postgres_url: str | None = None) -> dict[str, Any]:
+        postgres_url = postgres_url or self.config.postgres_url
+        if not postgres_url:
             return {"configured": False, "status": "unknown", "detail": "PostgreSQL URL is not configured"}
         try:
             import psycopg  # type: ignore[import-not-found]
 
-            with psycopg.connect(self.config.postgres_url, connect_timeout=3) as conn:
+            with psycopg.connect(postgres_url, connect_timeout=3) as conn:
                 conn.execute("SELECT 1")
             return {"configured": True, "status": "ok", "detail": "PostgreSQL connection succeeded"}
         except Exception as exc:
