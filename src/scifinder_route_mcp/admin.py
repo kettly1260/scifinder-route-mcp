@@ -69,6 +69,52 @@ class AdminHandler(BaseHTTPRequestHandler):
                 if not self._send_lock_error(exc):
                     raise
             return
+        if parsed.path == "/api/documents":
+            try:
+                self._require_role("viewer")
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    self.server.service.list_documents(
+                        query=first_query(query, "q"),
+                        file_type=first_query(query, "file_type"),
+                        limit=int(first_query(query, "limit", "100")),
+                        offset=int(first_query(query, "offset", "0")),
+                    )
+                )
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_error_json(exc)
+            return
+        if parsed.path.startswith("/api/documents/"):
+            try:
+                self._require_role("viewer")
+                query = parse_qs(parsed.query)
+                suffix = "/chunks"
+                if parsed.path.endswith(suffix):
+                    document_id = parsed.path.removeprefix("/api/documents/").removesuffix(suffix)
+                    self._send_json(
+                        self.server.service.list_document_parsed_chunks(
+                            document_id,
+                            limit=int(first_query(query, "limit", "50")),
+                            offset=int(first_query(query, "offset", "0")),
+                        )
+                    )
+                else:
+                    document_id = parsed.path.rsplit("/", 1)[-1]
+                    self._send_json(
+                        self.server.service.get_document_parse_result(
+                            document_id,
+                            chunk_limit=int(first_query(query, "chunk_limit", "50")),
+                            chunk_offset=int(first_query(query, "chunk_offset", "0")),
+                            reaction_limit=int(first_query(query, "reaction_limit", "100")),
+                        )
+                    )
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_error_json(exc)
+            return
         if parsed.path == "/api/rdf/reactions":
             try:
                 self._require_role("viewer")
@@ -84,6 +130,16 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._require_role("viewer")
                 query = parse_qs(parsed.query)
                 self._send_json(self.server.service.list_rdf_structures(document_id=first_query(query, "document_id"), query=first_query(query, "q"), limit=int(first_query(query, "limit", "50")), offset=int(first_query(query, "offset", "0"))))
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_error_json(exc)
+            return
+        if parsed.path.startswith("/api/rdf/structures/") and parsed.path.endswith("/image.svg"):
+            try:
+                self._require_role("viewer")
+                structure_id = parsed.path.removeprefix("/api/rdf/structures/").removesuffix("/image.svg")
+                self._send_svg(self.server.service.render_rdf_structure_svg(structure_id))
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
@@ -330,6 +386,15 @@ class AdminHandler(BaseHTTPRequestHandler):
         encoded = body.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_svg(self, body: str) -> None:
+        encoded = body.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
@@ -654,7 +719,9 @@ async function installRdkit(){await guarded(async()=>{const data=await post('/ap
 async function runChemSearch(){await guarded(async()=>{const query=document.getElementById('chemQuery').value.trim();const mode=document.getElementById('chemMode').value;let data;if(mode==='text'){data=await getJson('/api/rdf/structures?q='+encodeURIComponent(query)+'&limit=50')}else if(mode==='similarity'){data=(await post('/api/chem/similarity-search',{query,query_type:'smiles',min_similarity:0.2,limit:50})).results}else{data=(await post('/api/chem/substructure-search',{query,query_type:'smarts',limit:50})).results}document.getElementById('chemResults').innerHTML=table(data,[{label:'名称',key:'name'},{label:'角色',key:'role'},{label:'CAS',key:'cas_rn'},{label:'版本',key:'molfile_version'},{label:'评分',render:r=>esc(r.similarity??'')},{label:'反应',render:r=>`<button onclick="showRdfReaction('${esc(r.rdf_reaction_id)}')">打开</button>`},{label:'删除',render:r=>`<button onclick="trashItem('rdf_structure','${esc(r.id)}')">移入回收站</button>`}])})}
 async function loadRdfReactions(){await guarded(async()=>{const query=document.getElementById('rdfQuery').value.trim();const limit=document.getElementById('rdfLimit').value||25;const url='/api/rdf/reactions?limit='+encodeURIComponent(limit)+(query?'&q='+encodeURIComponent(query):'');const data=await getJson(url);document.getElementById('rdfReactions').innerHTML=table(data,[{label:'来源文件',render:r=>esc(shortName(r.source_file_path)||r.source_title||r.source_document_id)},{label:'记录',key:'record_index'},{label:'方案',key:'scheme_id'},{label:'步骤',key:'step_id'},{label:'CAS 反应号',key:'cas_reaction_number'},{label:'收率',key:'yield_text'},{label:'结构数',key:'structure_count'},{label:'打开',render:r=>`<button onclick="showRdfReaction('${esc(r.id)}')">打开</button>`},{label:'删除',render:r=>`<button onclick="trashItem('rdf_reaction','${esc(r.id)}')">移入回收站</button>`}])})}
 function rdfRoleOrder(role){return ['reactant','product','reagent','catalyst','solvent','unknown'].indexOf(role)}
-function renderRdfDetail(data){const readable=data.readable||{};const zh=readable.zh||{};const structures=(readable.structures||[]).slice().sort((a,b)=>(rdfRoleOrder(a.role)-rdfRoleOrder(b.role))||((a.role_index||0)-(b.role_index||0)));const rows=table(structures,[{label:'角色',render:s=>`${esc(s.role_label_zh||s.role)} ${esc(s.role_index||'')}`},{label:'名称',render:s=>esc(s.name||s.label)},{label:'化学式',key:'formula'},{label:'CAS RN',key:'cas_rn'},{label:'SMILES',key:'smiles'},{label:'结构',render:s=>s.has_molfile?esc(s.molfile_version||'molfile'):'仅元数据'},{label:'RDKit',key:'rdkit_status'}]);const warnings=(data.warnings||[]).map(w=>`<li>${esc(w)}</li>`).join('');return `<article class="panel"><h3>中文解读</h3><pre>${esc(zh.text||data.human_readable_text_zh||'暂无中文解读')}</pre><h3>反应式</h3><p>${esc(zh.equation||'')}</p><h3>结构与化学式</h3>${rows}<h3>参考文献</h3><p>${esc(zh.reference||'')}</p><details><summary>原始 RDF 字段与调试 JSON</summary><pre>${esc(JSON.stringify({id:data.id,fields:data.fields,reference:data.reference,structures:data.structures,warnings:data.warnings},null,2))}</pre></details>${warnings?`<h3>警告</h3><ul>${warnings}</ul>`:''}</article>`}
+function structureImage(s){if(!s.image_svg_url)return '<div class="structure-missing">仅元数据<br>无 molfile/SMILES 可渲染</div>';return `<div class="structure-image"><img loading="lazy" alt="${esc(s.display||s.label||s.name||'化学结构')}" src="${esc(s.image_svg_url)}"></div>`}
+function renderStructureCards(structures){if(!structures.length)return '<p class="hint">暂无结构数据</p>';return `<div class="structure-grid">${structures.map(s=>`<article class="structure-card">${structureImage(s)}<h4>${esc(s.role_label_zh||s.role)} ${esc(s.role_index||'')}</h4><dl><dt>名称</dt><dd>${esc(s.name||s.label||'')}</dd><dt>化学式</dt><dd>${esc(s.formula||'')}</dd><dt>CAS RN</dt><dd>${esc(s.cas_rn||'')}</dd><dt>SMILES</dt><dd>${esc(s.smiles||'')}</dd><dt>RDKit</dt><dd>${esc(s.rdkit_status||'')}</dd></dl></article>`).join('')}</div>`}
+function renderRdfDetail(data){const readable=data.readable||{};const zh=readable.zh||{};const structures=(readable.structures||[]).slice().sort((a,b)=>(rdfRoleOrder(a.role)-rdfRoleOrder(b.role))||((a.role_index||0)-(b.role_index||0)));const rows=table(structures,[{label:'角色',render:s=>`${esc(s.role_label_zh||s.role)} ${esc(s.role_index||'')}`},{label:'结构图',render:s=>s.image_svg_url?`<div class="structure-thumb"><img loading="lazy" alt="${esc(s.display||s.label||s.name||'化学结构')}" src="${esc(s.image_svg_url)}"></div>`:'仅元数据'},{label:'名称',render:s=>esc(s.name||s.label)},{label:'化学式',key:'formula'},{label:'CAS RN',key:'cas_rn'},{label:'SMILES',key:'smiles'},{label:'结构',render:s=>s.has_molfile?esc(s.molfile_version||'molfile'):(s.smiles?'SMILES':'仅元数据')},{label:'RDKit',key:'rdkit_status'}]);const warnings=(data.warnings||[]).map(w=>`<li>${esc(w)}</li>`).join('');return `<article class="panel"><h3>中文解读</h3><pre>${esc(zh.text||data.human_readable_text_zh||'暂无中文解读')}</pre><h3>反应式</h3><p>${esc(zh.equation||'')}</p><h3>反应结构图谱</h3>${renderStructureCards(structures)}<h3>结构与化学式</h3>${rows}<h3>参考文献</h3><p>${esc(zh.reference||'')}</p><details><summary>原始 RDF 字段与调试 JSON</summary><pre>${esc(JSON.stringify({id:data.id,fields:data.fields,reference:data.reference,structures:data.structures,warnings:data.warnings},null,2))}</pre></details>${warnings?`<h3>警告</h3><ul>${warnings}</ul>`:''}</article>`}
 async function showRdfReaction(id){await guarded(async()=>{const data=await getJson('/api/rdf/reactions/'+encodeURIComponent(id));document.getElementById('rdfDetail').innerHTML=renderRdfDetail(data)})}
 async function trashItem(entity_type,entity_id){if(!confirm(`要将 ${entity_type} 移入回收站吗？`))return;await guarded(async()=>{await post('/api/trash/delete',{entity_type,entity_id});await loadRdfReactions();const query=document.getElementById('chemQuery').value.trim();if(query)await runChemSearch()})}
 async function loadTrash(){await guarded(async()=>{const data=await getJson('/api/trash?limit=100');document.getElementById('trashList').innerHTML=table(data,[{label:'类型',key:'entity_type'},{label:'ID',key:'id'},{label:'标题',key:'title'},{label:'删除时间',key:'deleted_at'},{label:'还原',render:r=>`<button onclick="restoreTrash('${esc(r.entity_type)}','${esc(r.id)}')">还原</button>`}])})}

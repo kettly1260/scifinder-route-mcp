@@ -106,6 +106,18 @@ class RouteStorage:
                     confidence REAL NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS parsed_chunk (
+                    id TEXT PRIMARY KEY,
+                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
+                    chunk_index INTEGER NOT NULL,
+                    page_number INTEGER,
+                    text TEXT NOT NULL,
+                    parser_name TEXT NOT NULL,
+                    parser_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(source_document_id, chunk_index)
+                );
+
                 CREATE TABLE IF NOT EXISTS export_batch (
                     id TEXT PRIMARY KEY,
                     title TEXT,
@@ -330,6 +342,9 @@ class RouteStorage:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_parsed_chunk_document_index
+                ON parsed_chunk(source_document_id, chunk_index);
                 """
             )
             self._migrate_schema(conn)
@@ -522,10 +537,66 @@ class RouteStorage:
                 ).fetchall()
         return [self._job_from_row(row) for row in rows]
 
+    def get_latest_job_for_document(self, document_id: str) -> ParseJob | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM parse_job
+                WHERE document_id = ?
+                ORDER BY COALESCE(finished_at, started_at, '') DESC, id DESC
+                LIMIT 1
+                """,
+                (document_id,),
+            ).fetchone()
+        return self._job_from_row(row) if row else None
+
     def get_document(self, document_id: str) -> SourceDocument | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM source_document WHERE id = ?", (document_id,)).fetchone()
         return self._document_from_row(row) if row else None
+
+    def list_documents(self, *, query: str = "", file_type: str = "", limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        clauses = ["d.deleted_at IS NULL"]
+        params: list[Any] = []
+        if query:
+            like = f"%{query}%"
+            clauses.append("(d.title LIKE ? OR d.file_path LIKE ? OR d.doi LIKE ? OR d.id LIKE ?)")
+            params.extend([like, like, like, like])
+        if file_type:
+            clauses.append("d.file_type = ?")
+            params.append(file_type)
+        where = " AND ".join(clauses)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT d.*,
+                       COUNT(DISTINCT pc.id) AS parsed_chunk_count,
+                       COUNT(DISTINCT rs.id) AS reaction_step_count,
+                       MAX(j.finished_at) AS last_job_finished_at,
+                       (
+                         SELECT j2.status FROM parse_job j2
+                         WHERE j2.document_id = d.id
+                         ORDER BY COALESCE(j2.started_at, '') DESC, j2.id DESC
+                         LIMIT 1
+                       ) AS last_job_status,
+                       (
+                         SELECT j3.error FROM parse_job j3
+                         WHERE j3.document_id = d.id AND j3.error IS NOT NULL
+                         ORDER BY COALESCE(j3.finished_at, j3.started_at, '') DESC, j3.id DESC
+                         LIMIT 1
+                       ) AS last_job_error
+                FROM source_document d
+                LEFT JOIN parsed_chunk pc ON pc.source_document_id = d.id
+                LEFT JOIN reaction_step rs ON rs.source_document_id = d.id AND rs.deleted_at IS NULL
+                LEFT JOIN parse_job j ON j.document_id = d.id
+                WHERE {where}
+                GROUP BY d.id
+                ORDER BY d.updated_at DESC, d.created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, limit, offset),
+            ).fetchall()
+        return [self._document_summary_from_row(row) for row in rows]
 
     def get_document_by_hash_path(self, *, file_hash: str, file_path: str) -> SourceDocument | None:
         with self.connect() as conn:
@@ -560,6 +631,49 @@ class RouteStorage:
                 conn.execute("DELETE FROM reaction_step_fts WHERE reaction_step_id = ?", (step_id,))
             conn.execute("DELETE FROM reaction_step WHERE source_document_id = ?", (document_id,))
             conn.execute("DELETE FROM rdf_reaction_record WHERE source_document_id = ?", (document_id,))
+
+    def replace_parsed_chunks(self, document_id: str, chunks: Iterable[Any]) -> int:
+        now = utc_now()
+        inserted = 0
+        with self.connect() as conn:
+            conn.execute("DELETE FROM parsed_chunk WHERE source_document_id = ?", (document_id,))
+            for index, chunk in enumerate(chunks):
+                text = str(getattr(chunk, "text", "") or "")
+                if not text.strip():
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO parsed_chunk
+                    (id, source_document_id, chunk_index, page_number, text, parser_name, parser_version, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_id("chunk"),
+                        document_id,
+                        index,
+                        getattr(chunk, "page_number", None),
+                        text,
+                        str(getattr(chunk, "parser_name", "parser") or "parser"),
+                        str(getattr(chunk, "parser_version", "unknown") or "unknown"),
+                        now,
+                    ),
+                )
+                inserted += 1
+        return inserted
+
+    def list_parsed_chunks(self, document_id: str, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        with self.connect() as conn:
+            total = int(conn.execute("SELECT COUNT(*) AS total FROM parsed_chunk WHERE source_document_id = ?", (document_id,)).fetchone()["total"])
+            rows = conn.execute(
+                """
+                SELECT * FROM parsed_chunk
+                WHERE source_document_id = ?
+                ORDER BY chunk_index ASC
+                LIMIT ? OFFSET ?
+                """,
+                (document_id, limit, offset),
+            ).fetchall()
+        return {"total": total, "limit": limit, "offset": offset, "chunks": [parsed_chunk_row_to_dict(row) for row in rows]}
 
     def upsert_rdf_reaction_records(self, document_id: str, records: list[dict[str, Any]]) -> dict[str, int]:
         now = utc_now()
@@ -710,6 +824,21 @@ class RouteStorage:
                 (*params, limit, offset),
             ).fetchall()
         return [self._rdf_structure_row_to_dict(row) for row in rows]
+
+
+    def get_rdf_structure(self, structure_id: str, *, include_deleted: bool = False) -> dict[str, Any] | None:
+        deleted_clause = "" if include_deleted else " AND s.deleted_at IS NULL AND r.deleted_at IS NULL"
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT s.*, r.record_index, r.scheme_id, r.step_id, r.cas_reaction_number, r.yield_text
+                FROM rdf_structure s
+                JOIN rdf_reaction_record r ON r.id = s.rdf_reaction_id
+                WHERE s.id = ?{deleted_clause}
+                """,
+                (structure_id,),
+            ).fetchone()
+        return self._rdf_structure_row_to_dict(row) if row else None
 
     def list_rdf_structures_for_search(self, *, limit: int = 10000) -> list[dict[str, Any]]:
         return self.list_rdf_structures(limit=limit)
@@ -1500,6 +1629,20 @@ class RouteStorage:
             updated_at=row["updated_at"],
         )
 
+    def _document_summary_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = self._document_from_row(row).to_dict()
+        data.update(
+            {
+                "file_name": Path(row["file_path"]).name,
+                "parsed_chunk_count": int(row["parsed_chunk_count"] or 0),
+                "reaction_step_count": int(row["reaction_step_count"] or 0),
+                "last_job_status": row["last_job_status"],
+                "last_job_error": row["last_job_error"],
+                "last_job_finished_at": row["last_job_finished_at"],
+            }
+        )
+        return data
+
     def _job_from_row(self, row: sqlite3.Row) -> ParseJob:
         return ParseJob(
             id=row["id"],
@@ -1596,6 +1739,19 @@ def document_role(file_type: str) -> str:
         "txt": "text",
     }
     return mapping.get(file_type.lower(), "unknown")
+
+
+def parsed_chunk_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "source_document_id": row["source_document_id"],
+        "chunk_index": row["chunk_index"],
+        "page_number": row["page_number"],
+        "text": row["text"],
+        "parser_name": row["parser_name"],
+        "parser_version": row["parser_version"],
+        "created_at": row["created_at"],
+    }
 
 
 def batch_match_score(document: SourceDocument, row: sqlite3.Row) -> tuple[float, dict[str, Any]]:

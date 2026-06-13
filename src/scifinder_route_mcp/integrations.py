@@ -120,8 +120,8 @@ def test_http_endpoint(endpoint: str | None, *, model: str | None = None, provid
         return EndpointResult(configured=False, status="unknown", detail="Endpoint is not configured")
     if kind == "ocr" and provider == "paddleocr_vl":
         return EndpointResult(configured=True, status="ok", detail="PaddleOCR-VL job endpoint configured. This provider has no lightweight health endpoint; submit a document to verify job execution.")
-    if kind == "document_parser" and _looks_like_paddleocr_job_endpoint(endpoint, model):
-        return EndpointResult(configured=True, status="ok", detail="PaddleOCR-VL job endpoint configured. It does not expose /health or /models; document parsing will still fall back locally if external parsing fails.")
+    if kind in {"document_parser", "structure_recognition"} and _looks_like_paddleocr_job_endpoint(endpoint, model):
+        return EndpointResult(configured=True, status="ok", detail="PaddleOCR-VL job endpoint configured. It does not expose /health or /models; runtime calls will submit OCR jobs and use configured fallbacks where available.")
     if kind == "llm":
         try:
             return _test_llm_endpoint(endpoint, model=model, provider=provider, api_key=api_key)

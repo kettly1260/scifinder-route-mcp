@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .chem import fingerprint_from_query, install_rdkit, rdkit_info, substructure_match, tanimoto
+from .chem import fingerprint_from_query, install_rdkit, rdkit_info, render_structure_svg, substructure_match, tanimoto
 from .config import AppConfig, DEFAULT_ZOTERO_MCP_ENDPOINTS
 from .extractor import extract_reaction_steps
 from .integrations import EmbeddingAdapter, ExternalParserAdapter, LLMStructuringAdapter, OCRAdapter, StructureRecognitionAdapter, list_http_models, test_http_endpoint
@@ -189,6 +189,23 @@ class RouteService:
 
     def list_parse_jobs(self, status: str = "", limit: int = 100) -> list[dict[str, Any]]:
         return [job.to_dict() for job in self.storage.list_jobs(status=status, limit=limit)]
+
+    def list_documents(self, query: str = "", file_type: str = "", limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        return self.storage.list_documents(query=query, file_type=file_type, limit=limit, offset=offset)
+
+    def get_document_parse_result(self, document_id: str, *, chunk_limit: int = 50, chunk_offset: int = 0, reaction_limit: int = 100) -> dict[str, Any]:
+        document = self.storage.get_document(document_id)
+        if not document:
+            raise KeyError(f"Document not found: {document_id}")
+        chunks = self.storage.list_parsed_chunks(document_id, limit=chunk_limit, offset=chunk_offset)
+        reactions = [step.to_dict() for step in self.storage.list_reaction_steps_for_document(document_id, limit=reaction_limit)]
+        latest_job = self.storage.get_latest_job_for_document(document_id)
+        return {"document": document.to_dict(), "latest_job": latest_job.to_dict() if latest_job else None, "chunks": chunks, "reaction_steps": reactions}
+
+    def list_document_parsed_chunks(self, document_id: str, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        if not self.storage.get_document(document_id):
+            raise KeyError(f"Document not found: {document_id}")
+        return self.storage.list_parsed_chunks(document_id, limit=limit, offset=offset)
 
     def retry_parse_job(self, job_id: str) -> dict[str, Any]:
         job = self.storage.retry_job(job_id)
@@ -529,6 +546,12 @@ class RouteService:
             raise KeyError(f"RDF reaction not found: {reaction_id}")
         return self._with_rdf_readable_view(reaction)
 
+    def render_rdf_structure_svg(self, structure_id: str) -> str:
+        structure = self.storage.get_rdf_structure(structure_id)
+        if not structure:
+            raise KeyError(f"RDF structure not found: {structure_id}")
+        return render_structure_svg(structure.get("molfile"), structure.get("smiles"))
+
     def list_rdf_structures(self, document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
         return [self._with_rdf_provenance_warning(item) for item in self.storage.list_rdf_structures(document_id=document_id, query=query, limit=limit, offset=offset, include_deleted=include_deleted)]
 
@@ -597,6 +620,7 @@ class RouteService:
             "rdkit_error": structure.get("rdkit_error"),
             "warnings": structure.get("warnings") or [],
             "has_molfile": bool(structure.get("molfile")),
+            "image_svg_url": f"/api/rdf/structures/{structure.get('id')}/image.svg" if structure.get("molfile") or structure.get("smiles") else None,
             "display": self._rdf_structure_display(structure),
         }
 
@@ -1103,6 +1127,7 @@ class RouteService:
                 self.storage.update_job(job_id, status="running", stage="ocr")
                 parsed_document = self._augment_with_ocr(document.file_path, parsed_document)
             self.storage.update_document_metadata(document_id, file_type=parsed_document.file_type or detect_file_type(document.file_path), title=parsed_document.title, doi=parsed_document.doi)
+            self.storage.replace_parsed_chunks(document_id, parsed_document.chunks)
             if reparse:
                 self.storage.clear_document_reactions(document_id)
             if parsed_document.file_type == "rdf":

@@ -85,6 +85,28 @@ def substructure_match(query: str, molfile: str, query_type: str = "smarts") -> 
     return bool(target.HasSubstructMatch(pattern)), None
 
 
+def render_structure_svg(molfile: str | None = None, smiles: str | None = None, *, width: int = 260, height: int = 180) -> str:
+    try:
+        from rdkit import Chem  # type: ignore[import-not-found]
+        from rdkit.Chem import AllChem, Draw  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise RuntimeError(f"RDKit is not installed: {exc}") from exc
+
+    mol = None
+    if molfile:
+        mol = Chem.MolFromMolBlock(rdkit_molblock(molfile), sanitize=True, removeHs=False)
+    if mol is None and smiles:
+        mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError("RDKit could not parse structure from molfile or SMILES")
+    if not mol.GetNumConformers():
+        AllChem.Compute2DCoords(mol)
+    drawer = Draw.MolDraw2DSVG(width, height)
+    drawer.DrawMolecule(mol)
+    drawer.FinishDrawing()
+    return drawer.GetDrawingText()
+
+
 def rdkit_molblock(molfile: str) -> str:
     lines = molfile.splitlines()
     counts_index = next((index for index, line in enumerate(lines) if "V2000" in line or "V3000" in line), None)

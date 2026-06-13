@@ -3,7 +3,7 @@ import { clearToken, getJson, getStoredToken, hasTrustedToken, loadState, postJs
 import { Button, Card, DataTable, Input, JsonBlock, StatCard } from './components';
 import type { AdminState, ConfigField, JsonObject } from './types';
 
-type PageId = 'dashboard' | 'ingest' | 'config' | 'rdf' | 'structures' | 'literature' | 'ops';
+type PageId = 'dashboard' | 'ingest' | 'documents' | 'config' | 'rdf' | 'structures' | 'literature' | 'ops';
 type ThemeId = 'aurora' | 'graphite' | 'emerald' | 'rose' | 'light';
 type UploadResultRow = {
   file_name: string;
@@ -56,6 +56,7 @@ function initialTheme(): ThemeId {
 const pages: Array<{ id: PageId; label: string; description: string }> = [
   { id: 'dashboard', label: 'Dashboard', description: '运行状态与关键指标' },
   { id: 'ingest', label: '导入与任务', description: '上传、扫描、解析队列' },
+  { id: 'documents', label: 'Documents', description: '查看 PDF/RTF/HTML 解析结果' },
   { id: 'config', label: '配置', description: '集成、运行时、热配置' },
   { id: 'rdf', label: 'RDF 反应', description: 'CAS 反应记录与 molfile' },
   { id: 'structures', label: '结构检索', description: '相似度、子结构、文本过滤' },
@@ -150,6 +151,7 @@ export function App() {
   const [authRequired, setAuthRequired] = useState(true);
   const [theme, setTheme] = useState<ThemeId>(initialTheme);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [selectedDocumentId, setSelectedDocumentId] = useState('');
 
   async function refresh(nextToken = token, silent = false) {
     try {
@@ -268,7 +270,8 @@ export function App() {
         </header>
         {(message || error) && <div className={error ? 'notice error' : 'notice'}>{error || message}</div>}
         {page === 'dashboard' && <Dashboard state={state} />}
-        {page === 'ingest' && <IngestPage token={token} state={state} guarded={guarded} refresh={refresh} />}
+        {page === 'ingest' && <IngestPage token={token} state={state} guarded={guarded} refresh={refresh} openDocument={(documentId) => { setSelectedDocumentId(documentId); setPage('documents'); }} />}
+        {page === 'documents' && <DocumentsPage token={token} guarded={guarded} selectedDocumentId={selectedDocumentId} setSelectedDocumentId={setSelectedDocumentId} />}
         {page === 'config' && <ConfigPage token={token} state={state} guarded={guarded} refresh={refresh} />}
         {page === 'rdf' && <RdfPage token={token} guarded={guarded} />}
         {page === 'structures' && <StructurePage token={token} state={state} guarded={guarded} />}
@@ -337,7 +340,7 @@ function Dashboard({ state }: { state: AdminState }) {
   );
 }
 
-function IngestPage({ token, state, guarded, refresh }: PageProps & { refresh: () => Promise<AdminState> }) {
+function IngestPage({ token, state, guarded, refresh, openDocument }: PageProps & { refresh: () => Promise<AdminState>; openDocument: (documentId: string) => void }) {
   const [files, setFiles] = useState<File[]>([]);
   const [uploadStatus, setUploadStatus] = useState('');
   const [uploadResults, setUploadResults] = useState<UploadResultRow[]>([]);
@@ -442,7 +445,7 @@ function IngestPage({ token, state, guarded, refresh }: PageProps & { refresh: (
               { key: 'file_name', label: '文件' },
               { key: 'status', label: '状态', render: (row) => <StatusBadge tone={row.tone}>{row.status}</StatusBadge> },
               { key: 'detail', label: '详情' },
-              { key: 'document_id', label: '文档 ID' },
+              { key: 'document_id', label: '文档 ID', render: (row) => row.document_id ? <Button size="sm" variant="ghost" onClick={() => openDocument(String(row.document_id))}>查看解析</Button> : '' },
               { key: 'job_id', label: '任务 ID' },
               { key: 'uploaded_path', label: '写入路径' }
             ]}
@@ -458,6 +461,125 @@ function IngestPage({ token, state, guarded, refresh }: PageProps & { refresh: (
 
 function StatusBadge({ tone, children }: { tone: 'success' | 'deduped' | 'failed'; children: string }) {
   return <span className={`status-badge ${tone}`}>{children}</span>;
+}
+
+function DocumentsPage({ token, guarded, selectedDocumentId, setSelectedDocumentId }: Pick<PageProps, 'token' | 'guarded'> & { selectedDocumentId: string; setSelectedDocumentId: (value: string) => void }) {
+  const [query, setQuery] = useState('');
+  const [fileType, setFileType] = useState('');
+  const [documents, setDocuments] = useState<JsonObject[]>([]);
+  const [detail, setDetail] = useState<JsonObject | null>(null);
+  const [chunks, setChunks] = useState<JsonObject[]>([]);
+  const [chunkTotal, setChunkTotal] = useState(0);
+  const [chunkOffset, setChunkOffset] = useState(0);
+  const chunkLimit = 50;
+
+  async function loadDocuments() {
+    const params = new URLSearchParams({ limit: '100' });
+    if (query.trim()) params.set('q', query.trim());
+    if (fileType) params.set('file_type', fileType);
+    const rows = await getJson<JsonObject[]>(`/api/documents?${params.toString()}`, token);
+    setDocuments(rows);
+  }
+
+  async function openDocument(documentId: string) {
+    const data = await getJson<JsonObject>(`/api/documents/${encodeURIComponent(documentId)}?chunk_limit=${chunkLimit}&chunk_offset=0&reaction_limit=100`, token);
+    const chunkPage = asObject(data.chunks);
+    setSelectedDocumentId(documentId);
+    setDetail(data);
+    setChunks(asObjectArray(chunkPage.chunks));
+    setChunkTotal(Number(chunkPage.total || 0));
+    setChunkOffset(Number(chunkPage.limit || chunkLimit));
+  }
+
+  async function loadMoreChunks() {
+    if (!selectedDocumentId) return;
+    const data = await getJson<JsonObject>(`/api/documents/${encodeURIComponent(selectedDocumentId)}/chunks?limit=${chunkLimit}&offset=${chunkOffset}`, token);
+    const nextChunks = asObjectArray(data.chunks);
+    setChunks((current) => [...current, ...nextChunks]);
+    setChunkTotal(Number(data.total || 0));
+    setChunkOffset(chunkOffset + Number(data.limit || chunkLimit));
+  }
+
+  useEffect(() => {
+    loadDocuments().catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (selectedDocumentId) openDocument(selectedDocumentId).catch(() => undefined);
+  }, [selectedDocumentId]);
+
+  const document = asObject(detail?.document);
+  const latestJob = asObject(detail?.latest_job);
+  const reactions = asObjectArray(detail?.reaction_steps);
+  const hasMoreChunks = chunks.length < chunkTotal;
+  const status = String(document.ingest_status || '');
+
+  return (
+    <div className="page-stack">
+      <Card eyebrow="Documents" title="上传/注册文档" extra={<Button onClick={() => guarded(loadDocuments, '文档列表已加载')}>加载文档</Button>}>
+        <p className="muted">查看非 RDF 文件的完整解析文本块、页码/解析器来源，以及同一文档抽取出的反应步骤。</p>
+        <div className="form-grid compact-form">
+          <Input label="搜索" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="标题、文件名、DOI 或文档 ID" />
+          <label className="form-group">文件类型<select value={fileType} onChange={(event) => setFileType(event.target.value)}><option value="">全部</option><option value="pdf">PDF</option><option value="rtf">RTF</option><option value="html">HTML</option><option value="mhtml">MHTML</option><option value="md">Markdown</option><option value="txt">TXT</option><option value="rdf">RDF</option></select></label>
+        </div>
+        <DataTable rows={documents} columns={[
+          { key: 'file_name', label: '文件' },
+          { key: 'file_type', label: '类型' },
+          { key: 'ingest_status', label: '状态' },
+          { key: 'title', label: '标题' },
+          { key: 'parsed_chunk_count', label: '文本块' },
+          { key: 'reaction_step_count', label: '反应' },
+          { key: 'last_job_error', label: '最近错误' },
+          { key: 'open', label: '打开', render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => openDocument(String(row.id)), '解析结果已加载')}>查看解析</Button> }
+        ]} empty="暂无文档；请先上传或扫描收件箱。" />
+      </Card>
+
+      <Card eyebrow="Parse Result" title={document.id ? `解析结果：${shortName(document.file_path)}` : '解析结果'}>
+        {!document.id && <JsonBlock value={{ hint: '选择一个文档以查看完整解析文本和抽取反应。' }} maxHeight={240} />}
+        {Boolean(document.id) && (
+          <div className="page-stack">
+            <div className="summary-strip">
+              <span>状态: {status}</span>
+              <span>类型: {String(document.file_type || '')}</span>
+              <span>文本块: {chunks.length}/{chunkTotal}</span>
+              <span>反应步骤: {reactions.length}</span>
+              {Boolean(document.doi) && <span>DOI: {String(document.doi)}</span>}
+            </div>
+            {status === 'parsed_no_reactions' && <div className="notice warn">该文档已解析，但未抽取到反应步骤。请检查解析文本是否包含实验步骤，或调整抽取规则/LLM 配置后重解析。</div>}
+            {status === 'failed' && <div className="notice error">该文档解析失败。若已有 partial chunks 会在下方展示；请查看任务错误并重试。</div>}
+            {Boolean(latestJob.error) && <pre>{String(latestJob.error)}</pre>}
+            <div className="grid two">
+              <section className="chunk-panel">
+                <div className="section-heading"><p className="eyebrow">Parsed Chunks</p><h2>完整解析文本</h2></div>
+                {chunks.length === 0 && <div className="empty-state"><strong>暂无解析文本</strong><span>旧文档可能是在该功能上线前解析；重解析后会保存文本块。</span></div>}
+                <div className="chunk-list">
+                  {chunks.map((chunk) => (
+                    <article className="parsed-chunk" key={String(chunk.id || chunk.chunk_index)}>
+                      <div className="chunk-meta"><span>#{String(chunk.chunk_index)}</span><span>Page {String(chunk.page_number ?? 'n/a')}</span><span>{String(chunk.parser_name || '')} {String(chunk.parser_version || '')}</span></div>
+                      <pre>{String(chunk.text || '')}</pre>
+                    </article>
+                  ))}
+                </div>
+                {hasMoreChunks && <Button variant="secondary" onClick={() => guarded(loadMoreChunks, '已加载更多文本块')}>加载更多文本块</Button>}
+              </section>
+              <section>
+                <div className="section-heading"><p className="eyebrow">Extraction</p><h2>抽取反应步骤</h2></div>
+                <DataTable rows={reactions} columns={[
+                  { key: 'step_index', label: '步骤' },
+                  { key: 'reaction_name', label: '名称' },
+                  { key: 'reagent_text', label: '试剂' },
+                  { key: 'solvent_text', label: '溶剂' },
+                  { key: 'yield_text', label: '收率' },
+                  { key: 'confidence', label: '置信度' },
+                  { key: 'original_text', label: '原文', render: (row) => <pre>{String(row.original_text || '')}</pre> }
+                ]} empty="该文档当前没有抽取出的反应步骤。" />
+              </section>
+            </div>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
 }
 
 function ConfigPage({ token, state, guarded, refresh }: PageProps & { refresh: () => Promise<AdminState> }) {

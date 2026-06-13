@@ -106,6 +106,27 @@ def test_upload_and_reparse(tmp_path: Path) -> None:
     assert len(hits) >= 1
 
 
+def test_non_rdf_parse_result_is_visible_for_webui(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.html"
+
+    uploaded = service.upload_document(str(fixture))
+    document_id = uploaded["document"]["id"]
+
+    documents = service.list_documents(query="sample_scifinder_export", limit=10)
+    assert any(item["id"] == document_id and item["parsed_chunk_count"] > 0 for item in documents)
+
+    result = service.get_document_parse_result(document_id, chunk_limit=2)
+    assert result["document"]["id"] == document_id
+    assert result["chunks"]["total"] >= 1
+    assert "triethylamine" in result["chunks"]["chunks"][0]["text"]
+    assert result["reaction_steps"]
+
+    chunk_page = service.list_document_parsed_chunks(document_id, limit=1, offset=0)
+    assert chunk_page["total"] >= 1
+    assert chunk_page["chunks"][0]["parser_name"] == "html"
+
+
 def test_mcp_content_upload_validates_and_parses_rtf(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rtf"
@@ -275,7 +296,21 @@ def test_rdf_reaction_detail_includes_chinese_readable_structures(tmp_path: Path
     reactant = next(item for item in detail["readable"]["structures"] if item["role"] == "reactant")
     assert reactant["role_label_zh"] == "反应物"
     assert reactant["formula"] == "C17H10O2"
+    assert reactant["image_svg_url"] == f"/api/rdf/structures/{reactant['id']}/image.svg"
     assert detail["readable"]["fields_explained"]["RXN:VAR(1):CAS_Reaction_Number"] == "CAS 反应号"
+
+
+def test_rdf_structure_can_render_svg_with_rdkit(tmp_path: Path) -> None:
+    pytest.importorskip("rdkit")
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
+
+    result = service.register_document(str(fixture))
+    structure = next(item for item in service.list_rdf_structures(document_id=result["document"]["id"]) if item["molfile"])
+    svg = service.render_rdf_structure_svg(structure["id"])
+
+    assert "<svg" in svg
+    assert "</svg>" in svg
 
 
 def test_scan_inbox_deduplicates_registered_files(tmp_path: Path) -> None:
@@ -697,6 +732,19 @@ def test_paddleocr_endpoint_test_does_not_probe_health() -> None:
     assert "no lightweight health endpoint" in (result.detail or "")
 
 
+def test_structure_recognition_paddleocr_endpoint_test_does_not_probe_health() -> None:
+    from scifinder_route_mcp.integrations import test_http_endpoint
+
+    result = test_http_endpoint(
+        "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs",
+        kind="structure_recognition",
+        model="PaddleOCR-VL-1.6",
+    )
+
+    assert result.status == "ok"
+    assert "does not expose /health" in (result.detail or "")
+
+
 def test_embedding_endpoint_test_posts_to_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
     from scifinder_route_mcp.integrations import test_http_endpoint
 
@@ -940,6 +988,18 @@ def admin_request(port: int, method: str, path: str, payload: dict[str, object] 
     return response.status, text
 
 
+def admin_request_with_headers(port: int, method: str, path: str, payload: dict[str, object] | None = None) -> tuple[int, dict[str, str], str]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"} if payload is not None else {}
+    conn.request(method, path, body=body, headers=headers)
+    response = conn.getresponse()
+    response_headers = {key.lower(): value for key, value in response.getheaders()}
+    text = response.read().decode("utf-8")
+    conn.close()
+    return response.status, response_headers, text
+
+
 def admin_request_with_token(port: int, method: str, path: str, token: str, payload: dict[str, object] | None = None) -> tuple[int, str]:
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -978,6 +1038,26 @@ def test_admin_server_serves_react_webui_and_management_apis(tmp_path: Path) -> 
         status, body = admin_request(port, "GET", "/api/literature/links?status=candidate&limit=5")
         assert status == 200
         assert json.loads(body) == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_admin_rdf_structure_svg_endpoint(tmp_path: Path) -> None:
+    pytest.importorskip("rdkit")
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
+    result = service.register_document(str(fixture))
+    structure = next(item for item in service.list_rdf_structures(document_id=result["document"]["id"]) if item["molfile"])
+    server = start_admin_server(service, AdminRunConfig(host="127.0.0.1", port=0))
+    assert server is not None
+    port = server.server_address[1]
+    try:
+        status, headers, body = admin_request_with_headers(port, "GET", f"/api/rdf/structures/{structure['id']}/image.svg")
+        assert status == 200
+        assert headers["content-type"] == "image/svg+xml; charset=utf-8"
+        assert "<svg" in body
+        assert "</svg>" in body
     finally:
         server.shutdown()
         server.server_close()
