@@ -81,9 +81,10 @@ const configFields: ConfigField[] = [
   { section: 'integrations', name: 'document_parser_endpoint', label: '文档解析端点' },
   { section: 'integrations', name: 'document_parser_model', label: '文档解析模型', placeholder: 'pymupdf / mineru' },
   { section: 'integrations', name: 'document_parser_fallback', label: '解析失败回退', type: 'bool' },
+  { section: 'integrations', name: 'structure_recognition_provider', label: '结构识别提供商', type: 'select', options: ['generic', 'openai_compatible', 'gemini', 'claude'] },
   { section: 'integrations', name: 'structure_recognition_api_key', label: '结构识别 API Token', type: 'password', secret: true, placeholder: '留空则不变' },
   { section: 'integrations', name: 'structure_recognition_endpoint', label: '结构识别端点' },
-  { section: 'integrations', name: 'structure_recognition_model', label: '结构识别模型', placeholder: 'decimer / molscribe / osra' },
+  { section: 'integrations', name: 'structure_recognition_model', label: '结构识别模型', placeholder: 'decimer / molscribe / osra / gpt-4o' },
   { section: 'integrations', name: 'postgres_url', label: 'PostgreSQL URL', type: 'password', secret: true, placeholder: '留空则不变' },
   { section: 'server', name: 'max_workers', label: '最大工作线程', type: 'number', min: '1' },
   { section: 'server', name: 'async_jobs', label: '异步任务', type: 'bool' },
@@ -109,7 +110,7 @@ const integrationGroups = [
   { id: 'embedding', eyebrow: 'Embedding', title: '嵌入模型', description: '用于语义召回和向量索引重建，通常需要 OpenAI 兼容 /embeddings 与 /models。', fields: ['integrations.embedding_endpoint', 'integrations.embedding_model', 'integrations.embedding_api_key'], modelKey: 'integrations.embedding_model' },
   { id: 'ocr', eyebrow: 'OCR', title: 'OCR 识别', description: '用于扫描件和页面视觉证据抽取；不同提供商的端点形态可能不同。', fields: ['integrations.ocr_provider', 'integrations.ocr_endpoint', 'integrations.ocr_model', 'integrations.ocr_api_key'], modelKey: 'integrations.ocr_model' },
   { id: 'document_parser', eyebrow: 'Parser', title: '文档解析', description: '用于 PDF/RTF/HTML 正文解析和失败回退策略。', fields: ['integrations.document_parser_endpoint', 'integrations.document_parser_model', 'integrations.document_parser_api_key', 'integrations.document_parser_fallback'], modelKey: 'integrations.document_parser_model' },
-  { id: 'structure_recognition', eyebrow: 'Structure', title: '结构识别', description: '用于图片结构识别和结构敏感证据补充。', fields: ['integrations.structure_recognition_endpoint', 'integrations.structure_recognition_model', 'integrations.structure_recognition_api_key'], modelKey: 'integrations.structure_recognition_model' }
+  { id: 'structure_recognition', eyebrow: 'Structure', title: '结构识别', description: '用于图片结构识别和结构敏感证据补充。', fields: ['integrations.structure_recognition_provider', 'integrations.structure_recognition_endpoint', 'integrations.structure_recognition_model', 'integrations.structure_recognition_api_key'], modelKey: 'integrations.structure_recognition_model' }
 ] as const;
 
 const runtimeGroups = [
@@ -849,7 +850,7 @@ function rdfRoleOrder(role: unknown): number {
   return index === -1 ? order.length : index;
 }
 
-function RdfDetailView({ detail }: { detail: JsonObject | null }) {
+function RdfDetailView({ detail, token }: { detail: JsonObject | null, token: string }) {
   if (!detail) {
     return <JsonBlock value={{ hint: '选择一条反应以查看中文解读、结构名称、CAS RN 与化学式。' }} maxHeight={560} />;
   }
@@ -868,8 +869,9 @@ function RdfDetailView({ detail }: { detail: JsonObject | null }) {
         { key: 'formula', label: '化学式' },
         { key: 'cas_rn', label: 'CAS RN' },
         { key: 'smiles', label: 'SMILES' },
-        { key: 'molfile_version', label: '结构' },
-        { key: 'rdkit_status', label: 'RDKit' }
+        { key: 'molfile_version', label: '结构信息' },
+        { key: 'rdkit_status', label: 'RDKit' },
+        { key: 'image', label: '结构图', render: (row) => (row.rdkit_status === 'available' || row.smiles) ? <img src={`/api/rdf/structures/${row.id}/image.svg?token=${encodeURIComponent(token)}`} alt="结构图" style={{ maxWidth: '150px', maxHeight: '100px', backgroundColor: 'white' }} /> : '暂无' }
       ]} empty="该 RDF 反应没有可展示结构" />
       {reference && <p><strong>参考文献：</strong>{reference}</p>}
       <details>
@@ -905,7 +907,7 @@ function RdfPage({ token, guarded }: Pick<PageProps, 'token' | 'guarded'>) {
         <DataTable rows={rows} columns={[{ key: 'source_file_path', label: '来源文件', render: (row) => shortName(row.source_file_path || row.source_title || row.source_document_id) }, { key: 'record_index', label: '记录' }, { key: 'scheme_id', label: '方案' }, { key: 'step_id', label: '步骤' }, { key: 'cas_reaction_number', label: 'CAS 反应号' }, { key: 'yield_text', label: '收率' }, { key: 'structure_count', label: '结构数' }, { key: 'open', label: '打开', render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => open(row.id), '反应详情已加载')}>打开</Button> }]} />
       </Card>
       <Card eyebrow="Detail" title="反应详情与结构">
-        <RdfDetailView detail={detail} />
+        <RdfDetailView detail={detail} token={token} />
       </Card>
     </div>
   );
@@ -946,7 +948,15 @@ function StructurePage({ token, state, guarded }: PageProps) {
         </Card>
       </div>
       <Card eyebrow="Results" title="结构结果">
-        <DataTable rows={rows} columns={[{ key: 'name', label: '名称' }, { key: 'role', label: '角色' }, { key: 'cas_rn', label: 'CAS' }, { key: 'molfile_version', label: '版本' }, { key: 'similarity', label: '评分' }, { key: 'rdf_reaction_id', label: '反应 ID' }]} />
+        <DataTable rows={rows} columns={[
+          { key: 'name', label: '名称' },
+          { key: 'role', label: '角色' },
+          { key: 'cas_rn', label: 'CAS' },
+          { key: 'molfile_version', label: '版本' },
+          { key: 'similarity', label: '评分' },
+          { key: 'rdf_reaction_id', label: '反应 ID' },
+          { key: 'image', label: '结构图', render: (row) => <img src={`/api/rdf/structures/${row.id}/image.svg?token=${encodeURIComponent(token)}`} alt="结构图" style={{ maxWidth: '150px', maxHeight: '100px', backgroundColor: 'white' }} /> }
+        ]} />
       </Card>
     </div>
   );

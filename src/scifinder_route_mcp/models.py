@@ -3,6 +3,16 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+@dataclass(frozen=True)
+class AiProvider:
+    id: str
+    name: str
+    format: str
+    endpoint: str | None
+    api_key: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 @dataclass(frozen=True)
 class SourceDocument:

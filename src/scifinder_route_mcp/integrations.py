@@ -135,6 +135,13 @@ def test_http_endpoint(endpoint: str | None, *, model: str | None = None, provid
             return EndpointResult(configured=True, status="ok", detail=f"Embedding endpoint accepted a test request at {_display_url(embeddings_url)}", payload=payload)
         except Exception as exc:
             return EndpointResult(configured=True, status="error", detail=_http_error_detail(exc, url=embeddings_url, model=model))
+    if kind == "reranker":
+        rerank_url = endpoint.rstrip("/") + "/rerank"
+        try:
+            payload = post_json(rerank_url, {"model": model or "default", "query": "ping", "texts": ["ping"]}, timeout=30, headers=auth_headers("openai_compatible", api_key))
+            return EndpointResult(configured=True, status="ok", detail=f"Reranker endpoint accepted a test request at {_display_url(rerank_url)}", payload=payload)
+        except Exception as exc:
+            return EndpointResult(configured=True, status="error", detail=_http_error_detail(exc, url=rerank_url, model=model))
     health_url = endpoint.rstrip("/") + "/health"
     try:
         payload = get_json(health_url, headers=auth_headers(provider, api_key))
@@ -379,10 +386,11 @@ class ExternalParserAdapter:
 
 
 class StructureRecognitionAdapter:
-    def __init__(self, endpoint: str | None, model: str | None, api_key: str | None = None):
+    def __init__(self, endpoint: str | None, model: str | None, api_key: str | None = None, provider: str = "generic"):
         self.endpoint = endpoint
         self.model = model or "default"
         self.api_key = api_key
+        self.provider = provider
 
     @property
     def configured(self) -> bool:
@@ -391,9 +399,47 @@ class StructureRecognitionAdapter:
     def recognize(self, image_path: str) -> list[dict[str, Any]]:
         if not self.endpoint:
             raise RuntimeError("Structure recognition endpoint is not configured")
+        
+        if self.provider != "generic":
+            return self._recognize_vision_llm(image_path)
+            
         payload = post_json(self.endpoint.rstrip("/") + "/recognize", {"model": self.model, "image_path": image_path}, headers=auth_headers("openai_compatible", self.api_key))
         results = payload.get("structures", [])
         return results if isinstance(results, list) else []
+
+    def _recognize_vision_llm(self, image_path: str) -> list[dict[str, Any]]:
+        import base64
+        with open(image_path, "rb") as f:
+            b64_image = base64.b64encode(f.read()).decode("utf-8")
+        
+        system = "You are a chemical structure extractor. Return ONLY strict JSON in this exact format: {\"structures\": [{\"smiles\": \"...\"}]}. Do not include markdown blocks, text, or explanations. If no structures are found, return {\"structures\": []}."
+        user = "Extract all chemical structures from this image and return them as a list of SMILES."
+        
+        base = self.endpoint.rstrip("/")
+        content: str | None = None
+        if self.provider == "gemini":
+            url = base + f"/models/{self.model}:generateContent" + (("?key=" + self.api_key) if self.api_key else "")
+            payload = post_json(url, {"systemInstruction": {"parts": [{"text": system}]}, "contents": [{"role": "user", "parts": [{"text": user}, {"inlineData": {"mimeType": "image/jpeg", "data": b64_image}}]}]}, headers={})
+            candidates = payload.get("candidates") or []
+            parts = candidates[0].get("content", {}).get("parts", []) if candidates and isinstance(candidates[0], dict) else []
+            content = "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict)) or None
+        elif self.provider == "claude":
+            payload = post_json(base + "/messages", {"model": self.model, "system": system, "max_tokens": 2048, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_image}}, {"type": "text", "text": user}]}]}, headers=auth_headers(self.provider, self.api_key))
+            parts = payload.get("content") or []
+            content = "".join(str(item.get("text") or "") for item in parts if isinstance(item, dict)) or None
+        else:
+            payload = post_json(base + "/chat/completions", {"model": self.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": [{"type": "text", "text": user}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}]}]}, headers=auth_headers(self.provider, self.api_key))
+            content = payload.get("choices", [{}])[0].get("message", {}).get("content")
+            
+        if not content:
+            return []
+            
+        try:
+            parsed = parse_strict_json(content)
+            results = parsed.get("structures", [])
+            return results if isinstance(results, list) else []
+        except Exception:
+            return []
 
 
 def parse_strict_json(content: str) -> dict[str, Any]:
@@ -410,3 +456,36 @@ def parse_strict_json(content: str) -> dict[str, Any]:
 
 def degraded_result(kind: str, exc: Exception) -> dict[str, str]:
     return {"kind": kind, "status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+
+
+class RerankerAdapter:
+    def __init__(self, endpoint: str | None, model: str | None, api_key: str | None = None):
+        self.endpoint = endpoint
+        self.model = model or "default"
+        self.api_key = api_key
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.endpoint)
+
+    def rerank(self, query: str, texts: list[str]) -> list[float]:
+        if not self.endpoint:
+            raise RuntimeError("Reranker endpoint is not configured")
+        
+        payload = post_json(
+            self.endpoint.rstrip("/") + "/rerank",
+            {"model": self.model, "query": query, "texts": texts},
+            headers=auth_headers("openai_compatible", self.api_key)
+        )
+        
+        results = payload.get("results", [])
+        scores = [0.0] * len(texts)
+        for r in results:
+            idx = r.get("index")
+            if isinstance(idx, int) and 0 <= idx < len(texts):
+                score = r.get("relevance_score")
+                if score is None:
+                    score = r.get("score", 0.0)
+                scores[idx] = float(score)
+        
+        return scores

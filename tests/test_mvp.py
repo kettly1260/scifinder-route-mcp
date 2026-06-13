@@ -612,10 +612,15 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
             "queue": {"backend": "redis", "redis_url": "redis://queue:6379/0"},
             "ingest": {"scan_extensions": [".html"], "upload_extensions": [".html", ".rdf"], "upload_max_bytes": 4096},
             "integrations": {
-                "embedding_endpoint": "http://embedding:8000/v1",
+                "ai_providers": [
+                    {"id": "test-embed", "endpoint": "http://embedding:8000/v1"},
+                    {"id": "test-ocr", "endpoint": "http://ocr-worker:9000"},
+                    {"id": "test-parser", "endpoint": "http://parser:9100"}
+                ],
+                "embedding_provider_id": "test-embed",
                 "embedding_model": "bge-m3",
-                "ocr_endpoint": "http://ocr-worker:9000",
-                "document_parser_endpoint": "http://parser:9100",
+                "ocr_provider_id": "test-ocr",
+                "document_parser_provider_id": "test-parser",
                 "document_parser_fallback": True,
                 "structure_recognition_model": "decimer",
             },
@@ -632,8 +637,8 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
     assert updated["ingest"]["upload_extensions"] == [".html", ".rdf"]
     assert updated["ingest"]["upload_max_bytes"] == 4096
     assert updated["integrations"]["embedding_model"] == "bge-m3"
-    assert updated["integrations"]["ocr_endpoint"] == "http://ocr-worker:9000"
-    assert updated["integrations"]["document_parser_endpoint"] == "http://parser:9100"
+    assert updated["integrations"]["ai_providers"][1]["endpoint"] == "http://ocr-worker:9000"
+    assert updated["integrations"]["ai_providers"][2]["endpoint"] == "http://parser:9100"
     assert updated["integrations"]["document_parser_fallback"] is True
     assert updated["integrations"]["structure_recognition_model"] == "decimer"
     assert updated["extraction"]["llm_schema_version"] == "reaction_step.v2"
@@ -673,7 +678,7 @@ def test_integration_model_listing_uses_unsaved_form_overrides(tmp_path: Path, m
 
     result = service.list_integration_models(
         "llm",
-        overrides={"integrations": {"llm_endpoint": "https://llm.example/v1", "llm_provider": "gemini", "llm_api_key": "new-secret"}},
+        overrides={"integrations": {"ai_providers": [{"id": "new", "endpoint": "https://llm.example/v1", "format": "gemini", "api_key": "new-secret"}], "extraction_provider_id": "new"}},
     )
 
     assert seen == {"endpoint": "https://llm.example/v1", "provider": "gemini", "api_key": "new-secret", "kind": "llm", "model": None}
@@ -682,7 +687,8 @@ def test_integration_model_listing_uses_unsaved_form_overrides(tmp_path: Path, m
 
 def test_integration_endpoint_uses_saved_ocr_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
-    service.config = service.config.__class__(**{**service.config.__dict__, "ocr_provider": "paddleocr_vl", "ocr_endpoint": "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs", "ocr_model": "PaddleOCR-VL-1.6", "ocr_api_key": "secret"})
+    from scifinder_route_mcp.models import AiProvider
+    service.config = service.config.__class__(**{**service.config.__dict__, "ai_providers": [AiProvider(id="paddle", name="Paddle", format="paddleocr_vl", endpoint="https://paddleocr.aistudio-app.com/api/v2/ocr/jobs", api_key="secret")], "ocr_provider_id": "paddle", "ocr_model": "PaddleOCR-VL-1.6"})
     seen: dict[str, object] = {}
 
     def fake_test_endpoint(endpoint: str | None, *, model: str | None = None, provider: str = "openai_compatible", api_key: str | None = None, kind: str = "generic") -> EndpointResult:
@@ -947,9 +953,14 @@ def test_admin_dashboard_contains_modern_config_controls(tmp_path: Path) -> None
     state = admin_state(service)
 
     assert "<html lang=\"zh-CN\">" in html
-    assert "嵌入端点" in html
-    assert "OCR 端点" in html
-    assert "文档解析端点" in html
+    assert "AI 供应商" in html
+    assert "连接凭证池" in html
+    assert "功能路由" in html
+    assert "嵌入供应商" in html
+    assert "OCR 供应商" in html
+    assert "文档解析供应商" in html
+    assert "重排模型供应商" in html
+    assert "provider-select" in html
     assert "队列后端" in html
     assert "data-type=\"enum\"" in html
     assert "LLM 成本上限 USD" in html

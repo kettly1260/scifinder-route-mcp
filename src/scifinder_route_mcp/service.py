@@ -16,7 +16,7 @@ from typing import Any
 from .chem import fingerprint_from_query, install_rdkit, rdkit_info, render_structure_svg, substructure_match, tanimoto
 from .config import AppConfig, DEFAULT_ZOTERO_MCP_ENDPOINTS
 from .extractor import extract_reaction_steps
-from .integrations import EmbeddingAdapter, ExternalParserAdapter, LLMStructuringAdapter, OCRAdapter, StructureRecognitionAdapter, list_http_models, test_http_endpoint
+from .integrations import EmbeddingAdapter, ExternalParserAdapter, LLMStructuringAdapter, OCRAdapter, StructureRecognitionAdapter, RerankerAdapter, list_http_models, test_http_endpoint
 from .literature import ZoteroMcpClient, build_query, diff_reaction_fields, extract_method_fields, item_doi, item_key, item_title, item_year, normalize_doi, title_similarity, trim_text
 from .parsers import ParsedDocument, TextChunk, detect_file_type, parse_document, sniff_document_type
 from .rdfile import parse_rdfile_reactions
@@ -372,7 +372,8 @@ class RouteService:
         return {"latest": self.storage.latest_evaluation_metrics()}
 
     def rebuild_vector_index(self, limit: int = 10000) -> dict[str, Any]:
-        adapter = EmbeddingAdapter(self.config.embedding_endpoint, self.config.embedding_model, self.config.embedding_api_key)
+        endpoint, model, _fmt, api_key = self._integration_endpoint_settings("embedding")
+        adapter = EmbeddingAdapter(endpoint, model, api_key)
         if not adapter.configured:
             return {"configured": False, "status": "skipped", "reason": "embedding endpoint is not configured", **self.storage.vector_index_status()}
         indexed = 0
@@ -390,10 +391,12 @@ class RouteService:
         return {"configured": True, "status": "completed" if not errors else "partial_failed", "indexed": indexed, "errors": errors[:20], **self.storage.vector_index_status()}
 
     def get_vector_index_status(self) -> dict[str, Any]:
-        return {"configured": bool(self.config.embedding_endpoint), **self.storage.vector_index_status()}
+        endpoint, _, _, _ = self._integration_endpoint_settings("embedding")
+        return {"configured": bool(endpoint), **self.storage.vector_index_status()}
 
     def semantic_search_reaction_steps(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        adapter = EmbeddingAdapter(self.config.embedding_endpoint, self.config.embedding_model, self.config.embedding_api_key)
+        endpoint, model, _fmt, api_key = self._integration_endpoint_settings("embedding")
+        adapter = EmbeddingAdapter(endpoint, model, api_key)
         if not adapter.configured:
             return []
         vector = adapter.embed([query])[0]
@@ -427,42 +430,42 @@ class RouteService:
         payload = result.payload if isinstance(result.payload, dict) else {}
         return {"kind": kind, "configured": result.configured, "status": result.status, "detail": result.detail, "models": payload.get("models", [])}
 
+    def _resolve_provider(self, provider_id: str | None, overrides: dict[str, Any] | None = None) -> Any | None:
+        ai_providers_list = None
+        if isinstance(overrides, dict) and isinstance(overrides.get("integrations"), dict):
+            ai_providers_list = overrides["integrations"].get("ai_providers")
+        if ai_providers_list is None:
+            ai_providers_list = getattr(self.config, "ai_providers", [])
+        for p_dict in ai_providers_list:
+            if isinstance(p_dict, dict) and p_dict.get("id") == provider_id:
+                from .config import parse_ai_providers
+                return parse_ai_providers([p_dict])[0]
+            elif hasattr(p_dict, "id") and p_dict.id == provider_id:
+                return p_dict
+        return None
+
     def _integration_endpoint_settings(self, kind: str, overrides: dict[str, Any] | None = None) -> tuple[str | None, str | None, str, str | None]:
-        settings = {
-            "llm": (
-                self._override_value(overrides, "integrations", "llm_endpoint", self.config.llm_endpoint),
-                self._override_value(overrides, "integrations", "llm_model", self.config.llm_model),
-                self._override_value(overrides, "integrations", "llm_provider", self.config.llm_provider) or "openai_compatible",
-                self._override_value(overrides, "integrations", "llm_api_key", self.config.llm_api_key),
-            ),
-            "embedding": (
-                self._override_value(overrides, "integrations", "embedding_endpoint", self.config.embedding_endpoint),
-                self._override_value(overrides, "integrations", "embedding_model", self.config.embedding_model),
-                "openai_compatible",
-                self._override_value(overrides, "integrations", "embedding_api_key", self.config.embedding_api_key),
-            ),
-            "ocr": (
-                self._override_value(overrides, "integrations", "ocr_endpoint", self.config.ocr_endpoint),
-                self._override_value(overrides, "integrations", "ocr_model", self.config.ocr_model),
-                self._override_value(overrides, "integrations", "ocr_provider", self.config.ocr_provider) or "generic",
-                self._override_value(overrides, "integrations", "ocr_api_key", self.config.ocr_api_key),
-            ),
-            "document_parser": (
-                self._override_value(overrides, "integrations", "document_parser_endpoint", self.config.document_parser_endpoint),
-                self._override_value(overrides, "integrations", "document_parser_model", self.config.document_parser_model),
-                "openai_compatible",
-                self._override_value(overrides, "integrations", "document_parser_api_key", self.config.document_parser_api_key),
-            ),
-            "structure_recognition": (
-                self._override_value(overrides, "integrations", "structure_recognition_endpoint", self.config.structure_recognition_endpoint),
-                self._override_value(overrides, "integrations", "structure_recognition_model", self.config.structure_recognition_model),
-                "openai_compatible",
-                self._override_value(overrides, "integrations", "structure_recognition_api_key", self.config.structure_recognition_api_key),
-            ),
+        feature_map = {
+            "llm": ("extraction_provider_id", "extraction_model"),
+            "embedding": ("embedding_provider_id", "embedding_model"),
+            "ocr": ("ocr_provider_id", "ocr_model"),
+            "document_parser": ("document_parser_provider_id", "document_parser_model"),
+            "structure_recognition": ("structure_recognition_provider_id", "structure_recognition_model"),
+            "reranker": ("reranker_provider_id", "reranker_model")
         }
-        if kind not in settings:
-            raise ValueError(f"Unknown integration kind: {kind}")
-        return settings[kind]
+        
+        if kind not in feature_map:
+            return None, None, "openai_compatible", None
+            
+        provider_key, model_key = feature_map[kind]
+        provider_id = self._override_value(overrides, "integrations", provider_key, getattr(self.config, provider_key, None))
+        model = self._override_value(overrides, "integrations", model_key, getattr(self.config, model_key, None))
+        
+        provider = self._resolve_provider(provider_id, overrides)
+        if not provider:
+            return None, model, "openai_compatible", None
+            
+        return provider.endpoint, model, provider.format, provider.api_key
 
     @staticmethod
     def _override_value(overrides: dict[str, Any] | None, section: str, key: str, default: str | None) -> str | None:
@@ -771,7 +774,8 @@ class RouteService:
         return self.storage.empty_trash()
 
     def recognize_structure_image(self, image_path: str, reaction_step_id: str | None = None) -> dict[str, Any]:
-        adapter = StructureRecognitionAdapter(self.config.structure_recognition_endpoint, self.config.structure_recognition_model, self.config.structure_recognition_api_key)
+        endpoint, model, provider, api_key = self._integration_endpoint_settings("structure_recognition")
+        adapter = StructureRecognitionAdapter(endpoint, model, api_key, provider=provider)
         if not adapter.configured:
             return {"configured": False, "status": "skipped", "reason": "structure recognition endpoint is not configured", "compounds": []}
         structures = adapter.recognize(image_path)
@@ -1126,6 +1130,25 @@ class RouteService:
             if self._should_run_ocr(parsed_document) and self.config.ocr_endpoint:
                 self.storage.update_job(job_id, status="running", stage="ocr")
                 parsed_document = self._augment_with_ocr(document.file_path, parsed_document)
+            
+            if visual_metadata and visual_metadata.get("rendered_paths") and self.config.structure_recognition_endpoint:
+                self.storage.update_job(job_id, status="running", stage="vision_structure_extraction")
+                vision_smiles = []
+                for img_path in visual_metadata["rendered_paths"]:
+                    try:
+                        structs = self.recognize_structure_image(img_path)
+                        if structs.get("status") == "success":
+                            for c in structs.get("compounds", []):
+                                if c.get("smiles"):
+                                    vision_smiles.append(c["smiles"])
+                    except Exception:
+                        pass
+                if vision_smiles:
+                    vision_text = "Extracted molecular structures from document images:\n" + "\n".join(vision_smiles)
+                    import dataclasses
+                    from .parsers import TextChunk
+                    new_chunk = TextChunk(text=vision_text, page_number=None, parser_name="vision_llm")
+                    parsed_document = dataclasses.replace(parsed_document, chunks=parsed_document.chunks + [new_chunk])
             self.storage.update_document_metadata(document_id, file_type=parsed_document.file_type or detect_file_type(document.file_path), title=parsed_document.title, doi=parsed_document.doi)
             self.storage.replace_parsed_chunks(document_id, parsed_document.chunks)
             if reparse:
@@ -1177,12 +1200,13 @@ class RouteService:
         return self.storage.upsert_rdf_reaction_records(document_id, records)
 
     def _parse_with_optional_external(self, path: Path) -> ParsedDocument:
-        adapter = ExternalParserAdapter(self.config.document_parser_endpoint, self.config.document_parser_model, self.config.document_parser_api_key)
+        endpoint, model, _, api_key = self._integration_endpoint_settings("document_parser")
+        adapter = ExternalParserAdapter(endpoint, model, api_key)
         if adapter.configured:
             try:
                 return adapter.parse(str(path))
             except Exception:
-                if not self.config.parser_fallback:
+                if not self.config.document_parser_fallback:
                     raise
         return parse_document(path)
 
@@ -1224,13 +1248,15 @@ class RouteService:
             "pdf_page_image_counts": image_counts,
             "pdf_page_drawing_counts": drawing_counts,
             "needs_visual_review": has_visual,
+            "rendered_paths": rendered,
         }
 
     def _should_run_ocr(self, parsed: ParsedDocument) -> bool:
         return parsed.file_type == "pdf" and len(parsed.full_text.strip()) < 80
 
     def _augment_with_ocr(self, file_path: str, parsed: ParsedDocument) -> ParsedDocument:
-        adapter = OCRAdapter(self.config.ocr_endpoint, self.config.ocr_model, self.config.ocr_api_key, self.config.ocr_provider)
+        endpoint, model, provider, api_key = self._integration_endpoint_settings("ocr")
+        adapter = OCRAdapter(endpoint, model, api_key, provider=provider)
         payload = adapter.ocr_document(file_path)
         text = str(payload.get("text") or "")
         confidence = payload.get("confidence")
@@ -1240,17 +1266,19 @@ class RouteService:
         return ParsedDocument(file_type=parsed.file_type, title=parsed.title, doi=parsed.doi, chunks=[*parsed.chunks, chunk])
 
     def _structure_with_llm(self, step: dict[str, Any]) -> dict[str, Any]:
+        llm_enabled = bool(self.config.extraction_provider_id)
+        endpoint, model, provider, api_key = self._integration_endpoint_settings("llm")
         adapter = LLMStructuringAdapter(
-            self.config.llm_endpoint,
-            self.config.llm_model,
-            enabled=self.config.llm_enabled,
-            schema_version=self.config.llm_schema_version,
-            prompt_profile=self.config.llm_prompt_profile,
-            provider=self.config.llm_provider,
-            api_key=self.config.llm_api_key,
+            endpoint,
+            model,
+            enabled=llm_enabled,
+            schema_version=getattr(self.config, "llm_schema_version", "reaction_step.v1"),
+            prompt_profile=getattr(self.config, "llm_prompt_profile", "strict-reaction-json"),
+            provider=provider,
+            api_key=api_key,
         )
         step.setdefault("extraction_method", "rules")
-        step.setdefault("schema_version", self.config.llm_schema_version)
+        step.setdefault("schema_version", getattr(self.config, "llm_schema_version", "reaction_step.v1"))
         step.setdefault("metadata", {})
         if not adapter.configured:
             return step
@@ -1266,8 +1294,8 @@ class RouteService:
                 step["llm_confidence"] = float(llm["confidence"])
                 step["confidence"] = max(float(step.get("confidence") or 0), float(llm["confidence"]))
             step["extraction_method"] = "rules+llm"
-            step["schema_version"] = self.config.llm_schema_version
-            step["metadata"] = {**dict(step.get("metadata") or {}), "llm_prompt_profile": self.config.llm_prompt_profile}
+            step["schema_version"] = getattr(self.config, "llm_schema_version", "reaction_step.v1")
+            step["metadata"] = {**dict(step.get("metadata") or {}), "llm_prompt_profile": getattr(self.config, "llm_prompt_profile", "strict-reaction-json")}
         except Exception as exc:
             step["metadata"] = {**dict(step.get("metadata") or {}), "llm_error": str(exc), "llm_fallback": "rules"}
         return step

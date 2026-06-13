@@ -136,6 +136,8 @@ def detect_candidate_blocks(chunks: list[TextChunk]) -> list[CandidateBlock]:
 
 def is_reaction_like(text: str) -> bool:
     lowered = text.lower()
+    if "extracted molecular structures from document images" in lowered:
+        return True
     if len(text) < 80:
         return False
     hint_count = sum(1 for hint in REACTION_HINTS if hint in lowered)
