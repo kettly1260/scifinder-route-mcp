@@ -463,6 +463,49 @@ function StatusBadge({ tone, children }: { tone: 'success' | 'deduped' | 'failed
   return <span className={`status-badge ${tone}`}>{children}</span>;
 }
 
+function mergeLineBreaks(text: string): string {
+  if (!text) return '';
+  return text
+    .replace(/([a-zA-Z0-9,;:\-])\n\s*([a-zA-Z0-9])/g, '$1 $2')
+    .replace(/[ \t]+/g, ' ')
+    .trim();
+}
+
+function CollapsibleText({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const isLong = text.length > 200;
+
+  if (!isLong) {
+    return <div className="collapsible-text-content">{text}</div>;
+  }
+
+  return (
+    <div className="collapsible-text-content">
+      <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+        {expanded ? text : text.slice(0, 200) + '...'}
+      </div>
+      <button
+        className="expand-btn"
+        onClick={(e) => {
+          e.preventDefault();
+          setExpanded(!expanded);
+        }}
+        style={{
+          background: 'none',
+          border: 'none',
+          color: 'var(--primary-2, #00d2ff)',
+          cursor: 'pointer',
+          fontSize: '12px',
+          padding: '4px 0 0 0',
+          display: 'block'
+        }}
+      >
+        {expanded ? '收起' : '展开全文'}
+      </button>
+    </div>
+  );
+}
+
 function DocumentsPage({ token, guarded, selectedDocumentId, setSelectedDocumentId }: Pick<PageProps, 'token' | 'guarded'> & { selectedDocumentId: string; setSelectedDocumentId: (value: string) => void }) {
   const [query, setQuery] = useState('');
   const [fileType, setFileType] = useState('');
@@ -534,7 +577,26 @@ function DocumentsPage({ token, guarded, selectedDocumentId, setSelectedDocument
         ]} empty="暂无文档；请先上传或扫描收件箱。" />
       </Card>
 
-      <Card eyebrow="Parse Result" title={document.id ? `解析结果：${shortName(document.file_path)}` : '解析结果'}>
+      <Card
+        eyebrow="解析结果"
+        title={document.id ? `解析结果：${shortName(document.file_path)}` : '解析结果'}
+        extra={Boolean(document.id) && (
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (window.confirm('重新解析将清除现有反应步骤并重新提取，确定继续？')) {
+                guarded(async () => {
+                  const result = await postJson<JsonObject>('/api/documents/reparse', token, { document_id: document.id });
+                  await openDocument(String(document.id));
+                  return result;
+                }, '已启动重新解析任务');
+              }
+            }}
+          >
+            重新解析
+          </Button>
+        )}
+      >
         {!document.id && <JsonBlock value={{ hint: '选择一个文档以查看完整解析文本和抽取反应。' }} maxHeight={240} />}
         {Boolean(document.id) && (
           <div className="page-stack">
@@ -550,20 +612,29 @@ function DocumentsPage({ token, guarded, selectedDocumentId, setSelectedDocument
             {Boolean(latestJob.error) && <pre>{String(latestJob.error)}</pre>}
             <div className="grid two">
               <section className="chunk-panel">
-                <div className="section-heading"><p className="eyebrow">Parsed Chunks</p><h2>完整解析文本</h2></div>
-                {chunks.length === 0 && <div className="empty-state"><strong>暂无解析文本</strong><span>旧文档可能是在该功能上线前解析；重解析后会保存文本块。</span></div>}
+                <div className="section-heading"><p className="eyebrow">解析文本块</p><h2>完整解析文本</h2></div>
+                {chunks.length === 0 && (
+                  <div className="empty-state">
+                    <strong>暂无解析文本</strong>
+                    <span>旧文档可能是在该功能上线前解析；点击上方「重新解析」后将保存文本块。</span>
+                  </div>
+                )}
                 <div className="chunk-list">
                   {chunks.map((chunk) => (
                     <article className="parsed-chunk" key={String(chunk.id || chunk.chunk_index)}>
-                      <div className="chunk-meta"><span>#{String(chunk.chunk_index)}</span><span>Page {String(chunk.page_number ?? 'n/a')}</span><span>{String(chunk.parser_name || '')} {String(chunk.parser_version || '')}</span></div>
-                      <pre>{String(chunk.text || '')}</pre>
+                      <div className="chunk-meta">
+                        <span>第 {String(chunk.chunk_index)} 块</span>
+                        <span>{chunk.page_number ? `第 ${chunk.page_number} 页` : '页码未知'}</span>
+                        <span>解析器: {String(chunk.parser_name || '')} {String(chunk.parser_version || '')}</span>
+                      </div>
+                      <div className="chunk-text">{mergeLineBreaks(String(chunk.text || ''))}</div>
                     </article>
                   ))}
                 </div>
                 {hasMoreChunks && <Button variant="secondary" onClick={() => guarded(loadMoreChunks, '已加载更多文本块')}>加载更多文本块</Button>}
               </section>
-              <section>
-                <div className="section-heading"><p className="eyebrow">Extraction</p><h2>抽取反应步骤</h2></div>
+              <section className="extraction-panel">
+                <div className="section-heading"><p className="eyebrow">提取结果</p><h2>抽取反应步骤</h2></div>
                 <DataTable rows={reactions} columns={[
                   { key: 'step_index', label: '步骤' },
                   { key: 'reaction_name', label: '名称' },
@@ -571,7 +642,7 @@ function DocumentsPage({ token, guarded, selectedDocumentId, setSelectedDocument
                   { key: 'solvent_text', label: '溶剂' },
                   { key: 'yield_text', label: '收率' },
                   { key: 'confidence', label: '置信度' },
-                  { key: 'original_text', label: '原文', render: (row) => <pre>{String(row.original_text || '')}</pre> }
+                  { key: 'original_text', label: '原文', render: (row) => <CollapsibleText text={mergeLineBreaks(String(row.original_text || ''))} /> }
                 ]} empty="该文档当前没有抽取出的反应步骤。" />
               </section>
             </div>

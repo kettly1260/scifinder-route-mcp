@@ -237,6 +237,11 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._require_role("operator")
                 self._send_json(self.server.service.retry_failed_jobs())
                 return
+            if parsed.path == "/api/documents/reparse":
+                self._require_role("operator")
+                payload = self._read_json()
+                self._send_json(self.server.service.reparse_document(str(payload.get("document_id") or "")))
+                return
             if parsed.path == "/api/vector/rebuild":
                 self._require_role("operator")
                 self._send_json(self.server.service.rebuild_vector_index())

@@ -361,7 +361,7 @@ button, input, select { font: inherit; max-width: 100%; }
 .table-wrap { max-width: 100%; overflow: auto; overscroll-behavior-inline: contain; -webkit-overflow-scrolling: touch; border: 1px solid var(--line); border-radius: 18px; }
 table { width: 100%; border-collapse: collapse; min-width: 720px; }
 th, td { text-align: left; border-bottom: 1px solid var(--table-row-line); padding: 11px 12px; color: var(--muted); font-size: 13px; vertical-align: top; overflow-wrap: anywhere; }
-th { color: var(--text); background: rgba(255,255,255,.035); position: sticky; top: 0; z-index: 1; }
+th { color: var(--text); background: var(--panel-strong); position: sticky; top: 0; z-index: 1; }
 tr:last-child td { border-bottom: 0; }
 
 pre {
@@ -586,4 +586,43 @@ pre {
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+
+/* Custom styles for parsed chunks and reaction step extraction layout */
+.chunk-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 360px;
+  overflow-y: auto;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text);
+  font-family: inherit;
+  padding-right: 4px;
+}
+
+.collapsible-text-content {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+@media (min-width: 901px) {
+  .chunk-panel, .extraction-panel {
+    max-height: calc(100vh - 260px);
+    overflow-y: auto;
+    padding-right: 6px;
+  }
+}
+
+.extraction-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.extraction-panel .table-wrap {
+  flex: 1;
+  min-height: 0;
+  max-height: none !important;
 }

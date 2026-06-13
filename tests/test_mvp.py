@@ -1097,6 +1097,46 @@ def test_admin_zotero_endpoint_config_requires_admin_role(tmp_path: Path) -> Non
         server.server_close()
 
 
+def test_admin_reparse_document_endpoint(tmp_path: Path) -> None:
+    config = AppConfig(
+        data_dir=tmp_path / "data",
+        inbox_dir=tmp_path / "data" / "inbox",
+        upload_dir=tmp_path / "data" / "uploads",
+        evidence_dir=tmp_path / "data" / "evidence",
+        database_path=tmp_path / "data" / "routes.sqlite3",
+        config_path=tmp_path / "data" / "config.yaml",
+        sample_dir=None,
+        users=(UserCredential("ops", "operator-token", "operator"), UserCredential("admin", "admin-token", "admin")),
+    )
+    service = RouteService(config=config, storage=RouteStorage(config.database_path))
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
+    result = service.register_document(str(fixture))
+    doc_id = result["document"]["id"]
+
+    server = start_admin_server(service, AdminRunConfig(host="127.0.0.1", port=0))
+    assert server is not None
+    port = server.server_address[1]
+    payload = {"document_id": doc_id}
+    try:
+        # 1. No token (anonymous when token auth is enabled) -> 403 Forbidden
+        status, _body = admin_request_with_token(port, "POST", "/api/documents/reparse", "", payload)
+        assert status == 403
+
+        # 2. Invalid role or token -> 403 Forbidden
+        status, _body = admin_request_with_token(port, "POST", "/api/documents/reparse", "invalid-token", payload)
+        assert status == 403
+
+        # 3. operator role -> 200 OK
+        status, body = admin_request_with_token(port, "POST", "/api/documents/reparse", "operator-token", payload)
+        assert status == 200
+        res = json.loads(body)
+        assert "document" in res
+        assert "job" in res
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_admin_run_config_defaults_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SCIFINDER_ROUTE_ADMIN_HOST", raising=False)
 
