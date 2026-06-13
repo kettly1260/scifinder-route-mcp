@@ -1,9 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { clearToken, getJson, getStoredToken, hasTrustedToken, loadState, postJson, storeToken, uploadFile } from './api';
+import { Routes, Route, Navigate, useNavigate, useParams, useLocation, Link } from 'react-router-dom';
+import { clearToken, getJson, getStoredToken, hasTrustedToken, loadState, postJson, storeToken, uploadFile, getBlobUrl } from './api';
 import { Button, Card, DataTable, Input, JsonBlock, StatCard } from './components';
 import type { AdminState, ConfigField, JsonObject } from './types';
-
-type PageId = 'dashboard' | 'ingest' | 'documents' | 'config' | 'rdf' | 'structures' | 'literature' | 'ops';
 type ThemeId = 'aurora' | 'graphite' | 'emerald' | 'rose' | 'light';
 type UploadResultRow = {
   file_name: string;
@@ -53,15 +52,15 @@ function initialTheme(): ThemeId {
   return themes.some((theme) => theme.id === saved) ? (saved as ThemeId) : 'aurora';
 }
 
-const pages: Array<{ id: PageId; label: string; description: string }> = [
-  { id: 'dashboard', label: 'Dashboard', description: '运行状态与关键指标' },
-  { id: 'ingest', label: '导入与任务', description: '上传、扫描、解析队列' },
-  { id: 'documents', label: 'Documents', description: '查看 PDF/RTF/HTML 解析结果' },
-  { id: 'config', label: '配置', description: '集成、运行时、热配置' },
-  { id: 'rdf', label: 'RDF 反应', description: 'CAS 反应记录与 molfile' },
-  { id: 'structures', label: '结构检索', description: '相似度、子结构、文本过滤' },
-  { id: 'literature', label: '文献 / Zotero', description: '端点、候选链接、写回' },
-  { id: 'ops', label: '运维诊断', description: '索引、备份、回收站、配置警告' }
+const pages: Array<{ id: string; path: string; label: string; description: string }> = [
+  { id: 'dashboard', path: '/',          label: 'Dashboard', description: '运行状态与关键指标' },
+  { id: 'ingest',    path: '/ingest',    label: '导入与任务', description: '上传、扫描、解析队列' },
+  { id: 'documents', path: '/documents', label: 'Documents', description: '查看 PDF/RTF/HTML 解析结果' },
+  { id: 'config',    path: '/config',    label: '配置',      description: '集成、运行时、热配置' },
+  { id: 'rdf',       path: '/rdf',       label: 'RDF 反应',  description: 'CAS 反应记录与 molfile' },
+  { id: 'structures',path: '/structures',label: '结构检索',   description: '相似度、子结构、文本过滤' },
+  { id: 'literature',path: '/literature',label: '文献 / Zotero',description: '端点、候选链接、写回' },
+  { id: 'ops',       path: '/ops',       label: '运维诊断',   description: '索引、备份、回收站、配置警告' }
 ];
 
 const configFields: ConfigField[] = [
@@ -145,14 +144,15 @@ export function App() {
   const [token, setToken] = useState(getStoredToken());
   const [trusted, setTrusted] = useState(hasTrustedToken());
   const [state, setState] = useState<AdminState | null>(null);
-  const [page, setPage] = useState<PageId>('dashboard');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [authRequired, setAuthRequired] = useState(true);
   const [theme, setTheme] = useState<ThemeId>(initialTheme);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [selectedDocumentId, setSelectedDocumentId] = useState('');
+
+  const navigate = useNavigate();
+  const location = useLocation();
 
   async function refresh(nextToken = token, silent = false) {
     try {
@@ -176,7 +176,7 @@ export function App() {
     setMessage('');
     setError('');
     setSidebarOpen(false);
-  }, [page]);
+  }, [location.pathname]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -224,7 +224,11 @@ export function App() {
     return <LoginScreen token={token} setToken={setToken} trusted={trusted} setTrusted={setTrusted} login={login} busy={busy} error={error} />;
   }
 
-  const active = pages.find((item) => item.id === page) || pages[0];
+  const active = pages.find((item) =>
+    item.path === '/'
+      ? location.pathname === '/'
+      : location.pathname.startsWith(item.path)
+  ) || pages[0];
 
   return (
     <div className="app-shell">
@@ -239,10 +243,14 @@ export function App() {
         </div>
         <nav className="nav-list" aria-label="管理控制台分区导航">
           {pages.map((item) => (
-            <button key={item.id} className={page === item.id ? 'nav-item active' : 'nav-item'} onClick={() => setPage(item.id)}>
+            <Link
+              key={item.id}
+              to={item.path}
+              className={location.pathname === item.path || (item.path !== '/' && location.pathname.startsWith(item.path)) ? 'nav-item active' : 'nav-item'}
+            >
               <span>{item.label}</span>
               <small>{item.description}</small>
-            </button>
+            </Link>
           ))}
         </nav>
         <div className="sidebar-footer">
@@ -270,14 +278,19 @@ export function App() {
           </div>
         </header>
         {(message || error) && <div className={error ? 'notice error' : 'notice'}>{error || message}</div>}
-        {page === 'dashboard' && <Dashboard state={state} />}
-        {page === 'ingest' && <IngestPage token={token} state={state} guarded={guarded} refresh={refresh} openDocument={(documentId) => { setSelectedDocumentId(documentId); setPage('documents'); }} />}
-        {page === 'documents' && <DocumentsPage token={token} guarded={guarded} selectedDocumentId={selectedDocumentId} setSelectedDocumentId={setSelectedDocumentId} />}
-        {page === 'config' && <ConfigPage token={token} state={state} guarded={guarded} refresh={refresh} />}
-        {page === 'rdf' && <RdfPage token={token} guarded={guarded} />}
-        {page === 'structures' && <StructurePage token={token} state={state} guarded={guarded} />}
-        {page === 'literature' && <LiteraturePage token={token} state={state} guarded={guarded} />}
-        {page === 'ops' && <OpsPage token={token} state={state} guarded={guarded} refresh={refresh} />}
+        <Routes>
+          <Route path="/" element={<Dashboard state={state} />} />
+          <Route path="/ingest" element={<IngestPage token={token} state={state} guarded={guarded} refresh={refresh} openDocument={(documentId) => navigate(`/documents/${documentId}`)} />} />
+          <Route path="/documents" element={<DocumentsListPage token={token} guarded={guarded} />} />
+          <Route path="/documents/:documentId" element={<DocumentDetailPage token={token} guarded={guarded} />} />
+          <Route path="/config" element={<ConfigPage token={token} state={state} guarded={guarded} refresh={refresh} />} />
+          <Route path="/rdf" element={<RdfPage token={token} guarded={guarded} />} />
+          <Route path="/rdf/:reactionId" element={<RdfDetailPage token={token} guarded={guarded} />} />
+          <Route path="/structures" element={<StructurePage token={token} state={state} guarded={guarded} />} />
+          <Route path="/literature" element={<LiteraturePage token={token} state={state} guarded={guarded} />} />
+          <Route path="/ops" element={<OpsPage token={token} state={state} guarded={guarded} refresh={refresh} />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
       </main>
     </div>
   );
@@ -507,15 +520,11 @@ function CollapsibleText({ text }: { text: string }) {
   );
 }
 
-function DocumentsPage({ token, guarded, selectedDocumentId, setSelectedDocumentId }: Pick<PageProps, 'token' | 'guarded'> & { selectedDocumentId: string; setSelectedDocumentId: (value: string) => void }) {
+function DocumentsListPage({ token, guarded }: Pick<PageProps, 'token' | 'guarded'>) {
   const [query, setQuery] = useState('');
   const [fileType, setFileType] = useState('');
   const [documents, setDocuments] = useState<JsonObject[]>([]);
-  const [detail, setDetail] = useState<JsonObject | null>(null);
-  const [chunks, setChunks] = useState<JsonObject[]>([]);
-  const [chunkTotal, setChunkTotal] = useState(0);
-  const [chunkOffset, setChunkOffset] = useState(0);
-  const chunkLimit = 50;
+  const navigate = useNavigate();
 
   async function loadDocuments() {
     const params = new URLSearchParams({ limit: '100' });
@@ -525,38 +534,9 @@ function DocumentsPage({ token, guarded, selectedDocumentId, setSelectedDocument
     setDocuments(rows);
   }
 
-  async function openDocument(documentId: string) {
-    const data = await getJson<JsonObject>(`/api/documents/${encodeURIComponent(documentId)}?chunk_limit=${chunkLimit}&chunk_offset=0&reaction_limit=100`, token);
-    const chunkPage = asObject(data.chunks);
-    setSelectedDocumentId(documentId);
-    setDetail(data);
-    setChunks(asObjectArray(chunkPage.chunks));
-    setChunkTotal(Number(chunkPage.total || 0));
-    setChunkOffset(Number(chunkPage.limit || chunkLimit));
-  }
-
-  async function loadMoreChunks() {
-    if (!selectedDocumentId) return;
-    const data = await getJson<JsonObject>(`/api/documents/${encodeURIComponent(selectedDocumentId)}/chunks?limit=${chunkLimit}&offset=${chunkOffset}`, token);
-    const nextChunks = asObjectArray(data.chunks);
-    setChunks((current) => [...current, ...nextChunks]);
-    setChunkTotal(Number(data.total || 0));
-    setChunkOffset(chunkOffset + Number(data.limit || chunkLimit));
-  }
-
   useEffect(() => {
     loadDocuments().catch(() => undefined);
   }, []);
-
-  useEffect(() => {
-    if (selectedDocumentId) openDocument(selectedDocumentId).catch(() => undefined);
-  }, [selectedDocumentId]);
-
-  const document = asObject(detail?.document);
-  const latestJob = asObject(detail?.latest_job);
-  const reactions = asObjectArray(detail?.reaction_steps);
-  const hasMoreChunks = chunks.length < chunkTotal;
-  const status = String(document.ingest_status || '');
 
   return (
     <div className="page-stack">
@@ -574,9 +554,58 @@ function DocumentsPage({ token, guarded, selectedDocumentId, setSelectedDocument
           { key: 'parsed_chunk_count', label: '文本块' },
           { key: 'reaction_step_count', label: '反应' },
           { key: 'last_job_error', label: '最近错误' },
-          { key: 'open', label: '打开', render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => openDocument(String(row.id)), '解析结果已加载')}>查看解析</Button> }
+          { key: 'open', label: '打开', render: (row) => <Button size="sm" variant="ghost" onClick={() => navigate(`/documents/${encodeURIComponent(String(row.id))}`)}>查看解析</Button> }
         ]} empty="暂无文档；请先上传或扫描收件箱。" />
       </Card>
+    </div>
+  );
+}
+
+function DocumentDetailPage({ token, guarded }: Pick<PageProps, 'token' | 'guarded'>) {
+  const { documentId } = useParams<{ documentId: string }>();
+  const [detail, setDetail] = useState<JsonObject | null>(null);
+  const [chunks, setChunks] = useState<JsonObject[]>([]);
+  const [chunkTotal, setChunkTotal] = useState(0);
+  const [chunkOffset, setChunkOffset] = useState(0);
+  const chunkLimit = 50;
+
+  async function openDocument(id: string) {
+    const data = await getJson<JsonObject>(`/api/documents/${encodeURIComponent(id)}?chunk_limit=${chunkLimit}&chunk_offset=0&reaction_limit=100`, token);
+    const chunkPage = asObject(data.chunks);
+    setDetail(data);
+    setChunks(asObjectArray(chunkPage.chunks));
+    setChunkTotal(Number(chunkPage.total || 0));
+    setChunkOffset(Number(chunkPage.limit || chunkLimit));
+  }
+
+  async function loadMoreChunks() {
+    if (!documentId) return;
+    const data = await getJson<JsonObject>(`/api/documents/${encodeURIComponent(documentId)}/chunks?limit=${chunkLimit}&offset=${chunkOffset}`, token);
+    const nextChunks = asObjectArray(data.chunks);
+    setChunks((current) => [...current, ...nextChunks]);
+    setChunkTotal(Number(data.total || 0));
+    setChunkOffset(chunkOffset + Number(data.limit || chunkLimit));
+  }
+
+  useEffect(() => {
+    if (documentId) {
+      openDocument(documentId).catch(() => undefined);
+    }
+  }, [documentId]);
+
+  const document = asObject(detail?.document);
+  const latestJob = asObject(detail?.latest_job);
+  const reactions = asObjectArray(detail?.reaction_steps);
+  const hasMoreChunks = chunks.length < chunkTotal;
+  const status = String(document.ingest_status || '');
+
+  return (
+    <div className="page-stack">
+      <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+        <Link to="/documents" style={{ textDecoration: 'none' }}>
+          <Button variant="secondary">← 返回文档列表</Button>
+        </Link>
+      </div>
 
       <Card
         eyebrow="解析结果"
@@ -598,7 +627,7 @@ function DocumentsPage({ token, guarded, selectedDocumentId, setSelectedDocument
           </Button>
         )}
       >
-        {!document.id && <JsonBlock value={{ hint: '选择一个文档以查看完整解析文本和抽取反应。' }} maxHeight={240} />}
+        {!document.id && <JsonBlock value={{ hint: '加载文档详情中...' }} maxHeight={240} />}
         {Boolean(document.id) && (
           <div className="page-stack">
             <div className="summary-strip">
@@ -850,6 +879,60 @@ function rdfRoleOrder(role: unknown): number {
   return index === -1 ? order.length : index;
 }
 
+function StructureImage({ structureId, token }: { structureId: string; token: string }) {
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [error, setError] = useState<boolean>(false);
+  const [loading, setLoading] = useState<boolean>(true);
+
+  useEffect(() => {
+    let active = true;
+    let urlToRevoke: string | null = null;
+
+    setLoading(true);
+    setError(false);
+
+    getBlobUrl(`/api/rdf/structures/${structureId}/image.svg`, token)
+      .then((url) => {
+        if (active) {
+          urlToRevoke = url;
+          setBlobUrl(url);
+          setLoading(false);
+        } else {
+          URL.revokeObjectURL(url);
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to load structure image:', err);
+        if (active) {
+          setError(true);
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      active = false;
+      if (urlToRevoke) {
+        URL.revokeObjectURL(urlToRevoke);
+      }
+    };
+  }, [structureId, token]);
+
+  if (loading) {
+    return <span className="muted" style={{ fontSize: '12px' }}>加载中...</span>;
+  }
+  if (error || !blobUrl) {
+    return <span className="text-danger" style={{ fontSize: '12px', color: 'var(--color-danger, #ef4444)' }}>加载失败</span>;
+  }
+
+  return (
+    <img
+      src={blobUrl}
+      alt="结构图"
+      style={{ maxWidth: '150px', maxHeight: '100px', backgroundColor: 'white', border: '1px solid var(--color-border, #e2e8f0)', borderRadius: '4px' }}
+    />
+  );
+}
+
 function RdfDetailView({ detail, token }: { detail: JsonObject | null, token: string }) {
   if (!detail) {
     return <JsonBlock value={{ hint: '选择一条反应以查看中文解读、结构名称、CAS RN 与化学式。' }} maxHeight={560} />;
@@ -871,7 +954,7 @@ function RdfDetailView({ detail, token }: { detail: JsonObject | null, token: st
         { key: 'smiles', label: 'SMILES' },
         { key: 'molfile_version', label: '结构信息' },
         { key: 'rdkit_status', label: 'RDKit' },
-        { key: 'image', label: '结构图', render: (row) => (row.rdkit_status === 'available' || row.smiles) ? <img src={`/api/rdf/structures/${row.id}/image.svg?token=${encodeURIComponent(token)}`} alt="结构图" style={{ maxWidth: '150px', maxHeight: '100px', backgroundColor: 'white' }} /> : '暂无' }
+        { key: 'image', label: '结构图', render: (row) => (row.molfile || row.smiles) ? <StructureImage structureId={String(row.id)} token={token} /> : '暂无' }
       ]} empty="该 RDF 反应没有可展示结构" />
       {reference && <p><strong>参考文献：</strong>{reference}</p>}
       <details>
@@ -886,16 +969,14 @@ function RdfPage({ token, guarded }: Pick<PageProps, 'token' | 'guarded'>) {
   const [query, setQuery] = useState('');
   const [limit, setLimit] = useState('25');
   const [rows, setRows] = useState<JsonObject[]>([]);
-  const [detail, setDetail] = useState<JsonObject | null>(null);
+  const navigate = useNavigate();
+
   async function load() {
     const url = `/api/rdf/reactions?limit=${encodeURIComponent(limit)}${query ? `&q=${encodeURIComponent(query)}` : ''}`;
     const data = await getJson<JsonObject[]>(url, token);
     setRows(data);
   }
-  async function open(id: unknown) {
-    const data = await getJson<JsonObject>(`/api/rdf/reactions/${encodeURIComponent(String(id))}`, token);
-    setDetail(data);
-  }
+
   return (
     <div className="page-stack">
       <Card eyebrow="RDF Viewer" title="反应记录" extra={<Button onClick={() => guarded(load, 'RDF 反应已加载')}>加载 RDF 反应</Button>}>
@@ -904,8 +985,43 @@ function RdfPage({ token, guarded }: Pick<PageProps, 'token' | 'guarded'>) {
           <Input label="CAS / 文件名 / 标题" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="CAS 反应号、结构 CAS RN、PDF/RDF 文件名或标题" />
           <Input label="数量限制" type="number" min="1" value={limit} onChange={(event) => setLimit(event.target.value)} />
         </div>
-        <DataTable rows={rows} columns={[{ key: 'source_file_path', label: '来源文件', render: (row) => shortName(row.source_file_path || row.source_title || row.source_document_id) }, { key: 'record_index', label: '记录' }, { key: 'scheme_id', label: '方案' }, { key: 'step_id', label: '步骤' }, { key: 'cas_reaction_number', label: 'CAS 反应号' }, { key: 'yield_text', label: '收率' }, { key: 'structure_count', label: '结构数' }, { key: 'open', label: '打开', render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => open(row.id), '反应详情已加载')}>打开</Button> }]} />
+        <DataTable rows={rows} columns={[
+          { key: 'source_file_path', label: '来源文件', render: (row) => shortName(row.source_file_path || row.source_title || row.source_document_id) },
+          { key: 'record_index', label: '记录' },
+          { key: 'scheme_id', label: '方案' },
+          { key: 'step_id', label: '步骤' },
+          { key: 'cas_reaction_number', label: 'CAS 反应号' },
+          { key: 'yield_text', label: '收率' },
+          { key: 'structure_count', label: '结构数' },
+          { key: 'open', label: '打开', render: (row) => <Button size="sm" variant="ghost" onClick={() => navigate(`/rdf/${encodeURIComponent(String(row.id))}`)}>打开</Button> }
+        ]} />
       </Card>
+    </div>
+  );
+}
+
+function RdfDetailPage({ token, guarded }: Pick<PageProps, 'token' | 'guarded'>) {
+  const { reactionId } = useParams<{ reactionId: string }>();
+  const [detail, setDetail] = useState<JsonObject | null>(null);
+
+  async function open(id: string) {
+    const data = await getJson<JsonObject>(`/api/rdf/reactions/${encodeURIComponent(id)}`, token);
+    setDetail(data);
+  }
+
+  useEffect(() => {
+    if (reactionId) {
+      open(reactionId).catch(() => undefined);
+    }
+  }, [reactionId]);
+
+  return (
+    <div className="page-stack">
+      <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+        <Link to="/rdf" style={{ textDecoration: 'none' }}>
+          <Button variant="secondary">← 返回反应记录</Button>
+        </Link>
+      </div>
       <Card eyebrow="Detail" title="反应详情与结构">
         <RdfDetailView detail={detail} token={token} />
       </Card>
@@ -955,7 +1071,7 @@ function StructurePage({ token, state, guarded }: PageProps) {
           { key: 'molfile_version', label: '版本' },
           { key: 'similarity', label: '评分' },
           { key: 'rdf_reaction_id', label: '反应 ID' },
-          { key: 'image', label: '结构图', render: (row) => <img src={`/api/rdf/structures/${row.id}/image.svg?token=${encodeURIComponent(token)}`} alt="结构图" style={{ maxWidth: '150px', maxHeight: '100px', backgroundColor: 'white' }} /> }
+          { key: 'image', label: '结构图', render: (row) => (row.molfile || row.smiles) ? <StructureImage structureId={String(row.id)} token={token} /> : '暂无' }
         ]} />
       </Card>
     </div>

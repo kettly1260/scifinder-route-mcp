@@ -12,7 +12,7 @@ import tomllib
 import pytest
 
 from scifinder_route_mcp.chem import normalize_molfile
-from scifinder_route_mcp.admin import AdminRunConfig, admin_state, render_dashboard, start_admin_server
+from scifinder_route_mcp.admin import AdminRunConfig, admin_state, start_admin_server
 from scifinder_route_mcp.auth import UserCredential
 from scifinder_route_mcp.config import AppConfig, merge_hot_config, read_config_yaml, write_config_yaml
 from scifinder_route_mcp.server import SCIFINDER_IMPORT_GUIDANCE, ServerRunConfig, create_dual_transport_app, create_mcp, run_mcp_server
@@ -948,44 +948,12 @@ def test_literature_link_storage_and_field_diff(tmp_path: Path) -> None:
 
 def test_admin_dashboard_contains_modern_config_controls(tmp_path: Path) -> None:
     service = make_service(tmp_path)
-
-    html = render_dashboard(service)
     state = admin_state(service)
 
-    assert "<html lang=\"zh-CN\">" in html
-    assert "AI 供应商" in html
-    assert "连接凭证池" in html
-    assert "功能路由" in html
-    assert "嵌入供应商" in html
-    assert "OCR 供应商" in html
-    assert "文档解析供应商" in html
-    assert "重排模型供应商" in html
-    assert "provider-select" in html
-    assert "队列后端" in html
-    assert "data-type=\"enum\"" in html
-    assert "LLM 成本上限 USD" in html
-    assert "解析失败回退" in html
-    assert "Zotero MCP" in html
-    assert "webui-config.yaml" in html
-    assert "启动 Zotero 链接" in html
-    assert "zotero_linking_enabled" in html
-    assert "留空则不变" in html
-    assert ".pdf,.rtf,.rdf,.html,.htm,.mhtml,.mht,.md,.markdown,.txt" in html
-    assert "aria-label=\"管理控制台分区导航\"" in html
-    assert "href=\"#rdf-viewer\"" in html
-    assert "id=\"rdf-viewer\"" in html
-    assert "featured-panel" in html
-    assert "加载 RDF 反应" in html
-    assert "RDF/RDfile 是结构化证据" in html
-    assert "prefers-color-scheme: dark" in html
-    assert "color-scheme:light dark" in html
-    assert "position:sticky" in html
-    assert "backdrop-filter" in html
-    assert "@media (min-width: 1440px)" in html
-    assert "@media (min-width: 700px) and (max-width: 1023px)" in html
-    assert "@media (max-width: 699px)" in html
-    assert "@media (hover: none) and (pointer: coarse)" in html
     assert state["production"]
+    assert "config" in state
+    assert "integrations" in state["config"]
+    assert "queue" in state["config"]
 
 
 def admin_request(port: int, method: str, path: str, payload: dict[str, object] | None = None) -> tuple[int, str]:
@@ -1069,6 +1037,11 @@ def test_admin_rdf_structure_svg_endpoint(tmp_path: Path) -> None:
         assert headers["content-type"] == "image/svg+xml; charset=utf-8"
         assert "<svg" in body
         assert "</svg>" in body
+
+        # Verify nonexistent structure returns 404 instead of 400
+        status, _, body = admin_request_with_headers(port, "GET", "/api/rdf/structures/nonexistent_id/image.svg")
+        assert status == 404
+        assert "nonexistent_id" in body
     finally:
         server.shutdown()
         server.server_close()

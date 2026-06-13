@@ -142,6 +142,12 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._send_svg(self.server.service.render_rdf_structure_svg(structure_id))
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except KeyError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.UNPROCESSABLE_ENTITY)
+            except RuntimeError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.SERVICE_UNAVAILABLE)
             except Exception as exc:
                 self._send_error_json(exc)
             return
@@ -346,18 +352,8 @@ class AdminHandler(BaseHTTPRequestHandler):
         if not config.auth_token and not config.users:
             return
         token = self.headers.get("X-Scifinder-Route-Token") or ""
-        with open("/tmp/debug.log", "a") as f:
-            f.write(f"DEBUG: start _require_role\nheader_token={repr(token)}\npath={self.path}\n")
-        if not token:
-            parsed = urlparse(self.path)
-            query = parse_qs(parsed.query)
-            token = query.get("token", [""])[0]
-            with open("/tmp/debug.log", "a") as f:
-                f.write(f"query_token={repr(token)}\n")
         user = authenticate_token(config.users, config.auth_token, token)
         if not user:
-            with open("/tmp/debug.log", "a") as f:
-                f.write(f"FAIL: user not found for token={repr(token)}\n")
             raise PermissionError("Invalid or missing admin token")
         if not role_allows(user.role, role):
             raise PermissionError(f"Token role '{user.role}' cannot perform '{role}' operations")

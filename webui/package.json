@@ -10,6 +10,7 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
+    "react-router-dom": "^7.6.3",
     "@vitejs/plugin-react": "^5.1.1",
     "vite": "^7.2.7",
     "typescript": "^5.9.3",

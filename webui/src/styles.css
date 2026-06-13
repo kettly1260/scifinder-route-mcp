@@ -202,6 +202,9 @@ button, input, select { font: inherit; max-width: 100%; }
   color: var(--muted);
   background: transparent;
   cursor: pointer;
+  text-decoration: none;
+  display: block;
+  box-sizing: border-box;
 }
 .nav-item span { display: block; color: inherit; font-weight: 850; }
 .nav-item small { display: block; color: var(--subtle); margin-top: 4px; line-height: 1.35; }

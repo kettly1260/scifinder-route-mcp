@@ -66,3 +66,12 @@ export async function uploadFile(token: string, file: File): Promise<JsonObject>
 export function loadState(token: string): Promise<AdminState> {
   return getJson<AdminState>('/api/state', token);
 }
+
+export async function getBlobUrl(url: string, token: string): Promise<string> {
+  const response = await fetch(url, { headers: { 'X-Scifinder-Route-Token': token } });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch image: ${response.statusText}`);
+  }
+  const blob = await response.blob();
+  return URL.createObjectURL(blob);
+}

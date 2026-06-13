@@ -35,6 +35,11 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY --from=webui-build /app/src/scifinder_route_mcp/admin_webui ./src/scifinder_route_mcp/admin_webui
 
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends \
+       libxrender1 libxext6 libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN python -m pip install --upgrade pip \
     && python -m pip install .
 
