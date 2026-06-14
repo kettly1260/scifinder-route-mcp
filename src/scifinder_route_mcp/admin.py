@@ -43,15 +43,6 @@ class AdminHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/":
-            if self._send_static_asset("index.html"):
-                return
-            try:
-                self._send_html(render_dashboard(self.server.service))
-            except Exception as exc:
-                if not self._send_lock_error(exc):
-                    raise
-            return
         if parsed.path.startswith("/assets/"):
             if self._send_static_asset(parsed.path.lstrip("/")):
                 return
@@ -215,6 +206,15 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
                 self._send_error_json(exc)
+            return
+        if not parsed.path.startswith("/api/"):
+            if self._send_static_asset("index.html"):
+                return
+            try:
+                self._send_html(render_dashboard(self.server.service))
+            except Exception as exc:
+                if not self._send_lock_error(exc):
+                    raise
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
