@@ -246,7 +246,13 @@ class AppConfig:
         if webui_path and webui_path.exists():
             try:
                 config = apply_config_overrides(config, read_config_yaml(webui_path))
-            except Exception:
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).error(
+                    "Failed to apply webui config from %s: %s — "
+                    "falling back to base config. Fix or delete this file to restore WebUI settings.",
+                    webui_path, exc,
+                )
                 return config
         return config
 
@@ -436,41 +442,47 @@ def apply_config_overrides(config: AppConfig, raw: dict[str, Any]) -> AppConfig:
     extraction = section(raw, "extraction")
     retention = section(raw, "retention")
     scan_extensions = ingest.get("scan_extensions", config.scan_extensions)
-    if isinstance(scan_extensions, str):
+    if scan_extensions is None:
+        scan_extensions = config.scan_extensions
+    elif isinstance(scan_extensions, str):
         scan_extensions = parse_extensions(scan_extensions, config.scan_extensions)
     else:
         scan_extensions = tuple(normalize_extension(str(item)) for item in scan_extensions)
     upload_extensions = ingest.get("upload_extensions", config.upload_extensions)
-    if isinstance(upload_extensions, str):
+    if upload_extensions is None:
+        upload_extensions = config.upload_extensions
+    elif isinstance(upload_extensions, str):
         upload_extensions = parse_extensions(upload_extensions, config.upload_extensions)
     else:
         upload_extensions = tuple(normalize_extension(str(item)) for item in upload_extensions)
-    priority_terms = integrations.get("zotero_llm_priority_terms", config.zotero_llm_priority_terms)
-    if isinstance(priority_terms, str):
+    priority_terms = integrations.get("zotero_llm_priority_terms")
+    if priority_terms is None:
+        priority_terms = config.zotero_llm_priority_terms
+    elif isinstance(priority_terms, str):
         priority_terms = tuple(item.strip() for item in priority_terms.split(",") if item.strip())
     else:
         priority_terms = tuple(str(item).strip() for item in priority_terms if str(item).strip())
     return replace(
         config,
         async_jobs=coerce_bool(server.get("async_jobs"), config.async_jobs),
-        max_workers=max(1, int(server.get("max_workers", config.max_workers))),
+        max_workers=max(1, coerce_int(server.get("max_workers"), config.max_workers)),
         storage_backend=str(server.get("storage_backend", config.storage_backend)).strip().lower() or "sqlite",
         allow_external_paths=coerce_bool(security.get("allow_external_paths"), config.allow_external_paths),
         auth_token=none_if_empty(security.get("token", config.auth_token)),
-        users=parse_users(jsonish(security.get("users"))) if "users" in security else config.users,
+        users=parse_users(jsonish(security.get("users"))) if "users" in security and security.get("users") else config.users,
         upload_av_scan_enabled=coerce_bool(security.get("upload_av_scan_enabled"), config.upload_av_scan_enabled),
         upload_av_engine=str(security.get("upload_av_engine", config.upload_av_engine)).strip().lower() or "clamav",
         upload_av_endpoint=none_if_empty(security.get("upload_av_endpoint", config.upload_av_endpoint)),
         upload_av_fail_closed=coerce_bool(security.get("upload_av_fail_closed"), config.upload_av_fail_closed),
         scan_extensions=scan_extensions,
         upload_extensions=upload_extensions,
-        upload_max_bytes=max(1, int(ingest.get("upload_max_bytes", config.upload_max_bytes))),
+        upload_max_bytes=max(1, coerce_int(ingest.get("upload_max_bytes"), config.upload_max_bytes)),
         reject_file_type_mismatch=coerce_bool(ingest.get("reject_file_type_mismatch"), config.reject_file_type_mismatch),
         extract_visual_evidence=coerce_bool(ingest.get("extract_visual_evidence"), config.extract_visual_evidence),
         render_visual_pages=coerce_bool(ingest.get("render_visual_pages"), config.render_visual_pages),
-        visual_page_dpi=max(72, int(ingest.get("visual_page_dpi", config.visual_page_dpi))),
-        max_visual_pages_per_document=max(0, int(ingest.get("max_visual_pages_per_document", config.max_visual_pages_per_document))),
-        max_embedded_images_per_document=max(0, int(ingest.get("max_embedded_images_per_document", config.max_embedded_images_per_document))),
+        visual_page_dpi=max(72, coerce_int(ingest.get("visual_page_dpi"), config.visual_page_dpi)),
+        max_visual_pages_per_document=max(0, coerce_int(ingest.get("max_visual_pages_per_document"), config.max_visual_pages_per_document)),
+        max_embedded_images_per_document=max(0, coerce_int(ingest.get("max_embedded_images_per_document"), config.max_embedded_images_per_document)),
         queue_backend=str(queue.get("backend", config.queue_backend)).strip().lower() or "sqlite",
         redis_url=none_if_empty(queue.get("redis_url", config.redis_url)),
         ai_providers=parse_ai_providers(integrations.get("ai_providers", [p.to_dict() for p in config.ai_providers])),
@@ -495,10 +507,10 @@ def apply_config_overrides(config: AppConfig, raw: dict[str, Any]) -> AppConfig:
         zotero_llm_priority_terms=priority_terms,
         llm_schema_version=str(extraction.get("llm_schema_version", config.llm_schema_version)),
         llm_prompt_profile=str(extraction.get("llm_prompt_profile", config.llm_prompt_profile)),
-        llm_cost_limit_usd=float(extraction.get("llm_cost_limit_usd", config.llm_cost_limit_usd)),
-        verification_confidence_threshold=float(thresholds.get("verification_confidence_threshold", config.verification_confidence_threshold)),
-        evidence_retention_days=int(retention.get("evidence_retention_days", config.evidence_retention_days)),
-        cache_retention_days=int(retention.get("cache_retention_days", config.cache_retention_days)),
+        llm_cost_limit_usd=coerce_float(extraction.get("llm_cost_limit_usd"), config.llm_cost_limit_usd),
+        verification_confidence_threshold=coerce_float(thresholds.get("verification_confidence_threshold"), config.verification_confidence_threshold),
+        evidence_retention_days=coerce_int(retention.get("evidence_retention_days"), config.evidence_retention_days),
+        cache_retention_days=coerce_int(retention.get("cache_retention_days"), config.cache_retention_days),
     )
 
 
@@ -521,6 +533,24 @@ def coerce_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     return parse_bool(str(value), default=default)
+
+
+def coerce_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def coerce_float(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
 
 
 def none_if_empty(value: Any) -> str | None:
@@ -599,6 +629,60 @@ def merge_hot_config(current: dict[str, Any], updates: dict[str, Any]) -> dict[s
     return {key: merged.get(key, {}) for key in sorted(HOT_CONFIG_SECTIONS)}
 
 
+def _migrate_legacy_yaml_integrations(integrations: dict[str, Any]) -> dict[str, Any]:
+    """Auto-migrate flat legacy keys to unified ai_providers structure."""
+    if "ai_providers" in integrations:
+        return integrations
+        
+    integrations = dict(integrations)
+    providers = []
+    
+    legacy_features = [
+        ("llm", "extraction", "openai_compatible"),
+        ("embedding", "embedding", "openai_compatible"),
+        ("ocr", "ocr", "generic"),
+        ("document_parser", "document_parser", "generic"),
+        ("structure_recognition", "structure_recognition", "generic"),
+    ]
+    
+    keys_to_delete = []
+    for prefix, feature_id, default_format in legacy_features:
+        endpoint = integrations.get(f"{prefix}_endpoint")
+        if not endpoint:
+            continue
+            
+        provider_id = f"legacy-{feature_id}"
+        
+        fmt = integrations.get(f"{prefix}_provider", default_format)
+        if fmt == "paddleocr":
+            fmt = "paddleocr_vl"
+            
+        providers.append({
+            "id": provider_id,
+            "name": f"Legacy {feature_id.upper()} Provider",
+            "format": fmt,
+            "endpoint": endpoint,
+            "api_key": integrations.get(f"{prefix}_api_key"),
+        })
+        
+        model = integrations.get(f"{prefix}_model")
+        if model:
+            integrations[f"{feature_id}_model"] = model
+        integrations[f"{feature_id}_provider_id"] = provider_id
+        
+        for suffix in ["endpoint", "api_key", "model", "provider", "enabled"]:
+            key_name = f"{prefix}_{suffix}"
+            if key_name != f"{feature_id}_model":
+                keys_to_delete.append(key_name)
+                
+    if providers:
+        integrations["ai_providers"] = providers
+        for key in keys_to_delete:
+            integrations.pop(key, None)
+            
+    return integrations
+
+
 def read_config_yaml(path: Path) -> dict[str, Any]:
     lines = [line.split("#", 1)[0].rstrip() for line in path.read_text(encoding="utf-8").splitlines()]
     result: dict[str, Any] = {}
@@ -614,6 +698,10 @@ def read_config_yaml(path: Path) -> dict[str, Any]:
             result[section_name] = section_value
             continue
         index += 1
+        
+    if "integrations" in result and isinstance(result["integrations"], dict):
+        result["integrations"] = _migrate_legacy_yaml_integrations(result["integrations"])
+        
     return result
 
 

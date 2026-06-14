@@ -1395,3 +1395,116 @@ def test_run_mcp_server_stdio_falls_back_to_legacy_run() -> None:
     run_mcp_server(server, ServerRunConfig(transport="stdio"))
 
     assert server.calls == 1
+
+
+def test_legacy_config_migration(tmp_path: Path) -> None:
+    from scifinder_route_mcp.config import AppConfig, write_config_yaml
+    
+    # Create legacy YAML content
+    legacy_webui = {
+        "integrations": {
+            "llm_endpoint": "https://api.openai.com/v1",
+            "llm_api_key": "sk-proj-testkey",
+            "llm_model": "gpt-4o-mini",
+            "llm_provider": "openai_compatible",
+            "llm_enabled": True,
+            "embedding_endpoint": "https://api.openai.com/v1",
+            "embedding_api_key": "sk-proj-testkey",
+            "embedding_model": "text-embedding-3-small",
+            "ocr_provider": "paddleocr",
+            "ocr_endpoint": "http://127.0.0.1:8866",
+            "document_parser_provider": "doc2x",
+            "document_parser_endpoint": "https://api.doc2x.no/v1",
+            "document_parser_api_key": "d2x_testkey"
+        },
+        "security": {
+            "users": ""
+        }
+    }
+    
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    webui_path = data_dir / "webui-config.yaml"
+    write_config_yaml(webui_path, legacy_webui)
+    
+    # Create AppConfig with explicit webui path
+    config = AppConfig(
+        data_dir=data_dir,
+        inbox_dir=tmp_path / "inbox",
+        upload_dir=tmp_path / "uploads",
+        evidence_dir=tmp_path / "evidence",
+        database_path=tmp_path / "routes.db",
+        config_path=tmp_path / "config.yaml",
+        webui_config_path=webui_path,
+    )
+    
+    # Load overrides
+    config = config.apply_file_overrides()
+    
+    # Verify migration results
+    assert len(config.ai_providers) == 4
+    
+    extraction = next(p for p in config.ai_providers if p.id == "legacy-extraction")
+    assert extraction.format == "openai_compatible"
+    assert extraction.endpoint == "https://api.openai.com/v1"
+    assert extraction.api_key == "sk-proj-testkey"
+    assert config.extraction_provider_id == "legacy-extraction"
+    assert config.extraction_model == "gpt-4o-mini"
+    
+    ocr = next(p for p in config.ai_providers if p.id == "legacy-ocr")
+    assert ocr.format == "paddleocr_vl"
+    assert ocr.endpoint == "http://127.0.0.1:8866"
+    assert config.ocr_provider_id == "legacy-ocr"
+    
+    doc_parser = next(p for p in config.ai_providers if p.id == "legacy-document_parser")
+    assert doc_parser.format == "doc2x"
+    assert config.document_parser_provider_id == "legacy-document_parser"
+    
+    # Verify that users did not crash and fallback to default (empty config list or whatever config has)
+    assert config.users == ()
+
+
+def test_empty_numeric_fields_fallback(tmp_path: Path) -> None:
+    from scifinder_route_mcp.config import AppConfig, write_config_yaml
+    
+    # Create webui config with empty numeric/bool values
+    webui = {
+        "server": {
+            "max_workers": None
+        },
+        "ingest": {
+            "upload_max_bytes": "",
+            "visual_page_dpi": ""
+        },
+        "extraction": {
+            "llm_cost_limit_usd": None
+        }
+    }
+    
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    webui_path = data_dir / "webui-config.yaml"
+    write_config_yaml(webui_path, webui)
+    
+    # Base configuration values
+    base_config = AppConfig(
+        data_dir=data_dir,
+        inbox_dir=tmp_path / "inbox",
+        upload_dir=tmp_path / "uploads",
+        evidence_dir=tmp_path / "evidence",
+        database_path=tmp_path / "routes.db",
+        config_path=tmp_path / "config.yaml",
+        webui_config_path=webui_path,
+        max_workers=5,
+        upload_max_bytes=1000,
+        visual_page_dpi=150,
+        llm_cost_limit_usd=10.0
+    )
+    
+    # Loading overridden config should fallback to defaults instead of crashing
+    loaded = base_config.apply_file_overrides()
+    
+    assert loaded.max_workers == 5
+    assert loaded.upload_max_bytes == 1000
+    assert loaded.visual_page_dpi == 150
+    assert loaded.llm_cost_limit_usd == 10.0

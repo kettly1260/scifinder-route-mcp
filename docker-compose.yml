@@ -20,6 +20,7 @@ services:
       SCIFINDER_ROUTE_EVIDENCE_DIR: /data/evidence
       SCIFINDER_ROUTE_DATABASE: /data/scifinder_routes.sqlite3
       SCIFINDER_ROUTE_CONFIG: /data/config.yaml
+      SCIFINDER_ROUTE_WEBUI_CONFIG: /data/webui-config.yaml
       SCIFINDER_ROUTE_ASYNC_JOBS: "true"
       SCIFINDER_ROUTE_MAX_WORKERS: "1"
       SCIFINDER_ROUTE_BACKEND: ${SCIFINDER_ROUTE_BACKEND:-sqlite}
