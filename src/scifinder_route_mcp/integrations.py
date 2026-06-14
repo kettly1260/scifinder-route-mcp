@@ -138,7 +138,7 @@ def test_http_endpoint(endpoint: str | None, *, model: str | None = None, provid
     if kind == "reranker":
         rerank_url = endpoint.rstrip("/") + "/rerank"
         try:
-            payload = post_json(rerank_url, {"model": model or "default", "query": "ping", "texts": ["ping"]}, timeout=30, headers=auth_headers("openai_compatible", api_key))
+            payload = post_json(rerank_url, {"model": model or "default", "query": "ping", "texts": ["ping"], "documents": ["ping"]}, timeout=30, headers=auth_headers("openai_compatible", api_key))
             return EndpointResult(configured=True, status="ok", detail=f"Reranker endpoint accepted a test request at {_display_url(rerank_url)}", payload=payload)
         except Exception as exc:
             return EndpointResult(configured=True, status="error", detail=_http_error_detail(exc, url=rerank_url, model=model))
