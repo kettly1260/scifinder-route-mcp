@@ -466,120 +466,26 @@ def admin_state(service: RouteService) -> dict[str, Any]:
 
 
 def render_dashboard(service: RouteService) -> str:
-    state = admin_state(service)
-    config_json = json.dumps(state["config"], ensure_ascii=False)
-    production_json = json.dumps(state["production"], ensure_ascii=False, indent=2)
-    jobs_rows = "".join(
-        f"<tr><td>{escape(job['id'])}</td><td>{escape(job['status'])}</td><td>{escape(job['stage'])}</td><td>{escape(job.get('error') or '')}</td></tr>"
-        for job in state["jobs"]
-    ) or "<tr><td colspan='4'>暂无解析任务</td></tr>"
-    health = state["health"]
-    validation = state["validation"]
-    production = state["production"]
-    vector = production["vector_index"]
-    chem = production.get("chem", {})
-    usage_rows = "".join(f"<tr><td>{escape(name)}</td><td>{escape(item['files'])}</td><td>{escape(item['bytes'])}</td></tr>" for name, item in production["storage_usage"].items())
-    endpoint_buttons = "".join(f"<button type='button' onclick=\"testEndpoint('{kind}')\">测试 {label}</button>" for kind, label in [("llm", "LLM"), ("embedding", "Embedding"), ("ocr", "OCR"), ("document_parser", "文档解析"), ("structure_recognition", "结构识别"), ("postgres", "Postgres"), ("zotero_mcp", "Zotero MCP")])
-    auth_required = bool(service.config.auth_token or service.config.users)
-    warnings = "".join(f"<li>{escape(item)}</li>" for item in validation["warnings"]) or "<li>暂无配置警告</li>"
-    return f"""<!doctype html>
+    return """<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SciFinder Route 管理控制台</title>
-  <style>{ADMIN_CSS}{RESPONSIVE_CSS}</style>
+  <title>SciFinder Route MCP</title>
+  <style>
+    body { font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: #0f172a; color: #e2e8f0; margin: 0; }
+    .card { background: #1e293b; padding: 2rem; border-radius: 12px; text-align: center; border: 1px solid #334155; max-width: 480px; }
+    h1 { color: #f87171; margin-top: 0; }
+    code { background: #0f172a; padding: 0.2rem 0.4rem; border-radius: 4px; }
+  </style>
 </head>
 <body>
-  <div class="orb orb-a"></div>
-  <div class="orb orb-b"></div>
-  <main id="dashboardRoot" class="dashboard-root {'locked' if auth_required else 'unlocked'}" data-auth-required="{'true' if auth_required else 'false'}">
-    <section id="loginPanel" class="login-panel glass" aria-label="登录">
-      <div class="login-brand"><span class="brand-mark">SR</span><div><p class="eyebrow">NAS 控制台</p><h1>SciFinder Route MCP</h1></div></div>
-      <form class="login-card" onsubmit="loginAdmin(event)">
-        <label>管理令牌 <input id="token" type="password" autocomplete="current-password" placeholder="输入 token 后进入控制台"></label>
-        <button type="submit">登录</button>
-        <p id="loginMessage" class="hint">启用鉴权时，登录前不会显示设置和数据页面。</p>
-      </form>
-    </section>
-
-    <section id="appShell" class="app-shell">
-      <aside class="sidebar glass">
-        <div class="brand"><span class="brand-mark">SR</span><div><strong>SciFinder Route</strong><small>Admin Console</small></div></div>
-        <nav class="side-nav" aria-label="管理控制台分区导航">
-          <a class="side-link active" href="#overview" data-view-target="overview">概览</a>
-          <a class="side-link" href="#configuration" data-view-target="configuration">配置</a>
-          <a class="side-link" href="#data-viewers" data-view-target="data-viewers">数据查看</a>
-          <a class="side-link" href="#operations" data-view-target="operations">运维</a>
-          <a class="side-link" href="#diagnostics" data-view-target="diagnostics">诊断</a>
-          <a class="side-link accent" href="#rdf-viewer" data-view-target="data-viewers">RDF 查看器</a>
-        </nav>
-        <div class="sidebar-footer"><span class="status-pill">{escape(health['status']).upper()}</span><button type="button" class="ghost-button" onclick="logoutAdmin()">退出</button></div>
-      </aside>
-
-      <section class="workspace">
-        <p id="globalMessage" class="global-message hint"></p>
-
-        <section id="overview" class="view-panel active" data-view="overview" data-title="概览">
-          <section class="grid metrics">
-            <article class="glass metric"><span>文档数</span><strong>{health['documents']}</strong></article>
-            <article class="glass metric"><span>反应步骤</span><strong>{health['reaction_steps']}</strong></article>
-            <article class="glass metric"><span>异步任务</span><strong>{'启用' if health['async_jobs'] else '停用'}</strong></article>
-            <article class="glass metric"><span>配置文件</span><strong>{escape(short_path(health['config_path']))}</strong></article>
-          </section>
-          <section class="panel glass console-panel">
-            <div class="panel-title"><div><p class="eyebrow">Console</p><h2>基础运行信息</h2></div><button type="button" onclick="refreshState()">刷新</button></div>
-            <div id="consoleInfo" class="info-grid">
-              <div><span>健康状态</span><strong>{escape(health['status'])}</strong></div>
-              <div><span>OCR 积压</span><strong>{escape(health['ocr_backlog'])}</strong></div>
-              <div><span>存储后端</span><strong>{escape((state['config'].get('server') or {}).get('storage_backend'))}</strong></div>
-              <div><span>队列后端</span><strong>{escape((state['config'].get('queue') or {}).get('backend'))}</strong></div>
-            </div>
-          </section>
-        </section>
-
-        <section id="configuration" class="view-panel" data-view="configuration" data-title="配置">
-          <section id="secure-changes" class="panel glass"><div class="panel-title"><div><p class="eyebrow">安全变更</p><h2>受保护操作</h2></div><button type="button" onclick="scanInbox()">扫描收件箱</button></div><p class="hint">端口、卷挂载等 Docker-owned 设置仍在 .env / Docker Compose 中修改。</p></section>
-          <section class="grid two">
-            <form id="integrations" class="panel glass" onsubmit="saveProviderConfig(event)"><div class="panel-title"><div><p class="eyebrow">AI 供应商</p><h2>连接凭证池</h2></div><button type="submit">保存并重载</button></div><div id="aiProviderTable" class="table-wrap"></div><div class="form-grid"><label>供应商 ID <input id="providerIdInput" placeholder="my-openai"></label><label>供应商名称 <input id="providerNameInput" placeholder="My OpenAI API"></label><label>协议格式 <select id="providerFormatInput"><option value="openai_compatible">OpenAI 兼容</option><option value="openai_chat">OpenAI Chat Completions</option><option value="openai_responses">OpenAI Responses</option><option value="gemini">Gemini</option><option value="claude">Claude</option><option value="generic">通用 HTTP</option><option value="mineru">MinerU API</option><option value="paddleocr_vl">PaddleOCR-VL Job API</option></select></label><label>端点 URL <input id="providerEndpointInput" placeholder="https://api.openai.com/v1"></label><label>API Key <input id="providerApiKeyInput" type="password" placeholder="留空则不变"></label></div><div class="button-row compact" style="margin-top:12px"><button type="button" onclick="addProvider()">添加供应商</button></div><p class="hint">每个供应商定义一组连接凭证（格式 + 端点 + Key）。下方的功能路由通过 ID 引用供应商。</p></form>
-            <form id="featureRouting" class="panel glass" onsubmit="saveConfig(event)"><div class="panel-title"><div><p class="eyebrow">功能路由</p><h2>模块 → 供应商</h2></div><button type="submit">保存并重载</button></div><div class="form-grid"><label>抽取 (LLM) 供应商 <select name="extraction_provider_id" data-section="integrations" data-type="enum" class="provider-select"></select><button type="button" class="inline-button" onclick="testEndpoint('llm')">测试 LLM</button></label><label>抽取模型 <input name="extraction_model" data-section="integrations" list="llmModelOptions" placeholder="gpt-4o-mini / gemini-2.5-pro / claude-3-5-sonnet"><datalist id="llmModelOptions"></datalist><button type="button" class="inline-button" onclick="loadModels('llm','llmModelOptions','llmModelStatus')">拉取模型</button><span id="llmModelStatus" class="field-status"></span></label><label>嵌入供应商 <select name="embedding_provider_id" data-section="integrations" data-type="enum" class="provider-select"></select><button type="button" class="inline-button" onclick="testEndpoint('embedding')">测试 Embedding</button></label><label>嵌入模型 <input name="embedding_model" data-section="integrations" list="embeddingModelOptions" placeholder="bge-m3"><datalist id="embeddingModelOptions"></datalist><button type="button" class="inline-button" onclick="loadModels('embedding','embeddingModelOptions','embeddingModelStatus')">拉取模型</button><span id="embeddingModelStatus" class="field-status"></span></label><label>OCR 供应商 <select name="ocr_provider_id" data-section="integrations" data-type="enum" class="provider-select"></select><button type="button" class="inline-button" onclick="testEndpoint('ocr')">测试 OCR</button><span class="field-status">MinerU 文档: https://mineru.net/apiManage/docs；PaddleOCR 端点示例: https://paddleocr.aistudio-app.com/api/v2/ocr/jobs</span></label><label>OCR 模型 <input name="ocr_model" data-section="integrations" list="ocrModelOptions" placeholder="mineru-layout / PaddleOCR-VL-1.6"><datalist id="ocrModelOptions"></datalist><button type="button" class="inline-button" onclick="loadModels('ocr','ocrModelOptions','ocrModelStatus')">拉取模型</button><span id="ocrModelStatus" class="field-status"></span></label><label>文档解析供应商 <select name="document_parser_provider_id" data-section="integrations" data-type="enum" class="provider-select"></select><button type="button" class="inline-button" onclick="testEndpoint('document_parser')">测试文档解析</button></label><label>文档解析模型 <input name="document_parser_model" data-section="integrations" list="parserModelOptions" placeholder="pymupdf|mineru"><datalist id="parserModelOptions"></datalist><button type="button" class="inline-button" onclick="loadModels('document_parser','parserModelOptions','parserModelStatus')">拉取模型</button><span id="parserModelStatus" class="field-status"></span></label><label>解析失败回退 <select name="document_parser_fallback" data-section="integrations" data-type="bool"><option value="true">启用</option><option value="false">停用</option></select></label><label>结构识别供应商 <select name="structure_recognition_provider_id" data-section="integrations" data-type="enum" class="provider-select"></select><button type="button" class="inline-button" onclick="testEndpoint('structure_recognition')">测试结构识别</button></label><label>结构识别模型 <input name="structure_recognition_model" data-section="integrations" list="structureModelOptions" placeholder="decimer|molscribe|osra"><datalist id="structureModelOptions"></datalist><button type="button" class="inline-button" onclick="loadModels('structure_recognition','structureModelOptions','structureModelStatus')">拉取模型</button><span id="structureModelStatus" class="field-status"></span></label><label>重排模型供应商 <select name="reranker_provider_id" data-section="integrations" data-type="enum" class="provider-select"></select><button type="button" class="inline-button" onclick="testEndpoint('reranker')">测试 Reranker</button></label><label>重排模型 <input name="reranker_model" data-section="integrations" placeholder="bge-reranker-v2-m3"></label><label>PostgreSQL URL <input name="postgres_url" data-section="integrations" data-secret="true" placeholder="留空则不变"><button type="button" class="inline-button" onclick="testEndpoint('postgres')">测试 Postgres</button></label><label>Zotero 文献链接 <select name="zotero_linking_enabled" data-section="integrations" data-type="bool"><option value="false">停用</option><option value="true">启用</option></select></label><label>导入后链接 Zotero <select name="zotero_linking_on_import" data-section="integrations" data-type="bool"><option value="true">启用</option><option value="false">停用</option></select></label><label>Zotero 抽取策略 <select name="zotero_extraction_strategy" data-section="integrations" data-type="enum"><option value="rules_first">规则优先</option><option value="llm_first">LLM 优先</option><option value="rules_only">仅规则</option></select></label><label>LLM 优先术语 <input name="zotero_llm_priority_terms" data-section="integrations" data-type="list" placeholder="scale,purification,SI"></label></div><p class="hint">Web UI 变更会保存到 {escape((state['config'].get('paths') or {}).get('webui_config_path'))}。</p></form>
-
-            <form id="runtime" class="panel glass" onsubmit="saveConfig(event)"><div class="panel-title"><div><p class="eyebrow">运行时</p><h2>扫描与阈值</h2></div><button type="submit">保存并重载</button></div><div class="form-grid"><label>扫描扩展名 <input name="scan_extensions" data-section="ingest" data-type="list" placeholder=".pdf,.rtf,.rdf,.html,.htm,.mhtml,.mht,.md,.markdown,.txt"></label><label>最大工作线程 <input name="max_workers" data-section="server" type="number" min="1"></label><label>异步任务 <select name="async_jobs" data-section="server" data-type="bool"><option value="true">启用</option><option value="false">停用</option></select></label><label>允许外部路径 <select name="allow_external_paths" data-section="security" data-type="bool"><option value="false">禁止</option><option value="true">允许</option></select></label><label>配置令牌 <input name="token" data-section="security" data-secret="true" type="password" placeholder="留空则不变"></label><label>验证置信阈值 <input name="verification_confidence_threshold" data-section="thresholds" type="number" min="0" max="1" step="0.01"></label><label>队列后端 <select name="backend" data-section="queue" data-type="enum"><option value="sqlite">sqlite</option><option value="redis">redis</option></select></label><label>Redis URL <input name="redis_url" data-section="queue" data-secret="true" placeholder="留空则不变"></label><label>存储后端 <select name="storage_backend" data-section="server" data-type="enum"><option value="sqlite">sqlite</option><option value="postgres">postgres</option></select></label><label>LLM Schema 版本 <input name="llm_schema_version" data-section="extraction" placeholder="reaction_step.v1"></label><label>LLM 提示词配置 <input name="llm_prompt_profile" data-section="extraction" placeholder="strict-reaction-json"></label><label>LLM 成本上限 USD <input name="llm_cost_limit_usd" data-section="extraction" type="number" min="0" step="0.01"></label><label>证据保留天数 <input name="evidence_retention_days" data-section="retention" type="number" min="1"></label><label>缓存保留天数 <input name="cache_retention_days" data-section="retention" type="number" min="1"></label></div></form>
-          </section>
-        </section>
-
-        <section id="data-viewers" class="view-panel" data-view="data-viewers" data-title="数据查看">
-          <p class="hint warning">RDF/RDfile 是结构化证据，但可能不含完整实验步骤；最终化学结论前请结合 PDF/RTF/HTML 可读或视觉证据核验。</p>
-          <section id="rdf-viewer" class="panel glass featured-panel"><div class="panel-title"><div><p class="eyebrow">RDF 查看器</p><h2>反应记录</h2></div><button type="button" onclick="loadRdfReactions()">加载 RDF 反应</button></div><div class="form-grid"><label>CAS / 文件名 / 标题 <input id="rdfQuery" placeholder="CAS 反应号、结构 CAS RN、PDF/RDF 文件名或标题"></label><label>数量限制 <input id="rdfLimit" type="number" value="25" min="1"></label></div><p class="hint">不需要知道 document_id；可用 CAS、SciFinder 反应号、PDF/RDF 文件名、标题或 DOI 模糊检索。</p><div id="rdfReactions" class="table-wrap"></div><div id="rdfDetail" class="table-wrap">选择一个反应以查看中文反应详情、结构名称、CAS RN 与化学式。</div></section>
-          <section class="grid two"><section id="chem-search" class="panel glass"><div class="panel-title"><div><p class="eyebrow">化学检索</p><h2>RDKit 结构</h2></div><button type="button" onclick="installRdkit()">安装 RDKit</button></div><pre>{escape(json.dumps(chem, indent=2))}</pre><div class="form-grid"><label>查询 <input id="chemQuery" placeholder="SMILES、SMARTS、CAS 或名称"></label><label>模式 <select id="chemMode"><option value="similarity">相似度</option><option value="substructure">子结构</option><option value="text">文本过滤</option></select></label></div><button type="button" onclick="runChemSearch()">检索结构</button><div id="chemResults" class="table-wrap"></div></section><section id="zotero" class="panel glass"><div class="panel-title"><div><p class="eyebrow">Zotero MCP</p><h2>文献源地址</h2></div><div class="button-row compact"><button type="button" onclick="saveZoteroEndpoint()">保存地址</button><button type="button" onclick="loadZoteroEndpoints()">重新加载</button></div></div><p class="hint">默认使用本机 Streamable HTTP 端点 http://127.0.0.1:23120/mcp；通常无需添加 LAN、VPN 或反代多地址。</p><div class="form-grid"><label>地址别名 <input id="zoteroAlias" placeholder="local-zotero" value="local-zotero"></label><label>文献源组名 <input id="zoteroGroup" placeholder="local-zotero" value="local-zotero"></label><label>地址 URL <input id="zoteroUrl" placeholder="http://127.0.0.1:23120/mcp" value="http://127.0.0.1:23120/mcp"></label><label>优先级 <input id="zoteroPriority" type="number" value="100"></label><label>超时秒数 <input id="zoteroTimeout" type="number" value="10" step="0.5"></label><label>启用 <select id="zoteroEnabled"><option value="true">启用</option><option value="false">停用</option></select></label><label>允许写回笔记 <select id="zoteroWriteNote"><option value="false">禁止</option><option value="true">允许</option></select></label><label>请求头 JSON <input id="zoteroHeaders" placeholder='{{"Authorization":"Bearer ..."}}'></label></div><div id="zoteroEndpoints" class="table-wrap"></div></section></section>
-        </section>
-
-        <section id="operations" class="view-panel" data-view="operations" data-title="运维">
-          <section class="grid two"><section class="panel glass"><div class="panel-title"><div><p class="eyebrow">向量索引</p><h2>嵌入召回</h2></div><button type="button" onclick="rebuildVector()">重建</button></div><pre>{escape(json.dumps(vector, indent=2))}</pre></section><section class="panel glass"><p class="eyebrow">端点状态</p><h2>最近测试结果</h2><pre>{escape(json.dumps(health.get('integrations', []), indent=2))}</pre><p class="hint">连接测试已移动到配置页对应端点旁边。</p></section></section>
-          <section class="grid two"><section id="literature" class="panel glass"><div class="panel-title"><div><p class="eyebrow">OCR / DOI / 文献</p><h2>积压队列</h2></div><div class="button-row compact"><button type="button" onclick="startLiteratureLinking()">启动 Zotero 链接</button><button type="button" onclick="loadLiterature()">加载链接</button></div></div><pre>OCR 积压: {escape(health['ocr_backlog'])}\n低置信 DOI 队列: {escape(len(production['doi_low_confidence_queue']))}\n文献候选: {escape(len(production.get('literature_candidates', [])))}</pre><div class="form-grid"><label>文档 ID <input id="literatureDocumentId" placeholder="可选"></label></div><h3>文献任务</h3><div id="literatureJobs" class="table-wrap"></div><h3>候选链接</h3><div id="literatureLinks" class="table-wrap"></div></section><section id="trash" class="panel glass"><div class="panel-title"><div><p class="eyebrow">回收站</p><h2>已删除项目</h2></div><div class="button-row compact"><button type="button" onclick="loadTrash()">加载回收站</button><button type="button" onclick="emptyTrash()">清空回收站</button></div></div><div id="trashList" class="table-wrap"></div></section></section>
-          <section class="grid two"><section class="panel glass"><div class="panel-title"><div><p class="eyebrow">备份与保留</p><h2>NAS 存储</h2></div><button type="button" onclick="backupDb()">备份数据库</button></div><div class="table-wrap"><table><thead><tr><th>路径</th><th>文件数</th><th>字节数</th></tr></thead><tbody>{usage_rows}</tbody></table></div><button type="button" onclick="cleanupDryRun()">清理试运行</button></section><section class="panel glass"><p class="eyebrow">化合物注册表</p><h2>审核队列</h2><pre>已索引化合物: {escape(production['compound_count'])}</pre></section></section>
-        </section>
-
-        <section id="diagnostics" class="view-panel" data-view="diagnostics" data-title="诊断">
-          <section class="grid two"><section class="panel glass"><p class="eyebrow">校验</p><h2>配置警告</h2><ul>{warnings}</ul></section><section class="panel glass"><p class="eyebrow">路径</p><h2>已挂载存储</h2><pre>{escape(json.dumps(health, indent=2, ensure_ascii=False))}</pre></section></section>
-          <section id="jobs" class="panel glass"><p class="eyebrow">任务</p><h2>最近解析任务</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>状态</th><th>阶段</th><th>错误</th></tr></thead><tbody>{jobs_rows}</tbody></table></div></section>
-          <section class="panel glass"><p class="eyebrow">生产状态</p><h2>诊断快照</h2><pre>{escape(production_json)}</pre></section>
-        </section>
-      </section>
-    </section>
-  </main>
-  <script>window.__CONFIG__ = {config_json};window.__AUTH_REQUIRED__ = {json.dumps(auth_required)};{ADMIN_JS}</script>
+  <div class="card">
+    <h1>前端资源未构建</h1>
+    <p>请先在 <code>webui</code> 目录下运行 <code>npm run build</code> 来构建静态资源，或者运行开发服务器。</p>
+  </div>
 </body>
 </html>"""
 
-
-def escape(value: Any) -> str:
-    return html.escape(str(value))
-
-
-def short_path(value: str) -> str:
-    parts = value.replace("\\", "/").split("/")
-    return "/".join(parts[-2:]) if len(parts) >= 2 else value
 
 
 def safe_upload_name(value: str) -> str:
@@ -614,138 +520,5 @@ def parse_multipart_upload(content_type: str, body: bytes) -> tuple[str, bytes]:
     raise ValueError("multipart upload requires a file field")
 
 
-ADMIN_CSS = r"""
-:root{
-  color-scheme:light dark;
-  --bg:#f4f7fb;--surface:#ffffff;--text:#172033;--muted:#67748e;--line:rgba(20,33,61,.1);
-  --glass:rgba(255,255,255,.84);--glass-strong:rgba(255,255,255,.96);
-  --primary:#5e72e4;--primary-2:#11cdef;--accent:#2dce89;--danger:#f5365c;
-  --button-text:#06101c;--field-bg:#fff;--pre-bg:#f8fafc;--pre-text:#263449;--row-line:rgba(20,33,61,.08);--mini-bg:#f8fafc;
-  --body-bg:radial-gradient(circle at 82% 12%,rgba(17,205,239,.20),transparent 26%),linear-gradient(145deg,#eef3ff 0,#f7fafc 42%,#edf6ff 100%);
-  --mobile-bg:linear-gradient(160deg,#eef3ff 0,#f7fafc 55%,#edf6ff 100%);
-  --shadow:0 18px 45px rgba(50,50,93,.12),0 8px 18px rgba(0,0,0,.06);
-}
-@media (prefers-color-scheme: dark){
-  :root{
-    --bg:#111827;--surface:#182235;--text:#eef4ff;--muted:#a8b3c7;--line:rgba(255,255,255,.12);
-    --glass:rgba(24,34,53,.82);--glass-strong:rgba(24,34,53,.94);
-    --primary:#8fa2ff;--primary-2:#4ee5ff;--accent:#5cffb0;--danger:#ff6b8b;
-    --button-text:#0f172a;--field-bg:#111827;--pre-bg:#111827;--pre-text:#dbeafe;--row-line:rgba(255,255,255,.08);--mini-bg:rgba(255,255,255,.06);
-    --body-bg:radial-gradient(circle at 82% 12%,rgba(78,229,255,.16),transparent 26%),linear-gradient(145deg,#0f172a 0,#111827 42%,#0b1220 100%);
-    --mobile-bg:linear-gradient(160deg,#0f172a 0,#111827 55%,#0b1220 100%);
-    --shadow:0 24px 80px rgba(0,0,0,.36);
-  }
-}
-*{box-sizing:border-box}
-html{min-width:0;overflow-x:hidden;scroll-behavior:smooth}
-body{margin:0;min-height:100vh;width:100%;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--body-bg);color:var(--text);overflow-x:hidden}
-.orb{position:fixed;border-radius:999px;filter:blur(6px);opacity:.65;pointer-events:none}
-.orb-a{width:420px;height:420px;right:-120px;top:60px;background:linear-gradient(135deg,var(--primary-2),#a78bfa)}
-.orb-b{width:280px;height:280px;left:-80px;bottom:10%;background:linear-gradient(135deg,var(--accent),#ffd166)}
-.glass{border:1px solid var(--line);background:linear-gradient(135deg,var(--glass-strong),var(--glass));box-shadow:var(--shadow);backdrop-filter:blur(18px) saturate(1.2);-webkit-backdrop-filter:blur(18px) saturate(1.2)}
-.dashboard-root{min-height:100vh;min-width:0;padding:18px}.dashboard-root.locked .app-shell{display:none}.dashboard-root.unlocked .login-panel{display:none}
-.login-panel{width:min(560px,calc(100% - 28px));margin:12vh auto 0;padding:28px;border-radius:28px}.login-brand{display:flex;align-items:center;gap:14px;margin-bottom:24px}.login-brand h1{font-size:30px;letter-spacing:-.04em}.login-card{display:grid;gap:16px}.login-card button{justify-self:start}
-.app-shell{display:grid;grid-template-columns:260px minmax(0,1fr);gap:18px;min-height:calc(100vh - 36px);width:min(100%,1760px);min-width:0;margin:0 auto;align-items:start}
-.sidebar{position:sticky;top:18px;height:calc(100vh - 36px);border-radius:28px;padding:20px;display:flex;flex-direction:column;gap:22px}.brand{display:flex;align-items:center;gap:12px}.brand-mark{display:grid;place-items:center;width:42px;height:42px;border-radius:14px;background:linear-gradient(135deg,var(--primary),var(--primary-2));color:var(--button-text);font-weight:900}.brand strong,.brand small{display:block}.brand small{color:var(--muted);font-size:12px}.side-nav{display:grid;gap:8px}.side-link{border:1px solid transparent;border-radius:16px;color:var(--muted);font-weight:800;text-decoration:none;padding:12px 14px}.side-link:hover,.side-link:focus,.side-link.active{color:var(--text);background:var(--mini-bg);border-color:var(--line);outline:none}.side-link.accent{color:var(--primary)}
-.workspace,.view-panel,.grid,.panel,.metric,.info-grid div,.form-grid{min-width:0}.topbar{position:sticky;top:18px;z-index:5;border-radius:24px;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;gap:16px;min-width:0}.topbar-actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px;min-width:0}.global-message{min-height:22px;margin:12px 4px 0}.view-panel{display:none;margin-top:12px}.view-panel.active{display:block}
-.featured-panel{outline:2px solid color-mix(in srgb,var(--primary-2) 45%,transparent);outline-offset:3px}
-.eyebrow{margin:0 0 8px;color:var(--primary-2);font-weight:760;text-transform:uppercase;letter-spacing:.14em;font-size:12px}
-h1,h2,h3{margin:0}h1{font-size:clamp(32px,5vw,56px);line-height:1;letter-spacing:-.05em}h2{font-size:24px;letter-spacing:-.03em}h3{font-size:16px}
-.status-pill,button{max-width:100%;border:0;border-radius:999px;background:linear-gradient(135deg,var(--primary),var(--primary-2));color:var(--button-text);font-weight:850;padding:12px 18px;box-shadow:0 12px 32px rgba(158,240,255,.18)}
-button{cursor:pointer;transition:transform .2s,filter .2s}button:hover{transform:translateY(-1px);filter:saturate(1.2)}.ghost-button{background:var(--mini-bg);color:var(--text);border:1px solid var(--line);box-shadow:none}.inline-button{align-self:flex-start;padding:8px 12px;font-size:12px}.compact button{padding:9px 12px;font-size:12px}
-.grid{display:grid;gap:18px;margin-top:18px}.metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.two{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.metric{border-radius:24px;padding:22px}.metric span,.info-grid span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;margin-top:8px;font-size:28px;letter-spacing:-.04em}
-.panel{margin-top:18px;border-radius:32px;padding:24px;overflow:hidden}.panel-title{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:18px;min-width:0}.panel-title>div{min-width:0}.console-panel{margin-top:18px}.info-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.info-grid div{border:1px solid var(--line);border-radius:20px;background:var(--mini-bg);padding:14px}.info-grid strong{display:block;margin-top:6px;font-size:18px;overflow-wrap:anywhere}
-.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.button-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;min-width:0}label{display:flex;flex-direction:column;gap:8px;min-width:0;color:var(--muted);font-size:13px}input,select{width:100%;max-width:100%;border:1px solid var(--line);border-radius:18px;background:var(--field-bg);color:var(--text);padding:12px 14px;outline:none}input:focus,select:focus{border-color:var(--primary-2);box-shadow:0 0 0 3px rgba(158,240,255,.16)}.field-status{min-height:18px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}.hint{color:var(--muted);overflow-wrap:anywhere}pre{max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto;color:var(--pre-text);background:var(--pre-bg);padding:16px;border-radius:18px}.table-wrap{max-width:100%;overflow:auto;overscroll-behavior-inline:contain;-webkit-overflow-scrolling:touch}table{width:100%;min-width:720px;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid var(--row-line);padding:12px;color:var(--muted);font-size:13px;overflow-wrap:anywhere}th{color:var(--text)}
-"""
+# Legacy inline CSS and JS variables removed as modern React Web UI is used instead.
 
-
-RESPONSIVE_CSS = r"""
-@media (min-width: 1440px){
-  .app-shell{grid-template-columns:280px minmax(0,1fr)}.metrics{grid-template-columns:repeat(4,minmax(220px,1fr))}.two{grid-template-columns:minmax(0,1.08fr) minmax(0,.92fr);align-items:start}.form-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.panel{padding:30px}.table-wrap{max-height:420px}.featured-panel .table-wrap{max-height:520px}
-}
-@media (min-width: 1024px) and (max-width: 1439px){
-  .metrics,.info-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.two{grid-template-columns:1fr 1fr}.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
-}
-@media (min-width: 700px) and (max-width: 1023px){
-  .dashboard-root{padding:12px}.app-shell{grid-template-columns:minmax(0,1fr);min-height:auto}.sidebar{position:relative;top:auto;height:auto;border-radius:24px}.side-nav{display:flex;overflow-x:auto}.side-link{flex:0 0 auto}.topbar{top:12px}.metrics,.info-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.two{grid-template-columns:minmax(0,1fr)}.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.panel{padding:24px;border-radius:28px}.panel-title{flex-direction:row;align-items:center}.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}table{min-width:680px}button,input,select{min-height:46px}
-}
-@media (max-width: 699px){
-  body{background:var(--mobile-bg)}.orb-a{width:260px;height:260px;right:-120px;top:20px}.orb-b{width:190px;height:190px;left:-90px;bottom:16%}.dashboard-root{padding:10px}.login-panel{margin:8vh auto 0;padding:20px;border-radius:24px}.app-shell{grid-template-columns:minmax(0,1fr);min-height:auto;gap:12px}.sidebar{position:relative;top:auto;height:auto;border-radius:22px;padding:14px}.brand{display:none}.side-nav{display:flex;overflow-x:auto;gap:8px}.side-link{flex:0 0 auto;padding:10px 12px}.topbar{top:10px;border-radius:22px;align-items:flex-start;flex-direction:column}.topbar-actions{width:100%;justify-content:space-between}.grid{gap:12px;margin-top:12px}.metrics,.two,.form-grid,.info-grid{grid-template-columns:minmax(0,1fr)}.metric{padding:18px;border-radius:22px}.metric strong{font-size:25px}.panel{margin-top:12px;padding:18px;border-radius:22px}.panel-title{flex-direction:column;align-items:stretch}.panel-title button,.button-row button{width:100%}.button-row{align-items:stretch}button,input,select{min-height:48px;font-size:16px}label{font-size:12px}.inline-button{font-size:13px}.hint{font-size:13px}.table-wrap{margin-inline:-8px;padding-inline:8px;overflow-x:auto;-webkit-overflow-scrolling:touch}table{min-width:620px}th,td{padding:10px;font-size:12px}pre{max-height:260px;font-size:12px}.glass{backdrop-filter:blur(14px) saturate(1.15);-webkit-backdrop-filter:blur(14px) saturate(1.15)}
-}
-@media (max-width: 380px){
-  .dashboard-root{padding:7px}.panel,.login-panel{padding:16px;border-radius:20px}.eyebrow{font-size:10px;letter-spacing:.1em}.metric strong{font-size:22px}button,input,select{border-radius:16px}.table-wrap{margin-inline:-5px}table{min-width:560px}
-}
-@media (hover: none) and (pointer: coarse){
-  button:hover{transform:none}button,input,select{min-height:48px}.metric{touch-action:manipulation}
-}
-@media (prefers-reduced-motion: reduce){
-  *,*::before,*::after{scroll-behavior:auto!important;transition:none!important}.orb{filter:blur(8px)}
-}
-"""
-
-
-ADMIN_JS = r"""
-const config = window.__CONFIG__ || {};
-const authRequired = Boolean(window.__AUTH_REQUIRED__);
-function valueFor(section, name){const value=(config[section]||{})[name];return Array.isArray(value)?value.join(','):value ?? ''}
-document.querySelectorAll('[data-section]').forEach(el=>{if(el.dataset.secret==='true')return;el.value=valueFor(el.dataset.section,el.name)});
-const tokenInput = document.getElementById('token');
-const savedToken = sessionStorage.getItem('scifinderRouteAdminToken') || '';
-if(savedToken) tokenInput.value = savedToken;
-function token(){return tokenInput.value.trim()}
-initDashboard();
-let _providers = ((config.integrations||{}).ai_providers||[]).map(p=>({...p}));
-renderProviders();populateProviderSelects();
-function renderProviders(){const el=document.getElementById('aiProviderTable');if(!el)return;el.innerHTML=table(_providers,[{label:'ID',key:'id'},{label:'名称',key:'name'},{label:'格式',key:'format'},{label:'端点',render:r=>esc(r.endpoint||'')},{label:'Key',render:r=>r.api_key?'••••••':'未设置'},{label:'删除',render:(r,i)=>`<button type="button" onclick="removeProvider('${esc(r.id)}')">删除</button>`}])}
-function populateProviderSelects(){document.querySelectorAll('.provider-select').forEach(sel=>{const current=sel.value||valueFor(sel.dataset.section,sel.name);sel.innerHTML='<option value="">(未设置)</option>'+_providers.map(p=>`<option value="${esc(p.id)}"${p.id===current?' selected':''}>${esc(p.name||p.id)} (${esc(p.format)})</option>`).join('')})}
-function addProvider(){const id=document.getElementById('providerIdInput').value.trim();if(!id){alert('供应商 ID 不能为空');return}if(_providers.some(p=>p.id===id)){alert('供应商 ID 已存在');return}const p={id,name:document.getElementById('providerNameInput').value.trim()||id,format:document.getElementById('providerFormatInput').value,endpoint:document.getElementById('providerEndpointInput').value.trim()||null,api_key:document.getElementById('providerApiKeyInput').value.trim()||null};_providers.push(p);renderProviders();populateProviderSelects();document.getElementById('providerIdInput').value='';document.getElementById('providerNameInput').value='';document.getElementById('providerEndpointInput').value='';document.getElementById('providerApiKeyInput').value='';message('已添加供应商 '+id)}
-function removeProvider(id){if(!confirm('确认删除供应商 '+id+' ？'))return;_providers=_providers.filter(p=>p.id!==id);renderProviders();populateProviderSelects();message('已删除供应商 '+id)}
-async function saveProviderConfig(event){event.preventDefault();const payload={integrations:{ai_providers:_providers}};await guarded(async()=>{await post('/api/config',payload);location.reload()})}
-
-function initDashboard(){document.querySelectorAll('[data-view-target]').forEach(link=>link.addEventListener('click',event=>{event.preventDefault();showView(link.dataset.viewTarget)}));if(!authRequired){unlockDashboard();return}if(savedToken){loginAdmin(null,true);return}lockDashboard('请输入管理令牌')}
-function lockDashboard(text){const root=document.getElementById('dashboardRoot');root.classList.remove('unlocked');root.classList.add('locked');const msg=document.getElementById('loginMessage');if(msg)msg.textContent=text||'请输入管理令牌'}
-function unlockDashboard(){const root=document.getElementById('dashboardRoot');root.classList.remove('locked');root.classList.add('unlocked');showView(location.hash.replace('#','')||'overview')}
-async function loginAdmin(event,silent=false){if(event)event.preventDefault();if(authRequired&&!token()){lockDashboard('请输入管理令牌');return}try{await getJson('/api/state');sessionStorage.setItem('scifinderRouteAdminToken',token());unlockDashboard();message('已登录')}catch(err){sessionStorage.removeItem('scifinderRouteAdminToken');if(!silent)alert(authError(err));lockDashboard(authError(err))}}
-function logoutAdmin(){sessionStorage.removeItem('scifinderRouteAdminToken');tokenInput.value='';if(authRequired){lockDashboard('已退出登录')}else{message('本地未启用鉴权')}}
-function showView(name){const target=document.querySelector(`[data-view="${name}"]`)?name:'overview';document.querySelectorAll('.view-panel').forEach(panel=>panel.classList.toggle('active',panel.dataset.view===target));document.querySelectorAll('[data-view-target]').forEach(link=>link.classList.toggle('active',link.dataset.viewTarget===target));const panel=document.querySelector(`[data-view="${target}"]`);const title=document.getElementById('viewTitle');if(title&&panel)title.textContent=panel.dataset.title||target;history.replaceState(null,'','#'+target);window.scrollTo({top:0,behavior:'smooth'})}
-function message(text){const el=document.getElementById('globalMessage');if(el)el.textContent=text}
-function authError(err){const text=String(err && err.message || err);if(text.includes('Invalid or missing admin token'))return '需要管理令牌：请登录后重试';return text}
-function coerce(el){const text=el.value.trim();if(el.dataset.secret==='true'&&!text)return undefined;if(el.dataset.type==='list')return text.split(',').map(v=>v.trim()).filter(Boolean);if(el.type==='number')return text===''?undefined:Number(text);if(el.dataset.type==='bool')return el.value==='true';if(el.tagName==='SELECT')return el.value;return text || null}
-async function parseResponse(res){let data={};try{data=await res.json()}catch(err){data={error:res.statusText}}if(!res.ok||data.error)throw new Error(data.error||res.statusText);return data}
-async function post(url,payload={}){const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Scifinder-Route-Token':token()},body:JSON.stringify(payload)});return parseResponse(res)}
-async function getJson(url){const res=await fetch(url,{headers:{'X-Scifinder-Route-Token':token()}});return parseResponse(res)}
-async function guarded(action){try{return await action()}catch(err){const text=authError(err);message(text);alert(text);throw err}}
-async function refreshState(){await guarded(async()=>{const data=await getJson('/api/state');const health=data.health||{};const cfg=data.config||{};const server=cfg.server||{};const queue=cfg.queue||{};document.getElementById('consoleInfo').innerHTML=`<div><span>健康状态</span><strong>${esc(health.status)}</strong></div><div><span>OCR 积压</span><strong>${esc(health.ocr_backlog)}</strong></div><div><span>存储后端</span><strong>${esc(server.storage_backend)}</strong></div><div><span>队列后端</span><strong>${esc(queue.backend)}</strong></div>`;message('控制台信息已刷新')})}
-async function saveConfig(event){event.preventDefault();const payload={};event.target.querySelectorAll('[data-section]').forEach(el=>{const value=coerce(el);if(value===undefined)return;payload[el.dataset.section] ||= {};payload[el.dataset.section][el.name]=value});await guarded(async()=>{await post('/api/config',payload);location.reload()})}
-async function scanInbox(){await guarded(async()=>{const data=await post('/api/scan',{});alert(`已登记 ${data.registered_count} 个，已跳过 ${data.skipped_count} 个`);location.reload()})}
-async function rebuildVector(){await guarded(async()=>{const data=await post('/api/vector/rebuild',{});alert(JSON.stringify(data,null,2));location.reload()})}
-async function backupDb(){await guarded(async()=>{const data=await post('/api/backup',{});alert(JSON.stringify(data,null,2));location.reload()})}
-async function cleanupDryRun(){await guarded(async()=>{const data=await post('/api/cleanup',{dry_run:true});alert(JSON.stringify(data,null,2))})}
-async function testEndpoint(kind){await guarded(async()=>{const data=await post('/api/integration/test',{kind});alert(JSON.stringify(data,null,2));location.reload()})}
-async function loadModels(kind,datalistId,statusId){const status=document.getElementById(statusId);if(status)status.textContent='正在拉取...';await guarded(async()=>{const data=await post('/api/integration/models',{kind});const list=document.getElementById(datalistId);list.innerHTML=(data.models||[]).map(item=>`<option value="${esc(item)}"></option>`).join('');if(status)status.textContent=(data.models||[]).length?`已拉取 ${data.models.length} 个模型`:(data.detail||'未返回模型，仍可手动填写')})}
-function esc(v){return String(v ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function shortName(v){const text=String(v||'').replaceAll('\\','/');return text.split('/').filter(Boolean).pop()||text}
-function table(rows,cols){if(!rows.length)return '<p class="hint">暂无结果</p>';return '<table><thead><tr>'+cols.map(c=>`<th>${esc(c.label)}</th>`).join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>`<td>${c.render?c.render(r):esc(r[c.key])}</td>`).join('')+'</tr>').join('')+'</tbody></table>'}
-function parseHeaders(){const text=document.getElementById('zoteroHeaders').value.trim();if(!text)return {};try{return JSON.parse(text)}catch(err){throw new Error('请求头 JSON 无效')}}
-async function loadZoteroEndpoints(){await guarded(async()=>{const data=await getJson('/api/zotero/endpoints');document.getElementById('zoteroEndpoints').innerHTML=table(data,[{label:'地址别名',key:'alias'},{label:'文献源组名',key:'group_name'},{label:'地址 URL',key:'url'},{label:'启用',key:'enabled'},{label:'优先级',key:'priority'},{label:'写回笔记',key:'write_note_enabled'},{label:'状态',key:'last_status'},{label:'延迟',key:'last_latency_ms'},{label:'测试',render:r=>`<button onclick="testZoteroEndpoint('${esc(r.id)}')">测试</button>`},{label:'删除',render:r=>`<button onclick="deleteZoteroEndpoint('${esc(r.id)}')">删除</button>`}])})}
-async function saveZoteroEndpoint(){await guarded(async()=>{const payload={alias:document.getElementById('zoteroAlias').value.trim(),group_name:document.getElementById('zoteroGroup').value.trim(),url:document.getElementById('zoteroUrl').value.trim(),priority:Number(document.getElementById('zoteroPriority').value||100),timeout_seconds:Number(document.getElementById('zoteroTimeout').value||10),enabled:document.getElementById('zoteroEnabled').value==='true',write_note_enabled:document.getElementById('zoteroWriteNote').value==='true',headers:parseHeaders()};await post('/api/zotero/endpoints',payload);await loadZoteroEndpoints()})}
-async function testZoteroEndpoint(id){await guarded(async()=>{const data=await post('/api/zotero/endpoints/test',{id});alert(JSON.stringify(data,null,2));await loadZoteroEndpoints()})}
-async function deleteZoteroEndpoint(id){if(!confirm('要从 Web UI 配置中删除该 Zotero 端点吗？'))return;await guarded(async()=>{await post('/api/zotero/endpoints/delete',{id});await loadZoteroEndpoints()})}
-async function loadLiterature(){await guarded(async()=>{const doc=document.getElementById('literatureDocumentId').value.trim();const qs=doc?'?document_id='+encodeURIComponent(doc)+'&limit=50':'?status=candidate&limit=50';const links=await getJson('/api/literature/links'+qs);const jobs=await getJson('/api/literature/jobs?limit=20');document.getElementById('literatureJobs').innerHTML=table(jobs,[{label:'ID',key:'id'},{label:'文档',key:'document_id'},{label:'状态',key:'status'},{label:'阶段',key:'stage'},{label:'错误',key:'error'}]);document.getElementById('literatureLinks').innerHTML=table(links,[{label:'状态',key:'status'},{label:'反应',key:'reaction_step_id'},{label:'端点',key:'endpoint_alias'},{label:'DOI',key:'doi'},{label:'标题',key:'title'},{label:'评分',key:'confidence'},{label:'差异',render:r=>esc(Object.entries(r.field_diff||{}).map(([k,v])=>`${k}:${v.status}`).join(', '))},{label:'确认',render:r=>`<button onclick="confirmLiteratureLink('${esc(r.id)}')">确认</button>`},{label:'拒绝',render:r=>`<button onclick="rejectLiteratureLink('${esc(r.id)}')">拒绝</button>`},{label:'写笔记',render:r=>`<button onclick="writeZoteroNote('${esc(r.id)}')">写入</button>`}])})}
-async function startLiteratureLinking(){await guarded(async()=>{const document_id=document.getElementById('literatureDocumentId').value.trim();const data=await post('/api/literature/jobs/start',{document_id});alert(JSON.stringify(data,null,2));await loadLiterature()})}
-async function confirmLiteratureLink(id){await guarded(async()=>{await post('/api/literature/links/confirm',{id});await loadLiterature()})}
-async function rejectLiteratureLink(id){const reason=prompt('拒绝原因')||'';await guarded(async()=>{await post('/api/literature/links/reject',{id,reason});await loadLiterature()})}
-async function writeZoteroNote(id){await guarded(async()=>{const data=await post('/api/literature/links/write-note',{id});alert(JSON.stringify(data,null,2))})}
-async function installRdkit(){await guarded(async()=>{const data=await post('/api/chem/install-rdkit',{});alert('RDKit 安装任务已启动。成功后请重启服务或容器。\n'+JSON.stringify(data,null,2))})}
-async function runChemSearch(){await guarded(async()=>{const query=document.getElementById('chemQuery').value.trim();const mode=document.getElementById('chemMode').value;let data;if(mode==='text'){data=await getJson('/api/rdf/structures?q='+encodeURIComponent(query)+'&limit=50')}else if(mode==='similarity'){data=(await post('/api/chem/similarity-search',{query,query_type:'smiles',min_similarity:0.2,limit:50})).results}else{data=(await post('/api/chem/substructure-search',{query,query_type:'smarts',limit:50})).results}document.getElementById('chemResults').innerHTML=table(data,[{label:'名称',key:'name'},{label:'角色',key:'role'},{label:'CAS',key:'cas_rn'},{label:'版本',key:'molfile_version'},{label:'评分',render:r=>esc(r.similarity??'')},{label:'反应',render:r=>`<button onclick="showRdfReaction('${esc(r.rdf_reaction_id)}')">打开</button>`},{label:'删除',render:r=>`<button onclick="trashItem('rdf_structure','${esc(r.id)}')">移入回收站</button>`}])})}
-async function loadRdfReactions(){await guarded(async()=>{const query=document.getElementById('rdfQuery').value.trim();const limit=document.getElementById('rdfLimit').value||25;const url='/api/rdf/reactions?limit='+encodeURIComponent(limit)+(query?'&q='+encodeURIComponent(query):'');const data=await getJson(url);document.getElementById('rdfReactions').innerHTML=table(data,[{label:'来源文件',render:r=>esc(shortName(r.source_file_path)||r.source_title||r.source_document_id)},{label:'记录',key:'record_index'},{label:'方案',key:'scheme_id'},{label:'步骤',key:'step_id'},{label:'CAS 反应号',key:'cas_reaction_number'},{label:'收率',key:'yield_text'},{label:'结构数',key:'structure_count'},{label:'打开',render:r=>`<button onclick="showRdfReaction('${esc(r.id)}')">打开</button>`},{label:'删除',render:r=>`<button onclick="trashItem('rdf_reaction','${esc(r.id)}')">移入回收站</button>`}])})}
-function rdfRoleOrder(role){return ['reactant','product','reagent','catalyst','solvent','unknown'].indexOf(role)}
-function structureImage(s){if(!s.image_svg_url)return '<div class="structure-missing">仅元数据<br>无 molfile/SMILES 可渲染</div>';return `<div class="structure-image"><img loading="lazy" alt="${esc(s.display||s.label||s.name||'化学结构')}" src="${esc(s.image_svg_url)}"></div>`}
-function renderStructureCards(structures){if(!structures.length)return '<p class="hint">暂无结构数据</p>';return `<div class="structure-grid">${structures.map(s=>`<article class="structure-card">${structureImage(s)}<h4>${esc(s.role_label_zh||s.role)} ${esc(s.role_index||'')}</h4><dl><dt>名称</dt><dd>${esc(s.name||s.label||'')}</dd><dt>化学式</dt><dd>${esc(s.formula||'')}</dd><dt>CAS RN</dt><dd>${esc(s.cas_rn||'')}</dd><dt>SMILES</dt><dd>${esc(s.smiles||'')}</dd><dt>RDKit</dt><dd>${esc(s.rdkit_status||'')}</dd></dl></article>`).join('')}</div>`}
-function renderRdfDetail(data){const readable=data.readable||{};const zh=readable.zh||{};const structures=(readable.structures||[]).slice().sort((a,b)=>(rdfRoleOrder(a.role)-rdfRoleOrder(b.role))||((a.role_index||0)-(b.role_index||0)));const rows=table(structures,[{label:'角色',render:s=>`${esc(s.role_label_zh||s.role)} ${esc(s.role_index||'')}`},{label:'结构图',render:s=>s.image_svg_url?`<div class="structure-thumb"><img loading="lazy" alt="${esc(s.display||s.label||s.name||'化学结构')}" src="${esc(s.image_svg_url)}"></div>`:'仅元数据'},{label:'名称',render:s=>esc(s.name||s.label)},{label:'化学式',key:'formula'},{label:'CAS RN',key:'cas_rn'},{label:'SMILES',key:'smiles'},{label:'结构',render:s=>s.has_molfile?esc(s.molfile_version||'molfile'):(s.smiles?'SMILES':'仅元数据')},{label:'RDKit',key:'rdkit_status'}]);const warnings=(data.warnings||[]).map(w=>`<li>${esc(w)}</li>`).join('');return `<article class="panel"><h3>中文解读</h3><pre>${esc(zh.text||data.human_readable_text_zh||'暂无中文解读')}</pre><h3>反应式</h3><p>${esc(zh.equation||'')}</p><h3>反应结构图谱</h3>${renderStructureCards(structures)}<h3>结构与化学式</h3>${rows}<h3>参考文献</h3><p>${esc(zh.reference||'')}</p><details><summary>原始 RDF 字段与调试 JSON</summary><pre>${esc(JSON.stringify({id:data.id,fields:data.fields,reference:data.reference,structures:data.structures,warnings:data.warnings},null,2))}</pre></details>${warnings?`<h3>警告</h3><ul>${warnings}</ul>`:''}</article>`}
-async function showRdfReaction(id){await guarded(async()=>{const data=await getJson('/api/rdf/reactions/'+encodeURIComponent(id));document.getElementById('rdfDetail').innerHTML=renderRdfDetail(data)})}
-async function trashItem(entity_type,entity_id){if(!confirm(`要将 ${entity_type} 移入回收站吗？`))return;await guarded(async()=>{await post('/api/trash/delete',{entity_type,entity_id});await loadRdfReactions();const query=document.getElementById('chemQuery').value.trim();if(query)await runChemSearch()})}
-async function loadTrash(){await guarded(async()=>{const data=await getJson('/api/trash?limit=100');document.getElementById('trashList').innerHTML=table(data,[{label:'类型',key:'entity_type'},{label:'ID',key:'id'},{label:'标题',key:'title'},{label:'删除时间',key:'deleted_at'},{label:'还原',render:r=>`<button onclick="restoreTrash('${esc(r.entity_type)}','${esc(r.id)}')">还原</button>`}])})}
-async function restoreTrash(entity_type,entity_id){await guarded(async()=>{await post('/api/trash/restore',{entity_type,entity_id});await loadTrash()})}
-async function emptyTrash(){if(!confirm('要永久删除回收站中的全部项目吗？'))return;await guarded(async()=>{const data=await post('/api/trash/empty',{});alert(JSON.stringify(data,null,2));await loadTrash()})}
-"""
