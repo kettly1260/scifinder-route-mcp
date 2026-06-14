@@ -64,26 +64,20 @@ const pages: Array<{ id: string; path: string; label: string; description: strin
 ];
 
 const configFields: ConfigField[] = [
-  { section: 'integrations', name: 'llm_provider', label: 'LLM 提供商', type: 'select', options: ['openai_compatible', 'openai_chat', 'openai_responses', 'gemini', 'claude'] },
-  { section: 'integrations', name: 'llm_enabled', label: '启用 LLM', type: 'bool' },
-  { section: 'integrations', name: 'llm_api_key', label: 'LLM API Token', type: 'password', secret: true, placeholder: '留空则不变' },
-  { section: 'integrations', name: 'llm_endpoint', label: 'LLM 端点', placeholder: 'https://api.openai.com/v1' },
-  { section: 'integrations', name: 'llm_model', label: 'LLM 模型', placeholder: 'gpt-4o-mini / gemini-2.5-pro' },
-  { section: 'integrations', name: 'embedding_api_key', label: '嵌入 API Token', type: 'password', secret: true, placeholder: '留空则不变' },
-  { section: 'integrations', name: 'embedding_endpoint', label: '嵌入端点', placeholder: 'http://embedding:8000/v1' },
+  { section: 'integrations', name: 'extraction_provider_id', label: 'LLM 供应商 ID' },
+  { section: 'integrations', name: 'extraction_model', label: 'LLM 模型', placeholder: 'gpt-4o-mini / gemini-2.5-pro' },
+
+  { section: 'integrations', name: 'embedding_provider_id', label: '嵌入供应商 ID' },
   { section: 'integrations', name: 'embedding_model', label: '嵌入模型', placeholder: 'bge-m3' },
-  { section: 'integrations', name: 'ocr_provider', label: 'OCR 提供商', type: 'select', options: ['generic', 'mineru', 'paddleocr_vl'] },
-  { section: 'integrations', name: 'ocr_api_key', label: 'OCR API Token', type: 'password', secret: true, placeholder: '留空则不变' },
-  { section: 'integrations', name: 'ocr_endpoint', label: 'OCR 端点' },
+  { section: 'integrations', name: 'ocr_provider_id', label: 'OCR 供应商 ID' },
   { section: 'integrations', name: 'ocr_model', label: 'OCR 模型', placeholder: 'mineru-layout / PaddleOCR-VL-1.6' },
-  { section: 'integrations', name: 'document_parser_api_key', label: '文档解析 API Token', type: 'password', secret: true, placeholder: '留空则不变' },
-  { section: 'integrations', name: 'document_parser_endpoint', label: '文档解析端点' },
+  { section: 'integrations', name: 'document_parser_provider_id', label: '文档解析供应商 ID' },
   { section: 'integrations', name: 'document_parser_model', label: '文档解析模型', placeholder: 'pymupdf / mineru' },
   { section: 'integrations', name: 'document_parser_fallback', label: '解析失败回退', type: 'bool' },
-  { section: 'integrations', name: 'structure_recognition_provider', label: '结构识别提供商', type: 'select', options: ['generic', 'openai_compatible', 'gemini', 'claude'] },
-  { section: 'integrations', name: 'structure_recognition_api_key', label: '结构识别 API Token', type: 'password', secret: true, placeholder: '留空则不变' },
-  { section: 'integrations', name: 'structure_recognition_endpoint', label: '结构识别端点' },
-  { section: 'integrations', name: 'structure_recognition_model', label: '结构识别模型', placeholder: 'decimer / molscribe / osra / gpt-4o' },
+  { section: 'integrations', name: 'structure_recognition_provider_id', label: '结构识别供应商 ID' },
+  { section: 'integrations', name: 'structure_recognition_model', label: '结构识别模型', placeholder: 'decimer / molscribe / osra' },
+  { section: 'integrations', name: 'reranker_provider_id', label: '重排供应商 ID' },
+  { section: 'integrations', name: 'reranker_model', label: '重排模型', placeholder: 'bge-reranker-v2-m3' },
   { section: 'integrations', name: 'postgres_url', label: 'PostgreSQL URL', type: 'password', secret: true, placeholder: '留空则不变' },
   { section: 'server', name: 'max_workers', label: '最大工作线程', type: 'number', min: '1' },
   { section: 'server', name: 'async_jobs', label: '异步任务', type: 'bool' },
@@ -105,11 +99,12 @@ const configFields: ConfigField[] = [
 const configFieldByKey = new Map(configFields.map((field) => [`${field.section}.${field.name}`, field]));
 
 const integrationGroups = [
-  { id: 'llm', eyebrow: 'LLM', title: 'LLM 结构化', description: '用于反应步骤结构化、证据整理和 Zotero 规则之外的补充判断。', fields: ['integrations.llm_provider', 'integrations.llm_enabled', 'integrations.llm_endpoint', 'integrations.llm_model', 'integrations.llm_api_key'], modelKey: 'integrations.llm_model' },
-  { id: 'embedding', eyebrow: 'Embedding', title: '嵌入模型', description: '用于语义召回和向量索引重建，通常需要 OpenAI 兼容 /embeddings 与 /models。', fields: ['integrations.embedding_endpoint', 'integrations.embedding_model', 'integrations.embedding_api_key'], modelKey: 'integrations.embedding_model' },
-  { id: 'ocr', eyebrow: 'OCR', title: 'OCR 识别', description: '用于扫描件和页面视觉证据抽取；不同提供商的端点形态可能不同。', fields: ['integrations.ocr_provider', 'integrations.ocr_endpoint', 'integrations.ocr_model', 'integrations.ocr_api_key'], modelKey: 'integrations.ocr_model' },
-  { id: 'document_parser', eyebrow: 'Parser', title: '文档解析', description: '用于 PDF/RTF/HTML 正文解析和失败回退策略。', fields: ['integrations.document_parser_endpoint', 'integrations.document_parser_model', 'integrations.document_parser_api_key', 'integrations.document_parser_fallback'], modelKey: 'integrations.document_parser_model' },
-  { id: 'structure_recognition', eyebrow: 'Structure', title: '结构识别', description: '用于图片结构识别和结构敏感证据补充。', fields: ['integrations.structure_recognition_provider', 'integrations.structure_recognition_endpoint', 'integrations.structure_recognition_model', 'integrations.structure_recognition_api_key'], modelKey: 'integrations.structure_recognition_model' }
+  { id: 'extraction', eyebrow: 'LLM', title: 'LLM 结构化', description: '用于反应步骤结构化、证据整理等。', fields: ['integrations.extraction_provider_id', 'integrations.extraction_model'], modelKey: 'integrations.extraction_model', providerKey: 'integrations.extraction_provider_id' },
+  { id: 'embedding', eyebrow: 'Embedding', title: '嵌入模型', description: '用于语义召回和向量索引重建。', fields: ['integrations.embedding_provider_id', 'integrations.embedding_model'], modelKey: 'integrations.embedding_model', providerKey: 'integrations.embedding_provider_id' },
+  { id: 'ocr', eyebrow: 'OCR', title: 'OCR 识别', description: '用于扫描件和页面视觉证据抽取。', fields: ['integrations.ocr_provider_id', 'integrations.ocr_model'], modelKey: 'integrations.ocr_model', providerKey: 'integrations.ocr_provider_id' },
+  { id: 'document_parser', eyebrow: 'Parser', title: '文档解析', description: '用于 PDF/RTF/HTML 正文解析和失败回退策略。', fields: ['integrations.document_parser_provider_id', 'integrations.document_parser_model', 'integrations.document_parser_fallback'], modelKey: 'integrations.document_parser_model', providerKey: 'integrations.document_parser_provider_id' },
+  { id: 'structure_recognition', eyebrow: 'Structure', title: '结构识别', description: '用于图片结构识别和结构敏感证据补充。', fields: ['integrations.structure_recognition_provider_id', 'integrations.structure_recognition_model'], modelKey: 'integrations.structure_recognition_model', providerKey: 'integrations.structure_recognition_provider_id' },
+  { id: 'reranker', eyebrow: 'Reranker', title: '重排模型', description: '用于提升搜索召回结果的排序质量。', fields: ['integrations.reranker_provider_id', 'integrations.reranker_model'], modelKey: 'integrations.reranker_model', providerKey: 'integrations.reranker_provider_id' }
 ] as const;
 
 const runtimeGroups = [
@@ -685,6 +680,10 @@ function DocumentDetailPage({ token, guarded }: Pick<PageProps, 'token' | 'guard
 
 function ConfigPage({ token, state, guarded, refresh }: PageProps & { refresh: () => Promise<AdminState> }) {
   const [values, setValues] = useState<Record<string, string>>(() => buildConfigValues(state.config));
+  const [providers, setProviders] = useState<JsonObject[]>(() => {
+    const p = (state.config.integrations as JsonObject | undefined)?.ai_providers;
+    return Array.isArray(p) ? p as JsonObject[] : [];
+  });
   const [models, setModels] = useState<Record<string, string[]>>({});
   const [actionResults, setActionResults] = useState<Record<string, JsonObject>>({});
 
@@ -704,6 +703,8 @@ function ConfigPage({ token, state, guarded, refresh }: PageProps & { refresh: (
       else if (field.type === 'bool') section[field.name] = raw === 'true';
       else section[field.name] = raw || null;
     }
+    const integrations = (payload.integrations ||= {}) as JsonObject;
+    integrations.ai_providers = providers;
     return payload;
   }
 
@@ -712,6 +713,8 @@ function ConfigPage({ token, state, guarded, refresh }: PageProps & { refresh: (
     await postJson('/api/config', token, payload);
     const next = await refresh();
     setValues(buildConfigValues(next.config));
+    const p = (next.config.integrations as JsonObject | undefined)?.ai_providers;
+    setProviders(Array.isArray(p) ? p as JsonObject[] : []);
   }
 
   function rememberResult(key: string, data: JsonObject) {
@@ -748,7 +751,11 @@ function ConfigPage({ token, state, guarded, refresh }: PageProps & { refresh: (
       </section>
 
       <section className="config-section">
-        <div className="section-heading"><p className="eyebrow">Model Providers</p><h2>模型与外部能力</h2></div>
+        <AiProvidersPanel providers={providers} setProviders={setProviders} />
+      </section>
+
+      <section className="config-section">
+        <div className="section-heading"><p className="eyebrow">Model Providers</p><h2>功能路由配置</h2></div>
         <div className="config-grid">
           {integrationGroups.map((group) => (
             <ConfigIntegrationCard
@@ -756,6 +763,7 @@ function ConfigPage({ token, state, guarded, refresh }: PageProps & { refresh: (
               group={group}
               values={values}
               models={models[group.id] || []}
+              providers={providers}
               testResult={actionResults[group.id]}
               modelResult={actionResults[`${group.id}:models`]}
               onChange={update}
@@ -788,12 +796,13 @@ function ConfigPage({ token, state, guarded, refresh }: PageProps & { refresh: (
 }
 
 type ConfigGroup = { eyebrow: string; title: string; fields: readonly string[] };
-type IntegrationGroup = ConfigGroup & { id: string; description: string; modelKey: string };
+type IntegrationGroup = ConfigGroup & { id: string; description: string; modelKey: string; providerKey: string };
 
 function ConfigIntegrationCard({
   group,
   values,
   models,
+  providers,
   testResult,
   modelResult,
   onChange,
@@ -803,6 +812,7 @@ function ConfigIntegrationCard({
   group: IntegrationGroup;
   values: Record<string, string>;
   models: string[];
+  providers?: JsonObject[];
   testResult?: JsonObject;
   modelResult?: JsonObject;
   onChange: (key: string, value: string) => void;
@@ -816,7 +826,7 @@ function ConfigIntegrationCard({
         {group.fields.map((key) => {
           const field = configFieldByKey.get(key);
           if (!field) return null;
-          return <ConfigControl key={key} field={field} value={values[key] ?? ''} onChange={onChange} suggestions={key === group.modelKey ? models : undefined} />;
+          return <ConfigControl key={key} field={field} value={values[key] ?? ''} onChange={onChange} suggestions={key === group.modelKey ? models : undefined} providers={providers} />;
         })}
       </div>
       <ModelSuggestions models={models} modelKey={group.modelKey} onChange={onChange} />
@@ -1202,8 +1212,21 @@ function buildConfigValues(config: JsonObject): Record<string, string> {
   return values;
 }
 
-function ConfigControl({ field, value, onChange, suggestions }: { field: ConfigField; value: string; onChange: (key: string, value: string) => void; suggestions?: string[] }) {
+function ConfigControl({ field, value, onChange, suggestions, providers }: { field: ConfigField; value: string; onChange: (key: string, value: string) => void; suggestions?: string[]; providers?: JsonObject[] }) {
   const key = `${field.section}.${field.name}`;
+  if (field.name.endsWith('provider_id') && providers) {
+    return (
+      <label className="form-group">
+        {field.label}
+        <select value={value} onChange={(event) => onChange(key, event.target.value)}>
+          <option value="">(空 - 不使用)</option>
+          {providers.map((p) => (
+            <option key={String(p.id)} value={String(p.id)}>{String(p.name)} ({String(p.id)})</option>
+          ))}
+        </select>
+      </label>
+    );
+  }
   if (field.type === 'select') {
     return <label className="form-group">{field.label}<select value={value} onChange={(event) => onChange(key, event.target.value)}>{(field.options || []).map((option) => <option key={option} value={option}>{option}</option>)}</select></label>;
   }
@@ -1216,5 +1239,86 @@ function ConfigControl({ field, value, onChange, suggestions }: { field: ConfigF
       <Input label={field.label} type={field.type === 'password' ? 'password' : field.type === 'number' ? 'number' : 'text'} value={value} onChange={(event) => onChange(key, event.target.value)} placeholder={field.placeholder} min={field.min} max={field.max} step={field.step} list={listId} />
       {listId && <datalist id={listId}>{suggestions?.map((item) => <option key={item} value={item} />)}</datalist>}
     </>
+  );
+}
+
+function AiProvidersPanel({ providers, setProviders }: { providers: JsonObject[]; setProviders: (p: JsonObject[]) => void }) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [form, setForm] = useState<JsonObject>({ id: '', name: '', format: 'openai_chat', endpoint: '', api_key: '' });
+
+  function handleSave() {
+    if (!form.id) return;
+    const newProviders = [...providers];
+    const index = newProviders.findIndex((p) => p.id === form.id);
+    if (index >= 0 && editingId) {
+      newProviders[index] = { ...form };
+    } else {
+      newProviders.push({ ...form });
+    }
+    setProviders(newProviders);
+    setEditingId(null);
+    setForm({ id: '', name: '', format: 'openai_chat', endpoint: '', api_key: '' });
+  }
+
+  function handleEdit(p: JsonObject) {
+    setEditingId(String(p.id));
+    setForm({ ...p });
+  }
+
+  function handleDelete(id: string) {
+    if (!window.confirm(`删除供应商 ${id}？这只会影响尚未保存的配置。`)) return;
+    setProviders(providers.filter((p) => p.id !== id));
+    if (editingId === id) {
+      setEditingId(null);
+      setForm({ id: '', name: '', format: 'openai_chat', endpoint: '', api_key: '' });
+    }
+  }
+
+  return (
+    <Card eyebrow="Providers" title="AI 供应商管理">
+      <p className="muted">维护所有大模型、OCR、嵌入等底层服务的供应商。添加后可供下方各功能选择绑定。</p>
+      <div className="form-grid">
+        <Input label="唯一标识 ID" value={String(form.id || '')} onChange={(e) => setForm({ ...form, id: e.target.value })} placeholder="如 my-openai" disabled={!!editingId} />
+        <Input label="显示名称" value={String(form.name || '')} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="如 OpenAI GPT-4" />
+        <label className="form-group">
+          API 格式
+          <select value={String(form.format || 'openai_chat')} onChange={(e) => setForm({ ...form, format: e.target.value })}>
+            <option value="openai_chat">OpenAI Chat</option>
+            <option value="openai_responses">OpenAI Structured</option>
+            <option value="openai_compatible">OpenAI Compatible</option>
+            <option value="gemini">Gemini</option>
+            <option value="claude">Claude</option>
+            <option value="generic">Generic (Base URL only)</option>
+            <option value="mineru">MinerU</option>
+            <option value="paddleocr_vl">PaddleOCR-VL</option>
+          </select>
+        </label>
+        <Input label="API 端点 (Base URL)" value={String(form.endpoint || '')} onChange={(e) => setForm({ ...form, endpoint: e.target.value })} placeholder="如 https://api.openai.com/v1" />
+        <Input label="API Token" type="password" value={String(form.api_key || '')} onChange={(e) => setForm({ ...form, api_key: e.target.value })} placeholder="（可选）" />
+        <div style={{ alignSelf: 'end', display: 'flex', gap: '8px' }}>
+          <Button onClick={handleSave}>{editingId ? '更新' : '添加'}</Button>
+          {editingId && <Button variant="ghost" onClick={() => { setEditingId(null); setForm({ id: '', name: '', format: 'openai_chat', endpoint: '', api_key: '' }); }}>取消</Button>}
+        </div>
+      </div>
+      {providers.length > 0 && (
+        <div style={{ marginTop: '16px' }}>
+          <DataTable
+            rows={providers}
+            columns={[
+              { key: 'id', label: 'ID' },
+              { key: 'name', label: '名称' },
+              { key: 'format', label: '格式' },
+              { key: 'endpoint', label: '端点' },
+              { key: 'actions', label: '操作', render: (row) => (
+                <div className="button-row">
+                  <Button size="sm" variant="ghost" onClick={() => handleEdit(row)}>编辑</Button>
+                  <Button size="sm" variant="danger" onClick={() => handleDelete(String(row.id))}>删除</Button>
+                </div>
+              )}
+            ]}
+          />
+        </div>
+      )}
+    </Card>
   );
 }
