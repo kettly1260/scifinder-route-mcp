@@ -17,3 +17,5 @@ build/
 *.egg-info/
 node_modules/
 webui/node_modules/
+session-*.md
+
