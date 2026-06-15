@@ -361,9 +361,21 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._send_json(self.server.service.get_provider_enabled_models(str(payload.get("id") or "")))
                 return
         except PermissionError as exc:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 0:
+                    self.rfile.read(length)
+            except Exception:
+                pass
             self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             return
         except Exception as exc:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 0:
+                    self.rfile.read(length)
+            except Exception:
+                pass
             self._send_error_json(exc)
             return
         self.send_error(HTTPStatus.NOT_FOUND)

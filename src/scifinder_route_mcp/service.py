@@ -52,7 +52,14 @@ class RouteService:
         self.config = config or AppConfig.from_env()
         self.config.ensure_directories()
         self.storage_backend_status = self._resolve_storage_backend_status()
-        self.storage = storage or RouteStorage(self.config.database_path)
+        if storage:
+            self.storage = storage
+        elif self.config.storage_backend == "postgres":
+            if not self.config.postgres_url:
+                raise ValueError("Integrations.postgres_url is required when server.storage_backend is postgres")
+            self.storage = RouteStorage(self.config.postgres_url)
+        else:
+            self.storage = RouteStorage(self.config.database_path)
         self._migrate_legacy_providers()
         self._stop_event = threading.Event()
         self._workers: list[threading.Thread] = []

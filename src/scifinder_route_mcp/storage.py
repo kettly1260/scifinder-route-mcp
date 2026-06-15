@@ -7,7 +7,15 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Generator
+from contextlib import contextmanager
+
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker, Session
+from .orm import (
+    Base, AiProviderModel, SourceDocumentModel, ParseJobModel,
+    ReactionStepModel, ProvenanceModel, ParsedChunkModel
+)
 
 from .models import Compound, ParseJob, Provenance, ReactionStep, SourceDocument, AiProvider
 
@@ -21,445 +29,132 @@ def new_id(prefix: str) -> str:
 
 
 def is_sqlite_locked_error(exc: BaseException) -> bool:
-    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+    from sqlalchemy.exc import DBAPIError
+    orig = exc
+    if isinstance(exc, DBAPIError) and exc.orig is not None:
+        orig = exc.orig
+    return isinstance(orig, sqlite3.OperationalError) and "locked" in str(orig).lower()
+
 
 
 class RouteStorage:
-    def __init__(self, database_path: Path | str):
-        self.database_path = Path(database_path)
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_uri_or_path: Path | str):
+        db_str = str(db_uri_or_path).strip()
+        if db_str.startswith(("postgresql://", "postgres://")):
+            self.database_path = None
+            self.engine = create_engine(db_str)
+        else:
+            self.database_path = Path(db_uri_or_path)
+            self.database_path.parent.mkdir(parents=True, exist_ok=True)
+            self.engine = create_engine(
+                f"sqlite:///{self.database_path}",
+                connect_args={"timeout": 30}
+            )
+            
+            @event.listens_for(self.engine, "connect")
+            def set_sqlite_pragma(dbapi_connection, connection_record):
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute("PRAGMA busy_timeout=30000")
+                cursor.close()
+                
+        self._SessionFactory = sessionmaker(bind=self.engine, expire_on_commit=False)
         self.init_schema()
 
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.database_path, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+    @contextmanager
+    def session(self) -> Generator[Session, None, None]:
+        s = self._SessionFactory()
+        try:
+            yield s
+            s.commit()
+        except Exception:
+            s.rollback()
+            raise
+        finally:
+            s.close()
 
     def init_schema(self) -> None:
-        with self.connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS source_document (
-                    id TEXT PRIMARY KEY,
-                    file_path TEXT NOT NULL,
-                    file_hash TEXT NOT NULL,
-                    file_type TEXT NOT NULL,
-                    title TEXT,
-                    doi TEXT,
-                    scifinder_metadata TEXT NOT NULL DEFAULT '{}',
-                    ingest_status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(file_hash, file_path)
-                );
+        Base.metadata.create_all(self.engine)
+        if self.engine.dialect.name == "sqlite" and self.database_path:
+            import sqlite3
+            try:
+                conn = sqlite3.connect(self.database_path)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys = ON")
+                self._migrate_schema(conn)
+                conn.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS reaction_step_fts USING fts5(
+                        reaction_step_id,
+                        content
+                    );
+                    """
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
 
-                CREATE TABLE IF NOT EXISTS parse_job (
-                    id TEXT PRIMARY KEY,
-                    document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
-                    status TEXT NOT NULL,
-                    stage TEXT NOT NULL,
-                    error TEXT,
-                    started_at TEXT,
-                    finished_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS reaction_step (
-                    id TEXT PRIMARY KEY,
-                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
-                    step_index INTEGER NOT NULL,
-                    reaction_name TEXT,
-                    substrate_text TEXT,
-                    product_text TEXT,
-                    reagent_text TEXT,
-                    catalyst_text TEXT,
-                    solvent_text TEXT,
-                    temperature TEXT,
-                    time TEXT,
-                    atmosphere TEXT,
-                    yield_text TEXT,
-                    scale TEXT,
-                    workup TEXT,
-                    purification TEXT,
-                    original_text TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    verification_status TEXT NOT NULL,
-                    needs_ocr INTEGER NOT NULL DEFAULT 0,
-                    extraction_method TEXT NOT NULL DEFAULT 'rules',
-                    schema_version TEXT NOT NULL DEFAULT 'reaction_step.v1',
-                    llm_confidence REAL,
-                    metadata TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS provenance (
-                    id TEXT PRIMARY KEY,
-                    reaction_step_id TEXT NOT NULL REFERENCES reaction_step(id) ON DELETE CASCADE,
-                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
-                    page_number INTEGER,
-                    text_span TEXT NOT NULL,
-                    image_region_path TEXT,
-                    ocr_output TEXT,
-                    parser_name TEXT NOT NULL,
-                    parser_version TEXT NOT NULL,
-                    confidence REAL NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS parsed_chunk (
-                    id TEXT PRIMARY KEY,
-                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
-                    chunk_index INTEGER NOT NULL,
-                    page_number INTEGER,
-                    text TEXT NOT NULL,
-                    parser_name TEXT NOT NULL,
-                    parser_version TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(source_document_id, chunk_index)
-                );
-
-                CREATE TABLE IF NOT EXISTS export_batch (
-                    id TEXT PRIMARY KEY,
-                    title TEXT,
-                    export_timestamp TEXT,
-                    status TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    merge_method TEXT NOT NULL,
-                    explanation TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS export_batch_document (
-                    id TEXT PRIMARY KEY,
-                    batch_id TEXT NOT NULL REFERENCES export_batch(id) ON DELETE CASCADE,
-                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
-                    role TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    explanation TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL,
-                    UNIQUE(batch_id, source_document_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS export_batch_candidate (
-                    id TEXT PRIMARY KEY,
-                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
-                    candidate_batch_id TEXT NOT NULL REFERENCES export_batch(id) ON DELETE CASCADE,
-                    confidence REAL NOT NULL,
-                    explanation TEXT NOT NULL DEFAULT '{}',
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS ai_provider (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    format TEXT NOT NULL,
-                    endpoint TEXT,
-                    api_key TEXT,
-                    models_endpoint TEXT,
-                    available_models TEXT NOT NULL DEFAULT '[]',
-                    enabled_models TEXT NOT NULL DEFAULT '[]',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS doi_verification (
-                    id TEXT PRIMARY KEY,
-                    reaction_step_id TEXT NOT NULL REFERENCES reaction_step(id) ON DELETE CASCADE,
-                    doi TEXT NOT NULL,
-                    paper_title TEXT,
-                    verified_fields TEXT NOT NULL,
-                    original_paper_excerpt TEXT,
-                    verification_confidence REAL NOT NULL,
-                    verifier_agent TEXT,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE VIRTUAL TABLE IF NOT EXISTS reaction_step_fts USING fts5(
-                    reaction_step_id UNINDEXED,
-                    content
-                );
-
-                CREATE TABLE IF NOT EXISTS vector_index (
-                    reaction_step_id TEXT PRIMARY KEY REFERENCES reaction_step(id) ON DELETE CASCADE,
-                    model TEXT NOT NULL,
-                    embedding TEXT NOT NULL,
-                    dimensions INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    error TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS integration_status (
-                    kind TEXT PRIMARY KEY,
-                    configured INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    detail TEXT,
-                    checked_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS zotero_mcp_endpoint (
-                    id TEXT PRIMARY KEY,
-                    alias TEXT NOT NULL,
-                    group_name TEXT NOT NULL,
-                    url TEXT NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    priority INTEGER NOT NULL DEFAULT 100,
-                    timeout_seconds REAL NOT NULL DEFAULT 10,
-                    headers TEXT NOT NULL DEFAULT '{}',
-                    write_note_enabled INTEGER NOT NULL DEFAULT 0,
-                    last_status TEXT,
-                    last_latency_ms INTEGER,
-                    last_error TEXT,
-                    last_checked_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(alias)
-                );
-
-                CREATE TABLE IF NOT EXISTS literature_link_job (
-                    id TEXT PRIMARY KEY,
-                    document_id TEXT REFERENCES source_document(id) ON DELETE CASCADE,
-                    status TEXT NOT NULL,
-                    stage TEXT NOT NULL,
-                    error TEXT,
-                    started_at TEXT,
-                    finished_at TEXT,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS zotero_literature_link (
-                    id TEXT PRIMARY KEY,
-                    reaction_step_id TEXT NOT NULL REFERENCES reaction_step(id) ON DELETE CASCADE,
-                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
-                    endpoint_id TEXT,
-                    endpoint_alias TEXT,
-                    endpoint_group TEXT,
-                    zotero_item_key TEXT NOT NULL,
-                    zotero_attachment_key TEXT,
-                    doi TEXT,
-                    title TEXT,
-                    authors TEXT NOT NULL DEFAULT '[]',
-                    year TEXT,
-                    abstract TEXT,
-                    source_kind TEXT NOT NULL DEFAULT 'zotero',
-                    status TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    match_signals TEXT NOT NULL DEFAULT '{}',
-                    method_excerpt TEXT,
-                    si_excerpt TEXT,
-                    extracted_fields TEXT NOT NULL DEFAULT '{}',
-                    field_diff TEXT NOT NULL DEFAULT '{}',
-                    user_note TEXT,
-                    confirmed_by TEXT,
-                    confirmed_at TEXT,
-                    rejected_reason TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(reaction_step_id, endpoint_group, zotero_item_key)
-                );
-
-                CREATE TABLE IF NOT EXISTS zotero_writeback_log (
-                    id TEXT PRIMARY KEY,
-                    literature_link_id TEXT NOT NULL REFERENCES zotero_literature_link(id) ON DELETE CASCADE,
-                    endpoint_id TEXT,
-                    zotero_item_key TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    payload TEXT NOT NULL DEFAULT '{}',
-                    status TEXT NOT NULL,
-                    error TEXT,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS evaluation_metric (
-                    id TEXT PRIMARY KEY,
-                    gold_set_path TEXT NOT NULL,
-                    metrics TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS compound (
-                    id TEXT PRIMARY KEY,
-                    primary_name TEXT NOT NULL,
-                    cas TEXT,
-                    smiles TEXT,
-                    canonical_smiles TEXT,
-                    inchikey TEXT,
-                    fingerprint TEXT,
-                    source TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS compound_alias (
-                    id TEXT PRIMARY KEY,
-                    compound_id TEXT NOT NULL REFERENCES compound(id) ON DELETE CASCADE,
-                    alias TEXT NOT NULL,
-                    alias_type TEXT NOT NULL,
-                    UNIQUE(compound_id, alias, alias_type)
-                );
-
-                CREATE TABLE IF NOT EXISTS reaction_compound_role (
-                    id TEXT PRIMARY KEY,
-                    reaction_step_id TEXT NOT NULL REFERENCES reaction_step(id) ON DELETE CASCADE,
-                    compound_id TEXT NOT NULL REFERENCES compound(id) ON DELETE CASCADE,
-                    role TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    source TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS rdf_reaction_record (
-                    id TEXT PRIMARY KEY,
-                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
-                    record_index INTEGER NOT NULL,
-                    registry TEXT,
-                    scheme_id TEXT,
-                    step_id TEXT,
-                    reactant_count INTEGER NOT NULL DEFAULT 0,
-                    product_count INTEGER NOT NULL DEFAULT 0,
-                    cas_reaction_number TEXT,
-                    yield_text TEXT,
-                    reagents TEXT NOT NULL DEFAULT '[]',
-                    catalysts TEXT NOT NULL DEFAULT '[]',
-                    solvents TEXT NOT NULL DEFAULT '[]',
-                    reference TEXT NOT NULL DEFAULT '{}',
-                    experimental_procedure TEXT,
-                    fields TEXT NOT NULL DEFAULT '{}',
-                    warnings TEXT NOT NULL DEFAULT '[]',
-                    deleted_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(source_document_id, record_index)
-                );
-
-                CREATE TABLE IF NOT EXISTS rdf_structure (
-                    id TEXT PRIMARY KEY,
-                    rdf_reaction_id TEXT NOT NULL REFERENCES rdf_reaction_record(id) ON DELETE CASCADE,
-                    source_document_id TEXT NOT NULL REFERENCES source_document(id) ON DELETE CASCADE,
-                    role TEXT NOT NULL,
-                    role_index INTEGER NOT NULL,
-                    name TEXT,
-                    formula TEXT,
-                    cas_rn TEXT,
-                    molfile TEXT,
-                    molfile_version TEXT,
-                    smiles TEXT,
-                    inchikey TEXT,
-                    fingerprint TEXT,
-                    rdkit_status TEXT NOT NULL DEFAULT 'not_indexed',
-                    rdkit_error TEXT,
-                    warnings TEXT NOT NULL DEFAULT '[]',
-                    deleted_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_parsed_chunk_document_index
-                ON parsed_chunk(source_document_id, chunk_index);
-                """
-            )
-            self._migrate_schema(conn)
-            
-            # Initialize default Zotero endpoint if empty
-            count = conn.execute("SELECT COUNT(*) FROM zotero_mcp_endpoint").fetchone()[0]
+        # Initialize default Zotero endpoint if empty
+        from .orm import ZoteroMcpEndpointModel
+        from sqlalchemy import select, func
+        with self.session() as s:
+            count = s.scalar(select(func.count(ZoteroMcpEndpointModel.id))) or 0
             if count == 0:
-                conn.execute("""
-                    INSERT INTO zotero_mcp_endpoint (id, alias, group_name, url, enabled, priority, timeout_seconds, headers, write_note_enabled, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    "local-zotero",
-                    "Local Zotero",
-                    "local",
-                    "http://127.0.0.1:23120/mcp",
-                    1,
-                    100,
-                    10.0,
-                    "{}",
-                    1,
-                    utc_now(),
-                    utc_now(),
-                ))
+                now = utc_now()
+                ep = ZoteroMcpEndpointModel(
+                    id="local-zotero",
+                    alias="Local Zotero",
+                    group_name="local",
+                    url="http://127.0.0.1:23120/mcp",
+                    enabled=1,
+                    priority=100,
+                    timeout_seconds=10.0,
+                    headers={},
+                    write_note_enabled=1,
+                    created_at=now,
+                    updated_at=now
+                )
+                s.add(ep)
+                s.commit()
 
     # --- AI Providers ---
+    def list_ai_providers(self) -> list[AiProviderModel]:
+        from sqlalchemy import select
+        with self.session() as s:
+            return list(s.scalars(select(AiProviderModel).order_by(AiProviderModel.created_at.asc())).all())
 
-    def list_ai_providers(self) -> list[AiProvider]:
-        with self.connect() as conn:
-            rows = conn.execute("""
-                SELECT id, name, format, endpoint, api_key, models_endpoint, available_models, enabled_models
-                FROM ai_provider
-                ORDER BY created_at ASC
-            """).fetchall()
-        
-        providers = []
-        for row in rows:
-            providers.append(AiProvider(
-                id=row['id'],
-                name=row['name'],
-                format=row['format'],
-                endpoint=row['endpoint'],
-                api_key=row['api_key'],
-                models_endpoint=row['models_endpoint'],
-                available_models=tuple(json.loads(row['available_models'])),
-                enabled_models=tuple(json.loads(row['enabled_models'])),
-            ))
-        return providers
+    def get_ai_provider(self, provider_id: str) -> AiProviderModel | None:
+        with self.session() as s:
+            return s.get(AiProviderModel, provider_id)
 
-    def get_ai_provider(self, provider_id: str) -> AiProvider | None:
-        with self.connect() as conn:
-            row = conn.execute("""
-                SELECT id, name, format, endpoint, api_key, models_endpoint, available_models, enabled_models
-                FROM ai_provider WHERE id = ?
-            """, (provider_id,)).fetchone()
-        
-        if not row:
-            return None
-        return AiProvider(
-            id=row['id'],
-            name=row['name'],
-            format=row['format'],
-            endpoint=row['endpoint'],
-            api_key=row['api_key'],
-            models_endpoint=row['models_endpoint'],
-            available_models=tuple(json.loads(row['available_models'])),
-            enabled_models=tuple(json.loads(row['enabled_models'])),
-        )
-
-    def upsert_ai_provider(self, provider: AiProvider) -> None:
+    def upsert_ai_provider(self, provider: Any) -> None:
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute("""
-                INSERT INTO ai_provider (id, name, format, endpoint, api_key, models_endpoint, available_models, enabled_models, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    format = excluded.format,
-                    endpoint = excluded.endpoint,
-                    api_key = excluded.api_key,
-                    models_endpoint = excluded.models_endpoint,
-                    available_models = excluded.available_models,
-                    enabled_models = excluded.enabled_models,
-                    updated_at = excluded.updated_at
-            """, (
-                provider.id,
-                provider.name,
-                provider.format,
-                provider.endpoint,
-                provider.api_key,
-                provider.models_endpoint,
-                json.dumps(provider.available_models),
-                json.dumps(provider.enabled_models),
-                now, now
-            ))
+        with self.session() as s:
+            db_provider = s.get(AiProviderModel, provider.id)
+            if not db_provider:
+                db_provider = AiProviderModel(
+                    id=provider.id,
+                    created_at=now
+                )
+                s.add(db_provider)
+            db_provider.name = provider.name
+            db_provider.format = provider.format
+            db_provider.endpoint = provider.endpoint
+            db_provider.api_key = provider.api_key
+            db_provider.models_endpoint = provider.models_endpoint
+            db_provider.available_models = list(provider.available_models)
+            db_provider.enabled_models = list(provider.enabled_models)
+            db_provider.updated_at = now
 
     def delete_ai_provider(self, provider_id: str) -> bool:
-        with self.connect() as conn:
-            cur = conn.execute("DELETE FROM ai_provider WHERE id = ?", (provider_id,))
-            return cur.rowcount > 0
-
-
-    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        from sqlalchemy import delete
+        with self.session() as s:
+            res = s.execute(delete(AiProviderModel).where(AiProviderModel.id == provider_id))
+            return res.rowcount > 0
+    def _migrate_schema(self, conn) -> None:
+        if self.engine.dialect.name != "sqlite":
+            return
         reaction_columns = {row["name"] for row in conn.execute("PRAGMA table_info(reaction_step)")}
         reaction_migrations = {
             "extraction_method": "ALTER TABLE reaction_step ADD COLUMN extraction_method TEXT NOT NULL DEFAULT 'rules'",
@@ -482,51 +177,77 @@ class RouteStorage:
     def recover_interrupted_jobs(self, *, mode: str = "queued") -> int:
         status = "queued" if mode == "queued" else "failed"
         error = None if status == "queued" else "Job was interrupted by service shutdown"
-        with self.connect() as conn:
-            rows = conn.execute("SELECT id FROM parse_job WHERE status = 'running'").fetchall()
-            for row in rows:
-                conn.execute(
-                    "UPDATE parse_job SET status = ?, stage = ?, error = ?, finished_at = NULL WHERE id = ?",
-                    (status, "queued" if status == "queued" else "failed", error, row["id"]),
-                )
-            return len(rows)
+        with self.session() as s:
+            from sqlalchemy import select
+            stmt = select(ParseJobModel).where(ParseJobModel.status == "running")
+            jobs = s.scalars(stmt).all()
+            for job in jobs:
+                job.status = status
+                job.stage = "queued" if status == "queued" else "failed"
+                job.error = error
+                job.finished_at = None
+            s.commit()
+            return len(jobs)
 
-    def claim_next_job(self) -> ParseJob | None:
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT * FROM parse_job WHERE status = 'queued' ORDER BY COALESCE(started_at, ''), id LIMIT 1"
-            ).fetchone()
-            if not row:
-                conn.commit()
-                return None
-            conn.execute(
-                "UPDATE parse_job SET status = 'running', stage = 'document_parse', error = NULL, started_at = ?, finished_at = NULL WHERE id = ?",
-                (utc_now(), row["id"]),
-            )
-            conn.commit()
-            claimed = conn.execute("SELECT * FROM parse_job WHERE id = ?", (row["id"],)).fetchone()
-        return self._job_from_row(claimed)
+    def claim_next_job(self) -> ParseJobModel | None:
+        from sqlalchemy import select, func, text
+        if self.engine.dialect.name == "sqlite":
+            with self.session() as s:
+                s.execute(text("BEGIN IMMEDIATE"))
+                stmt = select(ParseJobModel).where(ParseJobModel.status == "queued").order_by(
+                    func.coalesce(ParseJobModel.started_at, "").asc(),
+                    ParseJobModel.id.asc()
+                ).limit(1)
+                job = s.scalars(stmt).first()
+                if not job:
+                    return None
+                job.status = "running"
+                job.stage = "document_parse"
+                job.error = None
+                job.started_at = utc_now()
+                job.finished_at = None
+                s.commit()
+                return job
+        else:
+            with self.session() as s:
+                stmt = select(ParseJobModel).where(ParseJobModel.status == "queued").order_by(
+                    func.coalesce(ParseJobModel.started_at, "").asc(),
+                    ParseJobModel.id.asc()
+                ).limit(1).with_for_update(skip_locked=True)
+                job = s.scalars(stmt).first()
+                if not job:
+                    return None
+                job.status = "running"
+                job.stage = "document_parse"
+                job.error = None
+                job.started_at = utc_now()
+                job.finished_at = None
+                s.commit()
+                return job
 
-    def retry_job(self, job_id: str) -> ParseJob:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM parse_job WHERE id = ?", (job_id,)).fetchone()
-            if not row:
+    def retry_job(self, job_id: str) -> ParseJobModel:
+        with self.session() as s:
+            job = s.get(ParseJobModel, job_id)
+            if not job:
                 raise KeyError(f"Parse job not found: {job_id}")
-            if row["status"] not in {"failed", "completed"}:
-                raise ValueError(f"Only failed/completed jobs can be retried; current status is {row['status']}")
-            conn.execute(
-                "UPDATE parse_job SET status = 'queued', stage = 'queued', error = NULL, finished_at = NULL WHERE id = ?",
-                (job_id,),
-            )
-            updated = conn.execute("SELECT * FROM parse_job WHERE id = ?", (job_id,)).fetchone()
-        return self._job_from_row(updated)
+            if job.status not in {"failed", "completed"}:
+                raise ValueError(f"Only failed/completed jobs can be retried; current status is {job.status}")
+            job.status = "queued"
+            job.stage = "queued"
+            job.error = None
+            job.finished_at = None
+            s.commit()
+            return job
 
-    def retry_failed_jobs(self, limit: int = 100) -> list[ParseJob]:
-        with self.connect() as conn:
-            rows = conn.execute("SELECT id FROM parse_job WHERE status = 'failed' ORDER BY COALESCE(finished_at, '') DESC LIMIT ?", (limit,)).fetchall()
-        return [self.retry_job(row["id"]) for row in rows]
-
+    def retry_failed_jobs(self, limit: int = 100) -> list[ParseJobModel]:
+        with self.session() as s:
+            from sqlalchemy import select
+            stmt = select(ParseJobModel).where(ParseJobModel.status == "failed").order_by(
+                ParseJobModel.finished_at.desc()
+            ).limit(limit)
+            jobs = s.scalars(stmt).all()
+            job_ids = [job.id for job in jobs]
+        return [self.retry_job(jid) for jid in job_ids]
     def upsert_document(
         self,
         *,
@@ -536,62 +257,70 @@ class RouteStorage:
         title: str | None,
         doi: str | None,
         ingest_status: str,
-    ) -> SourceDocument:
+    ) -> SourceDocumentModel:
         now = utc_now()
-        with self.connect() as conn:
-            existing = conn.execute(
-                "SELECT * FROM source_document WHERE file_hash = ? AND file_path = ?",
-                (file_hash, file_path),
-            ).fetchone()
-            if existing:
-                conn.execute(
-                    """
-                    UPDATE source_document
-                    SET file_type = ?, title = ?, doi = ?, ingest_status = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (file_type, title, doi, ingest_status, now, existing["id"]),
-                )
-                row = conn.execute("SELECT * FROM source_document WHERE id = ?", (existing["id"],)).fetchone()
+        with self.session() as s:
+            from sqlalchemy import select
+            stmt = select(SourceDocumentModel).where(
+                SourceDocumentModel.file_hash == file_hash,
+                SourceDocumentModel.file_path == file_path
+            )
+            doc = s.scalars(stmt).first()
+            if doc:
+                doc.file_type = file_type
+                doc.title = title
+                doc.doi = doi
+                doc.ingest_status = ingest_status
+                doc.updated_at = now
             else:
-                document_id = new_id("doc")
-                conn.execute(
-                    """
-                    INSERT INTO source_document
-                    (id, file_path, file_hash, file_type, title, doi, scifinder_metadata, ingest_status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (document_id, file_path, file_hash, file_type, title, doi, json.dumps({}, ensure_ascii=False), ingest_status, now, now),
+                doc = SourceDocumentModel(
+                    id=new_id("doc"),
+                    file_path=file_path,
+                    file_hash=file_hash,
+                    file_type=file_type,
+                    title=title,
+                    doi=doi,
+                    scifinder_metadata={},
+                    ingest_status=ingest_status,
+                    created_at=now,
+                    updated_at=now
                 )
-                row = conn.execute("SELECT * FROM source_document WHERE id = ?", (document_id,)).fetchone()
-        return self._document_from_row(row)
+                s.add(doc)
+            _ = doc.id
+            return doc
 
     def set_document_status(self, document_id: str, status: str) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE source_document SET ingest_status = ?, updated_at = ? WHERE id = ?",
-                (status, utc_now(), document_id),
-            )
+        with self.session() as s:
+            doc = s.get(SourceDocumentModel, document_id)
+            if doc:
+                doc.ingest_status = status
+                doc.updated_at = utc_now()
 
     def update_document_metadata(self, document_id: str, *, file_type: str, title: str | None, doi: str | None) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE source_document SET file_type = ?, title = ?, doi = ?, updated_at = ? WHERE id = ?",
-                (file_type, title, doi, utc_now(), document_id),
-            )
+        with self.session() as s:
+            doc = s.get(SourceDocumentModel, document_id)
+            if doc:
+                doc.file_type = file_type
+                doc.title = title
+                doc.doi = doi
+                doc.updated_at = utc_now()
 
-    def create_job(self, document_id: str, *, status: str = "queued", stage: str = "queued") -> ParseJob:
+    def create_job(self, document_id: str, *, status: str = "queued", stage: str = "queued") -> ParseJobModel:
         job_id = new_id("job")
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO parse_job (id, document_id, status, stage, started_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (job_id, document_id, status, stage, utc_now() if status == "running" else None),
+        now = utc_now()
+        with self.session() as s:
+            job = ParseJobModel(
+                id=job_id,
+                document_id=document_id,
+                status=status,
+                stage=stage,
+                error=None,
+                started_at=now if status == "running" else None,
+                finished_at=None
             )
-            row = conn.execute("SELECT * FROM parse_job WHERE id = ?", (job_id,)).fetchone()
-        return self._job_from_row(row)
+            s.add(job)
+            s.commit()
+            return job
 
     def create_queued_document_job(
         self,
@@ -601,7 +330,7 @@ class RouteStorage:
         file_type: str,
         title: str | None,
         doi: str | None,
-    ) -> tuple[SourceDocument, ParseJob]:
+    ) -> tuple[SourceDocumentModel, ParseJobModel]:
         document = self.upsert_document(
             file_path=file_path,
             file_hash=file_hash,
@@ -616,350 +345,450 @@ class RouteStorage:
     def update_job(self, job_id: str, *, status: str, stage: str, error: str | None = None) -> None:
         finished_at = utc_now() if status in {"completed", "failed"} else None
         started_at = utc_now() if status == "running" else None
-        with self.connect() as conn:
-            if started_at:
-                conn.execute(
-                    "UPDATE parse_job SET status = ?, stage = ?, error = ?, started_at = COALESCE(started_at, ?) WHERE id = ?",
-                    (status, stage, error, started_at, job_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE parse_job SET status = ?, stage = ?, error = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?",
-                    (status, stage, error, finished_at, job_id),
-                )
+        with self.session() as s:
+            job = s.get(ParseJobModel, job_id)
+            if job:
+                job.status = status
+                job.stage = stage
+                job.error = error
+                if started_at:
+                    if job.started_at is None:
+                        job.started_at = started_at
+                else:
+                    if finished_at is not None:
+                        job.finished_at = finished_at
+                s.commit()
 
-    def get_job(self, job_id: str) -> ParseJob | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM parse_job WHERE id = ?", (job_id,)).fetchone()
-        return self._job_from_row(row) if row else None
+    def get_job(self, job_id: str) -> ParseJobModel | None:
+        with self.session() as s:
+            return s.get(ParseJobModel, job_id)
 
-    def list_jobs(self, *, status: str = "", limit: int = 100) -> list[ParseJob]:
-        with self.connect() as conn:
+    def list_jobs(self, *, status: str = "", limit: int = 100) -> list[ParseJobModel]:
+        with self.session() as s:
+            from sqlalchemy import select, func
+            stmt = select(ParseJobModel)
             if status:
-                rows = conn.execute(
-                    "SELECT * FROM parse_job WHERE status = ? ORDER BY COALESCE(started_at, '') DESC, id DESC LIMIT ?",
-                    (status, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM parse_job ORDER BY COALESCE(started_at, '') DESC, id DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
-        return [self._job_from_row(row) for row in rows]
+                stmt = stmt.where(ParseJobModel.status == status)
+            stmt = stmt.order_by(
+                func.coalesce(ParseJobModel.started_at, "").desc(),
+                ParseJobModel.id.desc()
+            ).limit(limit)
+            return list(s.scalars(stmt).all())
 
-    def get_latest_job_for_document(self, document_id: str) -> ParseJob | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM parse_job
-                WHERE document_id = ?
-                ORDER BY COALESCE(finished_at, started_at, '') DESC, id DESC
-                LIMIT 1
-                """,
-                (document_id,),
-            ).fetchone()
-        return self._job_from_row(row) if row else None
+    def get_latest_job_for_document(self, document_id: str) -> ParseJobModel | None:
+        with self.session() as s:
+            from sqlalchemy import select, func
+            stmt = select(ParseJobModel).where(
+                ParseJobModel.document_id == document_id
+            ).order_by(
+                func.coalesce(ParseJobModel.finished_at, ParseJobModel.started_at, "").desc(),
+                ParseJobModel.id.desc()
+            ).limit(1)
+            return s.scalars(stmt).first()
 
-    def get_document(self, document_id: str) -> SourceDocument | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM source_document WHERE id = ?", (document_id,)).fetchone()
-        return self._document_from_row(row) if row else None
+    def get_document(self, document_id: str) -> SourceDocumentModel | None:
+        with self.session() as s:
+            return s.get(SourceDocumentModel, document_id)
 
     def list_documents(self, *, query: str = "", file_type: str = "", limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         clauses = ["d.deleted_at IS NULL"]
-        params: list[Any] = []
+        params: dict[str, Any] = {}
         if query:
             like = f"%{query}%"
-            clauses.append("(d.title LIKE ? OR d.file_path LIKE ? OR d.doi LIKE ? OR d.id LIKE ?)")
-            params.extend([like, like, like, like])
+            clauses.append("(d.title LIKE :like OR d.file_path LIKE :like OR d.doi LIKE :like OR d.id LIKE :like)")
+            params["like"] = like
         if file_type:
-            clauses.append("d.file_type = ?")
-            params.append(file_type)
+            clauses.append("d.file_type = :file_type")
+            params["file_type"] = file_type
         where = " AND ".join(clauses)
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT d.*,
-                       COUNT(DISTINCT pc.id) AS parsed_chunk_count,
-                       COUNT(DISTINCT rs.id) AS reaction_step_count,
-                       MAX(j.finished_at) AS last_job_finished_at,
-                       (
-                         SELECT j2.status FROM parse_job j2
-                         WHERE j2.document_id = d.id
-                         ORDER BY COALESCE(j2.started_at, '') DESC, j2.id DESC
-                         LIMIT 1
-                       ) AS last_job_status,
-                       (
-                         SELECT j3.error FROM parse_job j3
-                         WHERE j3.document_id = d.id AND j3.error IS NOT NULL
-                         ORDER BY COALESCE(j3.finished_at, j3.started_at, '') DESC, j3.id DESC
-                         LIMIT 1
-                       ) AS last_job_error
-                FROM source_document d
-                LEFT JOIN parsed_chunk pc ON pc.source_document_id = d.id
-                LEFT JOIN reaction_step rs ON rs.source_document_id = d.id AND rs.deleted_at IS NULL
-                LEFT JOIN parse_job j ON j.document_id = d.id
-                WHERE {where}
-                GROUP BY d.id
-                ORDER BY d.updated_at DESC, d.created_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                (*params, limit, offset),
-            ).fetchall()
-        return [self._document_summary_from_row(row) for row in rows]
+        params["limit"] = limit
+        params["offset"] = offset
 
-    def get_document_by_hash_path(self, *, file_hash: str, file_path: str) -> SourceDocument | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM source_document WHERE file_hash = ? AND file_path = ?",
-                (file_hash, file_path),
-            ).fetchone()
-        return self._document_from_row(row) if row else None
+        from sqlalchemy import text
+        sql = f"""
+            SELECT d.*,
+                   COUNT(DISTINCT pc.id) AS parsed_chunk_count,
+                   COUNT(DISTINCT rs.id) AS reaction_step_count,
+                   MAX(j.finished_at) AS last_job_finished_at,
+                   (
+                     SELECT j2.status FROM parse_job j2
+                     WHERE j2.document_id = d.id
+                     ORDER BY COALESCE(j2.started_at, '') DESC, j2.id DESC
+                     LIMIT 1
+                   ) AS last_job_status,
+                   (
+                     SELECT j3.error FROM parse_job j3
+                     WHERE j3.document_id = d.id AND j3.error IS NOT NULL
+                     ORDER BY COALESCE(j3.finished_at, j3.started_at, '') DESC, j3.id DESC
+                     LIMIT 1
+                   ) AS last_job_error
+            FROM source_document d
+            LEFT JOIN parsed_chunk pc ON pc.source_document_id = d.id
+            LEFT JOIN reaction_step rs ON rs.source_document_id = d.id AND rs.deleted_at IS NULL
+            LEFT JOIN parse_job j ON j.document_id = d.id
+            WHERE {where}
+            GROUP BY d.id
+            ORDER BY d.updated_at DESC, d.created_at DESC
+            LIMIT :limit OFFSET :offset
+        """
 
-    def get_document_by_hash(self, file_hash: str) -> SourceDocument | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM source_document WHERE file_hash = ? ORDER BY created_at ASC LIMIT 1",
-                (file_hash,),
-            ).fetchone()
-        return self._document_from_row(row) if row else None
+        with self.session() as s:
+            result = s.execute(text(sql), params).mappings().all()
+
+        summaries = []
+        for row in result:
+            meta = row["scifinder_metadata"]
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            elif meta is None:
+                meta = {}
+
+            doc_dict = {
+                "id": row["id"],
+                "file_path": row["file_path"],
+                "file_hash": row["file_hash"],
+                "file_type": row["file_type"],
+                "title": row["title"],
+                "doi": row["doi"],
+                "scifinder_metadata": meta,
+                "ingest_status": row["ingest_status"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "deleted_at": row.get("deleted_at"),
+                "file_name": Path(row["file_path"]).name,
+                "parsed_chunk_count": int(row["parsed_chunk_count"] or 0),
+                "reaction_step_count": int(row["reaction_step_count"] or 0),
+                "last_job_status": row["last_job_status"],
+                "last_job_error": row["last_job_error"],
+                "last_job_finished_at": row["last_job_finished_at"],
+            }
+            summaries.append(doc_dict)
+        return summaries
+
+    def get_document_by_hash_path(self, *, file_hash: str, file_path: str) -> SourceDocumentModel | None:
+        from sqlalchemy import select
+        with self.session() as s:
+            stmt = select(SourceDocumentModel).where(
+                SourceDocumentModel.file_hash == file_hash,
+                SourceDocumentModel.file_path == file_path
+            )
+            return s.scalars(stmt).first()
+
+    def get_document_by_hash(self, file_hash: str) -> SourceDocumentModel | None:
+        from sqlalchemy import select
+        with self.session() as s:
+            stmt = select(SourceDocumentModel).where(SourceDocumentModel.file_hash == file_hash).order_by(SourceDocumentModel.created_at.asc()).limit(1)
+            return s.scalars(stmt).first()
 
     def count_documents(self) -> int:
-        with self.connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS total FROM source_document WHERE deleted_at IS NULL").fetchone()
-        return int(row["total"])
+        from sqlalchemy import select, func
+        with self.session() as s:
+            stmt = select(func.count(SourceDocumentModel.id)).where(SourceDocumentModel.deleted_at.is_(None))
+            return s.scalar(stmt) or 0
 
     def count_reaction_steps(self) -> int:
-        with self.connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS total FROM reaction_step WHERE deleted_at IS NULL").fetchone()
-        return int(row["total"])
+        from sqlalchemy import select, func
+        with self.session() as s:
+            stmt = select(func.count(ReactionStepModel.id)).where(ReactionStepModel.deleted_at.is_(None))
+            return s.scalar(stmt) or 0
 
     def clear_document_reactions(self, document_id: str) -> None:
-        with self.connect() as conn:
-            step_ids = [row["id"] for row in conn.execute("SELECT id FROM reaction_step WHERE source_document_id = ?", (document_id,))]
-            for step_id in step_ids:
-                conn.execute("DELETE FROM reaction_step_fts WHERE reaction_step_id = ?", (step_id,))
-            conn.execute("DELETE FROM reaction_step WHERE source_document_id = ?", (document_id,))
-            conn.execute("DELETE FROM rdf_reaction_record WHERE source_document_id = ?", (document_id,))
+        from sqlalchemy import delete, select, text
+        with self.session() as s:
+            step_ids = s.scalars(select(ReactionStepModel.id).where(ReactionStepModel.source_document_id == document_id)).all()
+            if s.bind.dialect.name == "sqlite":
+                for step_id in step_ids:
+                    s.execute(text("DELETE FROM reaction_step_fts WHERE reaction_step_id = :step_id"), {"step_id": step_id})
+            s.execute(delete(ReactionStepModel).where(ReactionStepModel.source_document_id == document_id))
+            from .orm import RdfReactionRecordModel
+            s.execute(delete(RdfReactionRecordModel).where(RdfReactionRecordModel.source_document_id == document_id))
 
     def replace_parsed_chunks(self, document_id: str, chunks: Iterable[Any]) -> int:
+        from sqlalchemy import delete
         now = utc_now()
         inserted = 0
-        with self.connect() as conn:
-            conn.execute("DELETE FROM parsed_chunk WHERE source_document_id = ?", (document_id,))
+        with self.session() as s:
+            s.execute(delete(ParsedChunkModel).where(ParsedChunkModel.source_document_id == document_id))
             for index, chunk in enumerate(chunks):
-                text = str(getattr(chunk, "text", "") or "")
-                if not text.strip():
+                text_val = str(getattr(chunk, "text", "") or "")
+                if not text_val.strip():
                     continue
-                conn.execute(
-                    """
-                    INSERT INTO parsed_chunk
-                    (id, source_document_id, chunk_index, page_number, text, parser_name, parser_version, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        new_id("chunk"),
-                        document_id,
-                        index,
-                        getattr(chunk, "page_number", None),
-                        text,
-                        str(getattr(chunk, "parser_name", "parser") or "parser"),
-                        str(getattr(chunk, "parser_version", "unknown") or "unknown"),
-                        now,
-                    ),
+                db_chunk = ParsedChunkModel(
+                    id=new_id("chunk"),
+                    source_document_id=document_id,
+                    chunk_index=index,
+                    page_number=getattr(chunk, "page_number", None),
+                    text=text_val,
+                    parser_name=str(getattr(chunk, "parser_name", "parser") or "parser"),
+                    parser_version=str(getattr(chunk, "parser_version", "unknown") or "unknown"),
+                    created_at=now
                 )
+                s.add(db_chunk)
                 inserted += 1
         return inserted
 
     def list_parsed_chunks(self, document_id: str, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
-        with self.connect() as conn:
-            total = int(conn.execute("SELECT COUNT(*) AS total FROM parsed_chunk WHERE source_document_id = ?", (document_id,)).fetchone()["total"])
-            rows = conn.execute(
-                """
-                SELECT * FROM parsed_chunk
-                WHERE source_document_id = ?
-                ORDER BY chunk_index ASC
-                LIMIT ? OFFSET ?
-                """,
-                (document_id, limit, offset),
-            ).fetchall()
-        return {"total": total, "limit": limit, "offset": offset, "chunks": [parsed_chunk_row_to_dict(row) for row in rows]}
+        from sqlalchemy import select, func
+        with self.session() as s:
+            total_stmt = select(func.count(ParsedChunkModel.id)).where(ParsedChunkModel.source_document_id == document_id)
+            total = s.scalar(total_stmt) or 0
+            stmt = select(ParsedChunkModel).where(ParsedChunkModel.source_document_id == document_id).order_by(ParsedChunkModel.chunk_index.asc()).limit(limit).offset(offset)
+            rows = s.scalars(stmt).all()
+        return {"total": total, "limit": limit, "offset": offset, "chunks": [row.to_dict() for row in rows]}
 
     def upsert_rdf_reaction_records(self, document_id: str, records: list[dict[str, Any]]) -> dict[str, int]:
+        from .orm import RdfReactionRecordModel, RdfStructureModel
+        from sqlalchemy import delete
         now = utc_now()
         inserted_records = 0
         inserted_structures = 0
-        with self.connect() as conn:
-            conn.execute("DELETE FROM rdf_reaction_record WHERE source_document_id = ?", (document_id,))
+        with self.session() as s:
+            s.execute(delete(RdfReactionRecordModel).where(RdfReactionRecordModel.source_document_id == document_id))
             for record in records:
                 reaction_id = new_id("rdfrec")
-                conn.execute(
-                    """
-                    INSERT INTO rdf_reaction_record
-                    (id, source_document_id, record_index, registry, scheme_id, step_id, reactant_count,
-                     product_count, cas_reaction_number, yield_text, reagents, catalysts, solvents, reference,
-                     experimental_procedure, fields, warnings, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        reaction_id,
-                        document_id,
-                        record.get("record_index"),
-                        record.get("registry"),
-                        record.get("scheme_id"),
-                        record.get("step_id"),
-                        int(record.get("reactant_count") or 0),
-                        int(record.get("product_count") or 0),
-                        record.get("cas_reaction_number"),
-                        record.get("yield_text"),
-                        json.dumps(record.get("reagents") or [], ensure_ascii=False),
-                        json.dumps(record.get("catalysts") or [], ensure_ascii=False),
-                        json.dumps(record.get("solvents") or [], ensure_ascii=False),
-                        json.dumps(record.get("reference") or {}, ensure_ascii=False, sort_keys=True),
-                        record.get("experimental_procedure"),
-                        json.dumps(record.get("fields") or {}, ensure_ascii=False, sort_keys=True),
-                        json.dumps(record.get("warnings") or [], ensure_ascii=False),
-                        now,
-                        now,
-                    ),
+                rxn = RdfReactionRecordModel(
+                    id=reaction_id,
+                    source_document_id=document_id,
+                    record_index=record.get("record_index"),
+                    registry=record.get("registry"),
+                    scheme_id=record.get("scheme_id"),
+                    step_id=record.get("step_id"),
+                    reactant_count=int(record.get("reactant_count") or 0),
+                    product_count=int(record.get("product_count") or 0),
+                    cas_reaction_number=record.get("cas_reaction_number"),
+                    yield_text=record.get("yield_text"),
+                    reagents=record.get("reagents") or [],
+                    catalysts=record.get("catalysts") or [],
+                    solvents=record.get("solvents") or [],
+                    reference=record.get("reference") or {},
+                    experimental_procedure=record.get("experimental_procedure"),
+                    fields=record.get("fields") or {},
+                    warnings=record.get("warnings") or [],
+                    created_at=now,
+                    updated_at=now
                 )
+                s.add(rxn)
+                s.flush()
                 inserted_records += 1
+                
                 for molecule in record.get("molecules") or []:
-                    conn.execute(
-                        """
-                        INSERT INTO rdf_structure
-                        (id, rdf_reaction_id, source_document_id, role, role_index, name, formula, cas_rn,
-                         molfile, molfile_version, smiles, inchikey, fingerprint, rdkit_status, rdkit_error,
-                         warnings, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            new_id("rdfstr"),
-                            reaction_id,
-                            document_id,
-                            molecule.get("role") or "unknown",
-                            int(molecule.get("role_index") or 0),
-                            molecule.get("name"),
-                            molecule.get("formula"),
-                            molecule.get("cas_rn"),
-                            molecule.get("molfile"),
-                            molecule.get("molfile_version"),
-                            molecule.get("smiles"),
-                            molecule.get("inchikey"),
-                            molecule.get("fingerprint"),
-                            molecule.get("rdkit_status") or "not_indexed",
-                            molecule.get("rdkit_error"),
-                            json.dumps(molecule.get("warnings") or [], ensure_ascii=False),
-                            now,
-                            now,
-                        ),
+                    mol = RdfStructureModel(
+                        id=new_id("rdfstr"),
+                        rdf_reaction_id=reaction_id,
+                        source_document_id=document_id,
+                        role=molecule.get("role") or "unknown",
+                        role_index=int(molecule.get("role_index") or 0),
+                        name=molecule.get("name"),
+                        formula=molecule.get("formula"),
+                        cas_rn=molecule.get("cas_rn"),
+                        molfile=molecule.get("molfile"),
+                        molfile_version=molecule.get("molfile_version"),
+                        smiles=molecule.get("smiles"),
+                        inchikey=molecule.get("inchikey"),
+                        fingerprint=molecule.get("fingerprint"),
+                        rdkit_status=molecule.get("rdkit_status") or "not_indexed",
+                        rdkit_error=molecule.get("rdkit_error"),
+                        warnings=molecule.get("warnings") or [],
+                        created_at=now,
+                        updated_at=now
                     )
+                    s.add(mol)
                     inserted_structures += 1
+            s.commit()
         return {"records": inserted_records, "structures": inserted_structures}
 
     def list_rdf_reactions(self, *, document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
-        clauses = [] if include_deleted else ["r.deleted_at IS NULL"]
-        params: list[Any] = []
-        if document_id:
-            clauses.append("r.source_document_id = ?")
-            params.append(document_id)
-        if query:
-            like = f"%{query}%"
-            clauses.append(
-                """
-                (
-                    r.cas_reaction_number LIKE ? OR r.scheme_id LIKE ? OR r.step_id LIKE ? OR r.reference LIKE ?
-                    OR d.id LIKE ? OR d.file_path LIKE ? OR d.title LIKE ? OR d.doi LIKE ?
-                    OR EXISTS (
-                        SELECT 1 FROM rdf_structure rs
-                        WHERE rs.rdf_reaction_id = r.id
-                          AND (? OR rs.deleted_at IS NULL)
-                          AND (rs.cas_rn LIKE ? OR rs.name LIKE ? OR rs.formula LIKE ?)
+        from .orm import RdfReactionRecordModel, RdfStructureModel, SourceDocumentModel
+        from sqlalchemy import select, func, or_, and_, cast, String
+        
+        with self.session() as s:
+            stmt = select(
+                RdfReactionRecordModel,
+                SourceDocumentModel.file_path.label("source_file_path"),
+                SourceDocumentModel.title.label("source_title"),
+                func.count(RdfStructureModel.id).label("structure_count")
+            ).join(
+                SourceDocumentModel,
+                SourceDocumentModel.id == RdfReactionRecordModel.source_document_id
+            ).outerjoin(
+                RdfStructureModel,
+                and_(
+                    RdfStructureModel.rdf_reaction_id == RdfReactionRecordModel.id,
+                    or_(include_deleted, RdfStructureModel.deleted_at.is_(None))
+                )
+            )
+            
+            if not include_deleted:
+                stmt = stmt.where(RdfReactionRecordModel.deleted_at.is_(None))
+                
+            if document_id:
+                stmt = stmt.where(RdfReactionRecordModel.source_document_id == document_id)
+                
+            if query:
+                like = f"%{query}%"
+                exists_cond = select(1).select_from(RdfStructureModel).where(
+                    RdfStructureModel.rdf_reaction_id == RdfReactionRecordModel.id,
+                    or_(include_deleted, RdfStructureModel.deleted_at.is_(None)),
+                    or_(
+                        RdfStructureModel.cas_rn.like(like),
+                        RdfStructureModel.name.like(like),
+                        RdfStructureModel.formula.like(like)
+                    )
+                ).exists()
+                
+                stmt = stmt.where(
+                    or_(
+                        RdfReactionRecordModel.cas_reaction_number.like(like),
+                        RdfReactionRecordModel.scheme_id.like(like),
+                        RdfReactionRecordModel.step_id.like(like),
+                        cast(RdfReactionRecordModel.reference, String).like(like),
+                        SourceDocumentModel.id.like(like),
+                        SourceDocumentModel.file_path.like(like),
+                        SourceDocumentModel.title.like(like),
+                        SourceDocumentModel.doi.like(like),
+                        exists_cond
                     )
                 )
-                """
-            )
-            params.extend([like, like, like, like, like, like, like, like, 1 if include_deleted else 0, like, like, like])
-        where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT r.*, d.file_path AS source_file_path, d.title AS source_title, COUNT(s.id) AS structure_count
-                FROM rdf_reaction_record r
-                JOIN source_document d ON d.id = r.source_document_id
-                LEFT JOIN rdf_structure s ON s.rdf_reaction_id = r.id AND (? OR s.deleted_at IS NULL)
-                {where}
-                GROUP BY r.id
-                ORDER BY r.source_document_id, r.record_index
-                LIMIT ? OFFSET ?
-                """,
-                (1 if include_deleted else 0, *params, limit, offset),
-            ).fetchall()
-        return [self._rdf_reaction_row_to_dict(row) for row in rows]
+                
+            stmt = stmt.group_by(RdfReactionRecordModel.id, SourceDocumentModel.file_path, SourceDocumentModel.title)
+            stmt = stmt.order_by(RdfReactionRecordModel.source_document_id, RdfReactionRecordModel.record_index)
+            stmt = stmt.limit(limit).offset(offset)
+            
+            results = s.execute(stmt).all()
+            out = []
+            for rxn, file_path, title, count in results:
+                d = rxn.to_dict()
+                d.update({
+                    "source_file_path": file_path,
+                    "source_title": title,
+                    "structure_count": count
+                })
+                out.append(d)
+            return out
 
     def get_rdf_reaction(self, reaction_id: str, *, include_deleted: bool = False) -> dict[str, Any] | None:
-        deleted_clause = "" if include_deleted else " AND deleted_at IS NULL"
-        with self.connect() as conn:
-            row = conn.execute(f"SELECT * FROM rdf_reaction_record WHERE id = ?{deleted_clause}", (reaction_id,)).fetchone()
-            if not row:
+        from .orm import RdfReactionRecordModel, RdfStructureModel
+        from sqlalchemy import select
+        with self.session() as s:
+            stmt = select(RdfReactionRecordModel).where(RdfReactionRecordModel.id == reaction_id)
+            if not include_deleted:
+                stmt = stmt.where(RdfReactionRecordModel.deleted_at.is_(None))
+            rxn = s.scalars(stmt).first()
+            if not rxn:
                 return None
-            structures = conn.execute(
-                f"SELECT * FROM rdf_structure WHERE rdf_reaction_id = ?{' ' if include_deleted else ' AND deleted_at IS NULL '}ORDER BY role, role_index",
-                (reaction_id,),
-            ).fetchall()
-        data = self._rdf_reaction_row_to_dict(row)
-        data["structures"] = [self._rdf_structure_row_to_dict(item) for item in structures]
-        return data
+            
+            struct_stmt = select(RdfStructureModel).where(RdfStructureModel.rdf_reaction_id == reaction_id)
+            if not include_deleted:
+                struct_stmt = struct_stmt.where(RdfStructureModel.deleted_at.is_(None))
+            struct_stmt = struct_stmt.order_by(RdfStructureModel.role, RdfStructureModel.role_index)
+            structures = s.scalars(struct_stmt).all()
+            
+            data = rxn.to_dict()
+            data["structures"] = [item.to_dict() for item in structures]
+            return data
 
     def list_rdf_structures(self, *, document_id: str = "", query: str = "", limit: int = 50, offset: int = 0, include_deleted: bool = False) -> list[dict[str, Any]]:
-        clauses = [] if include_deleted else ["s.deleted_at IS NULL", "r.deleted_at IS NULL"]
-        params: list[Any] = []
-        if document_id:
-            clauses.append("s.source_document_id = ?")
-            params.append(document_id)
-        if query:
-            clauses.append("(LOWER(COALESCE(s.name,'')) LIKE ? OR LOWER(COALESCE(s.cas_rn,'')) LIKE ? OR LOWER(COALESCE(s.smiles,'')) LIKE ? OR LOWER(COALESCE(s.inchikey,'')) LIKE ?)")
-            params.extend([f"%{query.lower()}%"] * 4)
-        where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT s.*, r.record_index, r.scheme_id, r.step_id, r.cas_reaction_number, r.yield_text
-                FROM rdf_structure s
-                JOIN rdf_reaction_record r ON r.id = s.rdf_reaction_id
-                {where}
-                ORDER BY s.updated_at DESC, s.role, s.role_index
-                LIMIT ? OFFSET ?
-                """,
-                (*params, limit, offset),
-            ).fetchall()
-        return [self._rdf_structure_row_to_dict(row) for row in rows]
-
+        from .orm import RdfStructureModel, RdfReactionRecordModel
+        from sqlalchemy import select, func, or_
+        with self.session() as s:
+            stmt = select(
+                RdfStructureModel,
+                RdfReactionRecordModel.record_index,
+                RdfReactionRecordModel.scheme_id,
+                RdfReactionRecordModel.step_id,
+                RdfReactionRecordModel.cas_reaction_number,
+                RdfReactionRecordModel.yield_text
+            ).join(
+                RdfReactionRecordModel,
+                RdfReactionRecordModel.id == RdfStructureModel.rdf_reaction_id
+            )
+            
+            if not include_deleted:
+                stmt = stmt.where(
+                    RdfStructureModel.deleted_at.is_(None),
+                    RdfReactionRecordModel.deleted_at.is_(None)
+                )
+            if document_id:
+                stmt = stmt.where(RdfStructureModel.source_document_id == document_id)
+            if query:
+                like = f"%{query.lower()}%"
+                stmt = stmt.where(
+                    or_(
+                        func.lower(func.coalesce(RdfStructureModel.name, "")).like(like),
+                        func.lower(func.coalesce(RdfStructureModel.cas_rn, "")).like(like),
+                        func.lower(func.coalesce(RdfStructureModel.smiles, "")).like(like),
+                        func.lower(func.coalesce(RdfStructureModel.inchikey, "")).like(like)
+                    )
+                )
+            stmt = stmt.order_by(RdfStructureModel.updated_at.desc(), RdfStructureModel.role, RdfStructureModel.role_index)
+            stmt = stmt.limit(limit).offset(offset)
+            
+            results = s.execute(stmt).all()
+            out = []
+            for struct, record_index, scheme_id, step_id, cas_reaction_number, yield_text in results:
+                d = struct.to_dict()
+                d.update({
+                    "record_index": record_index,
+                    "scheme_id": scheme_id,
+                    "step_id": step_id,
+                    "cas_reaction_number": cas_reaction_number,
+                    "yield_text": yield_text
+                })
+                out.append(d)
+            return out
 
     def get_rdf_structure(self, structure_id: str, *, include_deleted: bool = False) -> dict[str, Any] | None:
-        deleted_clause = "" if include_deleted else " AND s.deleted_at IS NULL AND r.deleted_at IS NULL"
-        with self.connect() as conn:
-            row = conn.execute(
-                f"""
-                SELECT s.*, r.record_index, r.scheme_id, r.step_id, r.cas_reaction_number, r.yield_text
-                FROM rdf_structure s
-                JOIN rdf_reaction_record r ON r.id = s.rdf_reaction_id
-                WHERE s.id = ?{deleted_clause}
-                """,
-                (structure_id,),
-            ).fetchone()
-        return self._rdf_structure_row_to_dict(row) if row else None
+        from .orm import RdfStructureModel, RdfReactionRecordModel
+        from sqlalchemy import select
+        with self.session() as s:
+            stmt = select(
+                RdfStructureModel,
+                RdfReactionRecordModel.record_index,
+                RdfReactionRecordModel.scheme_id,
+                RdfReactionRecordModel.step_id,
+                RdfReactionRecordModel.cas_reaction_number,
+                RdfReactionRecordModel.yield_text
+            ).join(
+                RdfReactionRecordModel,
+                RdfReactionRecordModel.id == RdfStructureModel.rdf_reaction_id
+            ).where(
+                RdfStructureModel.id == structure_id
+            )
+            if not include_deleted:
+                stmt = stmt.where(
+                    RdfStructureModel.deleted_at.is_(None),
+                    RdfReactionRecordModel.deleted_at.is_(None)
+                )
+            res = s.execute(stmt).first()
+            if not res:
+                return None
+            struct, record_index, scheme_id, step_id, cas_reaction_number, yield_text = res
+            d = struct.to_dict()
+            d.update({
+                "record_index": record_index,
+                "scheme_id": scheme_id,
+                "step_id": step_id,
+                "cas_reaction_number": cas_reaction_number,
+                "yield_text": yield_text
+            })
+            return d
 
     def list_rdf_structures_for_search(self, *, limit: int = 10000) -> list[dict[str, Any]]:
         return self.list_rdf_structures(limit=limit)
 
     def rdf_structure_index_status(self) -> dict[str, Any]:
-        with self.connect() as conn:
-            total = int(conn.execute("SELECT COUNT(*) AS total FROM rdf_structure WHERE deleted_at IS NULL").fetchone()["total"])
-            indexed = int(conn.execute("SELECT COUNT(*) AS total FROM rdf_structure WHERE deleted_at IS NULL AND rdkit_status = 'indexed'").fetchone()["total"])
-            failed = int(conn.execute("SELECT COUNT(*) AS total FROM rdf_structure WHERE deleted_at IS NULL AND rdkit_status = 'rdkit_failed'").fetchone()["total"])
-            unavailable = int(conn.execute("SELECT COUNT(*) AS total FROM rdf_structure WHERE deleted_at IS NULL AND rdkit_status = 'rdkit_unavailable'").fetchone()["total"])
-            reactions = int(conn.execute("SELECT COUNT(*) AS total FROM rdf_reaction_record WHERE deleted_at IS NULL").fetchone()["total"])
+        from .orm import RdfStructureModel, RdfReactionRecordModel
+        from sqlalchemy import select, func
+        with self.session() as s:
+            total = s.scalar(select(func.count(RdfStructureModel.id)).where(RdfStructureModel.deleted_at.is_(None))) or 0
+            indexed = s.scalar(select(func.count(RdfStructureModel.id)).where(RdfStructureModel.deleted_at.is_(None), RdfStructureModel.rdkit_status == 'indexed')) or 0
+            failed = s.scalar(select(func.count(RdfStructureModel.id)).where(RdfStructureModel.deleted_at.is_(None), RdfStructureModel.rdkit_status == 'rdkit_failed')) or 0
+            unavailable = s.scalar(select(func.count(RdfStructureModel.id)).where(RdfStructureModel.deleted_at.is_(None), RdfStructureModel.rdkit_status == 'rdkit_unavailable')) or 0
+            reactions = s.scalar(select(func.count(RdfReactionRecordModel.id)).where(RdfReactionRecordModel.deleted_at.is_(None))) or 0
+            
         if total == 0:
             status = "empty"
         elif indexed == total:
@@ -971,67 +800,121 @@ class RouteStorage:
         return {"status": status, "reaction_records": reactions, "total_structures": total, "indexed_structures": indexed, "failed_structures": failed, "rdkit_unavailable_structures": unavailable}
 
     def soft_delete(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        from .orm import SourceDocumentModel, ReactionStepModel, RdfReactionRecordModel, RdfStructureModel
+        from sqlalchemy import update
         now = utc_now()
-        with self.connect() as conn:
+        with self.session() as s:
             if entity_type == "document":
-                conn.execute("UPDATE source_document SET deleted_at = ?, updated_at = ? WHERE id = ?", (now, now, entity_id))
-                conn.execute("UPDATE reaction_step SET deleted_at = ? WHERE source_document_id = ?", (now, entity_id))
-                conn.execute("UPDATE rdf_reaction_record SET deleted_at = ?, updated_at = ? WHERE source_document_id = ?", (now, now, entity_id))
-                conn.execute("UPDATE rdf_structure SET deleted_at = ?, updated_at = ? WHERE source_document_id = ?", (now, now, entity_id))
+                s.execute(update(SourceDocumentModel).where(SourceDocumentModel.id == entity_id).values(deleted_at=now, updated_at=now))
+                s.execute(update(ReactionStepModel).where(ReactionStepModel.source_document_id == entity_id).values(deleted_at=now))
+                s.execute(update(RdfReactionRecordModel).where(RdfReactionRecordModel.source_document_id == entity_id).values(deleted_at=now, updated_at=now))
+                s.execute(update(RdfStructureModel).where(RdfStructureModel.source_document_id == entity_id).values(deleted_at=now, updated_at=now))
             elif entity_type == "rdf_reaction":
-                conn.execute("UPDATE rdf_reaction_record SET deleted_at = ?, updated_at = ? WHERE id = ?", (now, now, entity_id))
-                conn.execute("UPDATE rdf_structure SET deleted_at = ?, updated_at = ? WHERE rdf_reaction_id = ?", (now, now, entity_id))
+                s.execute(update(RdfReactionRecordModel).where(RdfReactionRecordModel.id == entity_id).values(deleted_at=now, updated_at=now))
+                s.execute(update(RdfStructureModel).where(RdfStructureModel.rdf_reaction_id == entity_id).values(deleted_at=now, updated_at=now))
             elif entity_type == "rdf_structure":
-                conn.execute("UPDATE rdf_structure SET deleted_at = ?, updated_at = ? WHERE id = ?", (now, now, entity_id))
+                s.execute(update(RdfStructureModel).where(RdfStructureModel.id == entity_id).values(deleted_at=now, updated_at=now))
             elif entity_type == "reaction_step":
-                conn.execute("UPDATE reaction_step SET deleted_at = ? WHERE id = ?", (now, entity_id))
+                s.execute(update(ReactionStepModel).where(ReactionStepModel.id == entity_id).values(deleted_at=now))
             else:
                 raise ValueError(f"Unsupported delete entity type: {entity_type}")
+            s.commit()
         return {"status": "trashed", "entity_type": entity_type, "entity_id": entity_id, "deleted_at": now}
 
     def restore_trash_item(self, entity_type: str, entity_id: str) -> dict[str, Any]:
+        from .orm import SourceDocumentModel, ReactionStepModel, RdfReactionRecordModel, RdfStructureModel
+        from sqlalchemy import update
         now = utc_now()
-        with self.connect() as conn:
+        with self.session() as s:
             if entity_type == "document":
-                conn.execute("UPDATE source_document SET deleted_at = NULL, updated_at = ? WHERE id = ?", (now, entity_id))
-                conn.execute("UPDATE reaction_step SET deleted_at = NULL WHERE source_document_id = ?", (entity_id,))
-                conn.execute("UPDATE rdf_reaction_record SET deleted_at = NULL, updated_at = ? WHERE source_document_id = ?", (now, entity_id))
-                conn.execute("UPDATE rdf_structure SET deleted_at = NULL, updated_at = ? WHERE source_document_id = ?", (now, entity_id))
+                s.execute(update(SourceDocumentModel).where(SourceDocumentModel.id == entity_id).values(deleted_at=None, updated_at=now))
+                s.execute(update(ReactionStepModel).where(ReactionStepModel.source_document_id == entity_id).values(deleted_at=None))
+                s.execute(update(RdfReactionRecordModel).where(RdfReactionRecordModel.source_document_id == entity_id).values(deleted_at=None, updated_at=now))
+                s.execute(update(RdfStructureModel).where(RdfStructureModel.source_document_id == entity_id).values(deleted_at=None, updated_at=now))
             elif entity_type == "rdf_reaction":
-                conn.execute("UPDATE rdf_reaction_record SET deleted_at = NULL, updated_at = ? WHERE id = ?", (now, entity_id))
-                conn.execute("UPDATE rdf_structure SET deleted_at = NULL, updated_at = ? WHERE rdf_reaction_id = ?", (now, entity_id))
+                s.execute(update(RdfReactionRecordModel).where(RdfReactionRecordModel.id == entity_id).values(deleted_at=None, updated_at=now))
+                s.execute(update(RdfStructureModel).where(RdfStructureModel.rdf_reaction_id == entity_id).values(deleted_at=None, updated_at=now))
             elif entity_type == "rdf_structure":
-                conn.execute("UPDATE rdf_structure SET deleted_at = NULL, updated_at = ? WHERE id = ?", (now, entity_id))
+                s.execute(update(RdfStructureModel).where(RdfStructureModel.id == entity_id).values(deleted_at=None, updated_at=now))
             elif entity_type == "reaction_step":
-                conn.execute("UPDATE reaction_step SET deleted_at = NULL WHERE id = ?", (entity_id,))
+                s.execute(update(ReactionStepModel).where(ReactionStepModel.id == entity_id).values(deleted_at=None))
             else:
                 raise ValueError(f"Unsupported restore entity type: {entity_type}")
+            s.commit()
         return {"status": "restored", "entity_type": entity_type, "entity_id": entity_id}
 
     def list_trash(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            documents = conn.execute("SELECT id, title, file_path, deleted_at FROM source_document WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ?", (limit,)).fetchall()
-            reactions = conn.execute("SELECT id, cas_reaction_number AS title, source_document_id, deleted_at FROM rdf_reaction_record WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ?", (limit,)).fetchall()
-            structures = conn.execute("SELECT id, name AS title, cas_rn, rdf_reaction_id, deleted_at FROM rdf_structure WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ?", (limit,)).fetchall()
+        from .orm import SourceDocumentModel, RdfReactionRecordModel, RdfStructureModel
+        from sqlalchemy import select
+        with self.session() as s:
+            doc_stmt = select(
+                SourceDocumentModel.id,
+                SourceDocumentModel.title,
+                SourceDocumentModel.file_path,
+                SourceDocumentModel.deleted_at
+            ).where(
+                SourceDocumentModel.deleted_at.is_not(None)
+            ).order_by(
+                SourceDocumentModel.deleted_at.desc()
+            ).limit(limit)
+            documents = s.execute(doc_stmt).all()
+            
+            rxn_stmt = select(
+                RdfReactionRecordModel.id,
+                RdfReactionRecordModel.cas_reaction_number.label("title"),
+                RdfReactionRecordModel.source_document_id,
+                RdfReactionRecordModel.deleted_at
+            ).where(
+                RdfReactionRecordModel.deleted_at.is_not(None)
+            ).order_by(
+                RdfReactionRecordModel.deleted_at.desc()
+            ).limit(limit)
+            reactions = s.execute(rxn_stmt).all()
+            
+            struct_stmt = select(
+                RdfStructureModel.id,
+                RdfStructureModel.name.label("title"),
+                RdfStructureModel.cas_rn,
+                RdfStructureModel.rdf_reaction_id,
+                RdfStructureModel.deleted_at
+            ).where(
+                RdfStructureModel.deleted_at.is_not(None)
+            ).order_by(
+                RdfStructureModel.deleted_at.desc()
+            ).limit(limit)
+            structures = s.execute(struct_stmt).all()
+            
         items: list[dict[str, Any]] = []
-        items.extend({"entity_type": "document", **dict(row)} for row in documents)
-        items.extend({"entity_type": "rdf_reaction", **dict(row)} for row in reactions)
-        items.extend({"entity_type": "rdf_structure", **dict(row)} for row in structures)
+        items.extend({"entity_type": "document", "id": r.id, "title": r.title, "file_path": r.file_path, "deleted_at": r.deleted_at} for r in documents)
+        items.extend({"entity_type": "rdf_reaction", "id": r.id, "title": r.title, "source_document_id": r.source_document_id, "deleted_at": r.deleted_at} for r in reactions)
+        items.extend({"entity_type": "rdf_structure", "id": r.id, "title": r.title, "cas_rn": r.cas_rn, "rdf_reaction_id": r.rdf_reaction_id, "deleted_at": r.deleted_at} for r in structures)
         items.sort(key=lambda item: item.get("deleted_at") or "", reverse=True)
         return items[:limit]
 
     def empty_trash(self) -> dict[str, int]:
-        with self.connect() as conn:
-            structures = conn.execute("DELETE FROM rdf_structure WHERE deleted_at IS NOT NULL").rowcount
-            reactions = conn.execute("DELETE FROM rdf_reaction_record WHERE deleted_at IS NOT NULL").rowcount
-            step_ids = [row["id"] for row in conn.execute("SELECT id FROM reaction_step WHERE deleted_at IS NOT NULL")]
-            for step_id in step_ids:
-                conn.execute("DELETE FROM reaction_step_fts WHERE reaction_step_id = ?", (step_id,))
-            reaction_steps = conn.execute("DELETE FROM reaction_step WHERE deleted_at IS NOT NULL").rowcount
-            documents = conn.execute("DELETE FROM source_document WHERE deleted_at IS NOT NULL").rowcount
+        from .orm import RdfStructureModel, RdfReactionRecordModel, ReactionStepModel, SourceDocumentModel
+        from sqlalchemy import delete, select
+        with self.session() as s:
+            structures = s.execute(delete(RdfStructureModel).where(RdfStructureModel.deleted_at.is_not(None))).rowcount
+            reactions = s.execute(delete(RdfReactionRecordModel).where(RdfReactionRecordModel.deleted_at.is_not(None))).rowcount
+            
+            step_ids_stmt = select(ReactionStepModel.id).where(ReactionStepModel.deleted_at.is_not(None))
+            step_ids = s.scalars(step_ids_stmt).all()
+            if step_ids:
+                if s.bind.dialect.name == "sqlite":
+                    from sqlalchemy import text
+                    for step_id in step_ids:
+                        s.execute(
+                            text("DELETE FROM reaction_step_fts WHERE reaction_step_id = :step_id"),
+                            {"step_id": step_id}
+                        )
+            reaction_steps = s.execute(delete(ReactionStepModel).where(ReactionStepModel.deleted_at.is_not(None))).rowcount
+            documents = s.execute(delete(SourceDocumentModel).where(SourceDocumentModel.deleted_at.is_not(None))).rowcount
+            s.commit()
+            
         return {"documents": documents, "reaction_steps": reaction_steps, "rdf_reactions": reactions, "rdf_structures": structures}
 
-    def insert_reaction_step(self, step: dict[str, Any], provenance: dict[str, Any]) -> ReactionStep:
+    def insert_reaction_step(self, step: dict[str, Any], provenance: dict[str, Any]) -> ReactionStepModel:
         step_id = new_id("rxnstep")
         provenance_id = new_id("prov")
         created_at = utc_now()
@@ -1054,45 +937,38 @@ class RouteStorage:
             "needs_ocr": False,
             **step,
         }
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO reaction_step
-                (id, source_document_id, step_index, reaction_name, substrate_text, product_text,
-                 reagent_text, catalyst_text, solvent_text, temperature, time, atmosphere, yield_text,
-                 scale, workup, purification, original_text, confidence, verification_status, needs_ocr,
-                 extraction_method, schema_version, llm_confidence, metadata, created_at)
-                 VALUES
-                 (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    values["id"],
-                    values["source_document_id"],
-                    values["step_index"],
-                    values["reaction_name"],
-                    values["substrate_text"],
-                    values["product_text"],
-                    values["reagent_text"],
-                    values["catalyst_text"],
-                    values["solvent_text"],
-                    values["temperature"],
-                    values["time"],
-                    values["atmosphere"],
-                    values["yield_text"],
-                    values["scale"],
-                    values["workup"],
-                    values["purification"],
-                    values["original_text"],
-                    values["confidence"],
-                    values["verification_status"],
-                    1 if values["needs_ocr"] else 0,
-                    values.get("extraction_method", "rules"),
-                    values.get("schema_version", "reaction_step.v1"),
-                    values.get("llm_confidence"),
-                    json.dumps(values.get("metadata") or {}, ensure_ascii=False, sort_keys=True),
-                    created_at,
-                ),
+        with self.session() as s:
+            rxn = ReactionStepModel(
+                id=step_id,
+                source_document_id=values["source_document_id"],
+                step_index=values["step_index"],
+                reaction_name=values["reaction_name"],
+                substrate_text=values["substrate_text"],
+                product_text=values["product_text"],
+                reagent_text=values["reagent_text"],
+                catalyst_text=values["catalyst_text"],
+                solvent_text=values["solvent_text"],
+                temperature=values["temperature"],
+                time=values["time"],
+                atmosphere=values["atmosphere"],
+                yield_text=values["yield_text"],
+                scale=values["scale"],
+                workup=values["workup"],
+                purification=values["purification"],
+                original_text=values["original_text"],
+                confidence=values["confidence"],
+                verification_status=values["verification_status"],
+                needs_ocr=bool(values["needs_ocr"]),
+                extraction_method=values.get("extraction_method", "rules"),
+                schema_version=values.get("schema_version", "reaction_step.v1"),
+                llm_confidence=values.get("llm_confidence"),
+                metadata_=values.get("metadata") or {},
+                created_at=created_at,
+                deleted_at=None
             )
+            s.add(rxn)
+            s.flush()
+
             fts_content = "\n".join(str(values.get(key) or "") for key in (
                 "reaction_name",
                 "substrate_text",
@@ -1108,32 +984,28 @@ class RouteStorage:
                 "purification",
                 "original_text",
             ))
-            conn.execute(
-                "INSERT INTO reaction_step_fts (reaction_step_id, content) VALUES (?, ?)",
-                (step_id, fts_content),
+            if s.bind.dialect.name == "sqlite":
+                from sqlalchemy import text
+                s.execute(
+                    text("INSERT INTO reaction_step_fts (reaction_step_id, content) VALUES (:step_id, :content)"),
+                    {"step_id": step_id, "content": fts_content}
+                )
+
+            prov = ProvenanceModel(
+                id=provenance_id,
+                reaction_step_id=step_id,
+                source_document_id=values["source_document_id"],
+                page_number=provenance.get("page_number"),
+                text_span=provenance["text_span"],
+                image_region_path=provenance.get("image_region_path"),
+                ocr_output=provenance.get("ocr_output"),
+                parser_name=provenance["parser_name"],
+                parser_version=provenance["parser_version"],
+                confidence=provenance["confidence"]
             )
-            conn.execute(
-                """
-                INSERT INTO provenance
-                (id, reaction_step_id, source_document_id, page_number, text_span, image_region_path,
-                 ocr_output, parser_name, parser_version, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    provenance_id,
-                    step_id,
-                    values["source_document_id"],
-                    provenance.get("page_number"),
-                    provenance["text_span"],
-                    provenance.get("image_region_path"),
-                    provenance.get("ocr_output"),
-                    provenance["parser_name"],
-                    provenance["parser_version"],
-                    provenance["confidence"],
-                ),
-            )
-            row = conn.execute("SELECT * FROM reaction_step WHERE id = ?", (step_id,)).fetchone()
-        return self._reaction_from_row(row)
+            s.add(prov)
+            s.commit()
+            return rxn
 
     def search_reaction_steps(
         self,
@@ -1144,56 +1016,48 @@ class RouteStorage:
         document_id: str = "",
         min_confidence: float = 0.0,
         limit: int = 10,
-    ) -> list[ReactionStep]:
-        clauses = ["r.confidence >= ?", "r.deleted_at IS NULL"]
-        params: list[Any] = [min_confidence]
-        if reagent:
-            clauses.append("LOWER(COALESCE(r.reagent_text, '')) LIKE ?")
-            params.append(f"%{reagent.lower()}%")
-        if solvent:
-            clauses.append("LOWER(COALESCE(r.solvent_text, '')) LIKE ?")
-            params.append(f"%{solvent.lower()}%")
-        if document_id:
-            clauses.append("r.source_document_id = ?")
-            params.append(document_id)
+    ) -> list[ReactionStepModel]:
+        with self.session() as s:
+            from sqlalchemy import select, text
+            stmt = select(ReactionStepModel).where(
+                ReactionStepModel.confidence >= min_confidence,
+                ReactionStepModel.deleted_at.is_(None)
+            )
+            if reagent:
+                from sqlalchemy import func
+                stmt = stmt.where(func.lower(func.coalesce(ReactionStepModel.reagent_text, "")).like(f"%{reagent.lower()}%"))
+            if solvent:
+                from sqlalchemy import func
+                stmt = stmt.where(func.lower(func.coalesce(ReactionStepModel.solvent_text, "")).like(f"%{solvent.lower()}%"))
+            if document_id:
+                stmt = stmt.where(ReactionStepModel.source_document_id == document_id)
 
-        with self.connect() as conn:
             if query:
-                rows = conn.execute(
-                    f"""
-                    SELECT r.*
-                    FROM reaction_step r
-                    JOIN reaction_step_fts f ON f.reaction_step_id = r.id
-                    WHERE {' AND '.join(clauses)} AND f.content MATCH ?
-                    ORDER BY r.confidence DESC, r.step_index ASC
-                    LIMIT ?
-                    """,
-                    (*params, self._fts_query(query), limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    f"""
-                    SELECT r.* FROM reaction_step r
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY r.confidence DESC, r.step_index ASC
-                    LIMIT ?
-                    """,
-                    (*params, limit),
-                ).fetchall()
-        return [self._reaction_from_row(row) for row in rows]
+                if s.bind.dialect.name == "sqlite":
+                    stmt = stmt.where(text("reaction_step.id IN (SELECT reaction_step_id FROM reaction_step_fts WHERE content MATCH :q)")).params(q=self._fts_query(query))
+                else:
+                    concat_cols = "coalesce(reaction_name, '') || ' ' || coalesce(substrate_text, '') || ' ' || coalesce(product_text, '') || ' ' || coalesce(reagent_text, '') || ' ' || coalesce(catalyst_text, '') || ' ' || coalesce(solvent_text, '') || ' ' || coalesce(temperature, '') || ' ' || coalesce(time, '') || ' ' || coalesce(yield_text, '') || ' ' || coalesce(scale, '') || ' ' || coalesce(workup, '') || ' ' || coalesce(purification, '') || ' ' || coalesce(original_text, '')"
+                    stmt = stmt.where(text(f"to_tsvector('english', {concat_cols}) @@ plainto_tsquery('english', :q)")).params(q=query)
 
-    def get_reaction_step(self, reaction_step_id: str) -> ReactionStep | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM reaction_step WHERE id = ? AND deleted_at IS NULL", (reaction_step_id,)).fetchone()
-        return self._reaction_from_row(row) if row else None
+            stmt = stmt.order_by(ReactionStepModel.confidence.desc(), ReactionStepModel.step_index.asc()).limit(limit)
+            return list(s.scalars(stmt).all())
 
-    def get_provenance(self, reaction_step_id: str) -> list[Provenance]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM provenance WHERE reaction_step_id = ? ORDER BY id",
-                (reaction_step_id,),
-            ).fetchall()
-        return [self._provenance_from_row(row) for row in rows]
+    def get_reaction_step(self, reaction_step_id: str) -> ReactionStepModel | None:
+        with self.session() as s:
+            from sqlalchemy import select
+            stmt = select(ReactionStepModel).where(
+                ReactionStepModel.id == reaction_step_id,
+                ReactionStepModel.deleted_at.is_(None)
+            )
+            return s.scalars(stmt).first()
+
+    def get_provenance(self, reaction_step_id: str) -> list[ProvenanceModel]:
+        with self.session() as s:
+            from sqlalchemy import select
+            stmt = select(ProvenanceModel).where(
+                ProvenanceModel.reaction_step_id == reaction_step_id
+            ).order_by(ProvenanceModel.id)
+            return list(s.scalars(stmt).all())
 
     def auto_batch_document(self, document_id: str) -> dict[str, Any]:
         document = self.get_document(document_id)
@@ -1214,119 +1078,215 @@ class RouteStorage:
         return {"status": "created", "batch_id": batch_id, "confidence": 1.0}
 
     def list_batches_for_document(self, document_id: str) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT b.*, bd.role, bd.confidence AS document_confidence, bd.explanation AS document_explanation
-                FROM export_batch_document bd
-                JOIN export_batch b ON b.id = bd.batch_id
-                WHERE bd.source_document_id = ?
-                ORDER BY bd.confidence DESC, b.updated_at DESC
-                """,
-                (document_id,),
-            ).fetchall()
-        return [batch_row_to_dict(row) for row in rows]
+        from .orm import ExportBatchDocumentModel, ExportBatchModel
+        with self.session() as s:
+            from sqlalchemy import select
+            stmt = select(
+                ExportBatchModel,
+                ExportBatchDocumentModel.role,
+                ExportBatchDocumentModel.confidence.label("document_confidence"),
+                ExportBatchDocumentModel.explanation.label("document_explanation")
+            ).join(
+                ExportBatchModel,
+                ExportBatchModel.id == ExportBatchDocumentModel.batch_id
+            ).where(
+                ExportBatchDocumentModel.source_document_id == document_id
+            ).order_by(
+                ExportBatchDocumentModel.confidence.desc(),
+                ExportBatchModel.updated_at.desc()
+            )
+            results = s.execute(stmt).all()
+            out = []
+            for b, role, doc_conf, doc_expl in results:
+                d = b.to_dict()
+                d.update({
+                    "role": role,
+                    "document_confidence": doc_conf,
+                    "document_explanation": doc_expl
+                })
+                out.append(d)
+            return out
 
     def list_export_batches(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM export_batch ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
-        return [plain_batch_row_to_dict(row) for row in rows]
+        from .orm import ExportBatchModel
+        with self.session() as s:
+            from sqlalchemy import select
+            stmt = select(ExportBatchModel).order_by(ExportBatchModel.updated_at.desc()).limit(limit)
+            return [b.to_dict() for b in s.scalars(stmt).all()]
 
     def get_export_batch(self, batch_id: str) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            batch = conn.execute("SELECT * FROM export_batch WHERE id = ?", (batch_id,)).fetchone()
+        from .orm import ExportBatchModel, ExportBatchDocumentModel, SourceDocumentModel
+        with self.session() as s:
+            batch = s.get(ExportBatchModel, batch_id)
             if not batch:
                 return None
-            documents = conn.execute(
-                """
-                SELECT d.*, bd.role, bd.confidence AS link_confidence, bd.explanation AS link_explanation
-                FROM export_batch_document bd
-                JOIN source_document d ON d.id = bd.source_document_id
-                WHERE bd.batch_id = ?
-                ORDER BY bd.role, d.created_at
-                """,
-                (batch_id,),
-            ).fetchall()
-        data = plain_batch_row_to_dict(batch)
-        data["documents"] = [{key: json.loads(row[key]) if key in {"scifinder_metadata", "link_explanation"} and row[key] else row[key] for key in row.keys()} for row in documents]
-        return data
+            from sqlalchemy import select
+            stmt = select(
+                SourceDocumentModel,
+                ExportBatchDocumentModel.role,
+                ExportBatchDocumentModel.confidence.label("link_confidence"),
+                ExportBatchDocumentModel.explanation.label("link_explanation")
+            ).join(
+                SourceDocumentModel,
+                SourceDocumentModel.id == ExportBatchDocumentModel.source_document_id
+            ).where(
+                ExportBatchDocumentModel.batch_id == batch_id
+            ).order_by(
+                ExportBatchDocumentModel.role,
+                SourceDocumentModel.created_at
+            )
+            docs = s.execute(stmt).all()
+            
+            data = batch.to_dict()
+            doc_list = []
+            for d, role, link_conf, link_expl in docs:
+                doc_dict = d.to_dict()
+                doc_dict.update({
+                    "role": role,
+                    "link_confidence": link_conf,
+                    "link_explanation": link_expl
+                })
+                doc_list.append(doc_dict)
+            data["documents"] = doc_list
+            return data
 
     def unlink_document_from_batch(self, document_id: str, batch_id: str, reason: str = "") -> dict[str, Any]:
-        with self.connect() as conn:
-            conn.execute("DELETE FROM export_batch_document WHERE source_document_id = ? AND batch_id = ?", (document_id, batch_id))
-            row = conn.execute("SELECT explanation FROM export_batch WHERE id = ?", (batch_id,)).fetchone()
-            explanation = json.loads(row["explanation"]) if row and row["explanation"] else {}
-            explanation["last_unlink_reason"] = reason
-            conn.execute("UPDATE export_batch SET updated_at = ?, explanation = ? WHERE id = ?", (utc_now(), json.dumps(explanation, ensure_ascii=False, sort_keys=True), batch_id))
+        from .orm import ExportBatchDocumentModel, ExportBatchModel
+        from sqlalchemy import delete
+        with self.session() as s:
+            s.execute(
+                delete(ExportBatchDocumentModel).where(
+                    ExportBatchDocumentModel.source_document_id == document_id,
+                    ExportBatchDocumentModel.batch_id == batch_id
+                )
+            )
+            batch = s.get(ExportBatchModel, batch_id)
+            if batch:
+                explanation = dict(batch.explanation or {})
+                explanation["last_unlink_reason"] = reason
+                batch.explanation = explanation
+                batch.updated_at = utc_now()
+            s.commit()
         return {"status": "unlinked", "document_id": document_id, "batch_id": batch_id, "reason": reason}
 
-    def _best_batch_candidate(self, document: SourceDocument) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT b.id AS batch_id, b.title, d.file_path, d.file_type, d.title AS document_title
-                FROM export_batch b
-                JOIN export_batch_document bd ON bd.batch_id = b.id
-                JOIN source_document d ON d.id = bd.source_document_id
-                ORDER BY b.updated_at DESC
-                LIMIT 100
-                """
-            ).fetchall()
+    def _best_batch_candidate(self, document: SourceDocumentModel) -> dict[str, Any] | None:
+        from .orm import ExportBatchModel, ExportBatchDocumentModel, SourceDocumentModel
+        with self.session() as s:
+            from sqlalchemy import select
+            stmt = select(
+                ExportBatchModel.id.label("batch_id"),
+                ExportBatchModel.title,
+                SourceDocumentModel.file_path,
+                SourceDocumentModel.file_type,
+                SourceDocumentModel.title.label("document_title")
+            ).join(
+                ExportBatchDocumentModel,
+                ExportBatchDocumentModel.batch_id == ExportBatchModel.id
+            ).join(
+                SourceDocumentModel,
+                SourceDocumentModel.id == ExportBatchDocumentModel.source_document_id
+            ).order_by(
+                ExportBatchModel.updated_at.desc()
+            ).limit(100)
+            rows = s.execute(stmt).all()
+            
         best: dict[str, Any] | None = None
         for row in rows:
-            score, explanation = batch_match_score(document, row)
+            score, explanation = batch_match_score(document, row._mapping)
             if not best or score > best["confidence"]:
-                best = {"batch_id": row["batch_id"], "confidence": score, "explanation": explanation}
+                best = {"batch_id": row._mapping["batch_id"], "confidence": score, "explanation": explanation}
         return best
 
     def _create_export_batch(self, title: str | None, *, status: str, confidence: float, merge_method: str, explanation: dict[str, Any]) -> str:
         batch_id = new_id("batch")
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO export_batch (id, title, export_timestamp, status, confidence, merge_method, explanation, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (batch_id, title, None, status, confidence, merge_method, json.dumps(explanation, ensure_ascii=False, sort_keys=True), now, now),
+        from .orm import ExportBatchModel
+        with self.session() as s:
+            batch = ExportBatchModel(
+                id=batch_id,
+                title=title,
+                export_timestamp=None,
+                status=status,
+                confidence=confidence,
+                merge_method=merge_method,
+                explanation=explanation,
+                created_at=now,
+                updated_at=now
             )
+            s.add(batch)
+            s.commit()
         return batch_id
 
     def _link_document_to_batch(self, batch_id: str, document_id: str, role: str, confidence: float, explanation: dict[str, Any]) -> None:
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO export_batch_document (id, batch_id, source_document_id, role, confidence, explanation, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (new_id("batchdoc"), batch_id, document_id, role, confidence, json.dumps(explanation, ensure_ascii=False, sort_keys=True), now),
-            )
-            conn.execute("UPDATE export_batch SET updated_at = ?, confidence = MAX(confidence, ?) WHERE id = ?", (now, confidence, batch_id))
+        from .orm import ExportBatchDocumentModel, ExportBatchModel
+        with self.session() as s:
+            if s.bind.dialect.name == "sqlite":
+                from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+                stmt = sqlite_insert(ExportBatchDocumentModel).values(
+                    id=new_id("batchdoc"),
+                    batch_id=batch_id,
+                    source_document_id=document_id,
+                    role=role,
+                    confidence=confidence,
+                    explanation=explanation,
+                    created_at=now
+                ).on_conflict_do_nothing()
+                s.execute(stmt)
+            else:
+                from sqlalchemy.dialects.postgresql import insert as pg_insert
+                stmt = pg_insert(ExportBatchDocumentModel).values(
+                    id=new_id("batchdoc"),
+                    batch_id=batch_id,
+                    source_document_id=document_id,
+                    role=role,
+                    confidence=confidence,
+                    explanation=explanation,
+                    created_at=now
+                ).on_conflict_do_nothing(index_elements=["batch_id", "source_document_id"])
+                s.execute(stmt)
+            
+            batch = s.get(ExportBatchModel, batch_id)
+            if batch:
+                batch.updated_at = now
+                batch.confidence = max(batch.confidence or 0.0, confidence)
+            s.commit()
 
     def _record_batch_candidate(self, document_id: str, batch_id: str, confidence: float, explanation: dict[str, Any]) -> None:
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO export_batch_candidate (id, source_document_id, candidate_batch_id, confidence, explanation, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
-                """,
-                (new_id("batchcand"), document_id, batch_id, confidence, json.dumps(explanation, ensure_ascii=False, sort_keys=True), now, now),
+        from .orm import ExportBatchCandidateModel
+        with self.session() as s:
+            cand = ExportBatchCandidateModel(
+                id=new_id("batchcand"),
+                source_document_id=document_id,
+                candidate_batch_id=batch_id,
+                confidence=confidence,
+                explanation=explanation,
+                status="pending",
+                created_at=now,
+                updated_at=now
             )
+            s.add(cand)
+            s.commit()
 
-    def add_provenance(self, reaction_step_id: str, source_document_id: str, *, text_span: str, parser_name: str, parser_version: str = "external", page_number: int | None = None, image_region_path: str | None = None, ocr_output: str | None = None, confidence: float = 0.0) -> Provenance:
+    def add_provenance(self, reaction_step_id: str, source_document_id: str, *, text_span: str, parser_name: str, parser_version: str = "external", page_number: int | None = None, image_region_path: str | None = None, ocr_output: str | None = None, confidence: float = 0.0) -> ProvenanceModel:
         provenance_id = new_id("prov")
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO provenance (id, reaction_step_id, source_document_id, page_number, text_span, image_region_path, ocr_output, parser_name, parser_version, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (provenance_id, reaction_step_id, source_document_id, page_number, text_span, image_region_path, ocr_output, parser_name, parser_version, confidence),
+        with self.session() as s:
+            prov = ProvenanceModel(
+                id=provenance_id,
+                reaction_step_id=reaction_step_id,
+                source_document_id=source_document_id,
+                page_number=page_number,
+                text_span=text_span,
+                image_region_path=image_region_path,
+                ocr_output=ocr_output,
+                parser_name=parser_name,
+                parser_version=parser_version,
+                confidence=confidence
             )
-            row = conn.execute("SELECT * FROM provenance WHERE id = ?", (provenance_id,)).fetchone()
-        return self._provenance_from_row(row)
+            s.add(prov)
+            s.commit()
+            return prov
 
     def record_doi_verification(
         self,
@@ -1341,287 +1301,492 @@ class RouteStorage:
     ) -> dict[str, Any]:
         verification_id = new_id("doiver")
         created_at = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO doi_verification
-                (id, reaction_step_id, doi, paper_title, verified_fields, original_paper_excerpt,
-                 verification_confidence, verifier_agent, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    verification_id,
-                    reaction_step_id,
-                    doi,
-                    paper_title,
-                    json.dumps(verified_fields, ensure_ascii=False, sort_keys=True),
-                    original_paper_excerpt,
-                    verification_confidence,
-                    verifier_agent,
-                    created_at,
-                ),
+        from .orm import DoiVerificationModel
+        with self.session() as s:
+            ver = DoiVerificationModel(
+                id=verification_id,
+                reaction_step_id=reaction_step_id,
+                doi=doi,
+                paper_title=paper_title,
+                verified_fields=verified_fields,
+                original_paper_excerpt=original_paper_excerpt,
+                verification_confidence=verification_confidence,
+                verifier_agent=verifier_agent,
+                created_at=created_at
             )
-            conn.execute(
-                "UPDATE reaction_step SET verification_status = ? WHERE id = ?",
-                ("doi_verified", reaction_step_id),
-            )
-        return {
-            "id": verification_id,
-            "reaction_step_id": reaction_step_id,
-            "doi": doi,
-            "paper_title": paper_title,
-            "verified_fields": verified_fields,
-            "original_paper_excerpt": original_paper_excerpt,
-            "verification_confidence": verification_confidence,
-            "verifier_agent": verifier_agent,
-            "created_at": created_at,
-        }
+            s.add(ver)
+            rxn = s.get(ReactionStepModel, reaction_step_id)
+            if rxn:
+                rxn.verification_status = "doi_verified"
+            s.commit()
+            return ver.to_dict()
 
     def export_evaluation_rows(self, limit: int = 500) -> Iterable[dict[str, Any]]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT r.*, d.file_path, d.title, d.doi
-                FROM reaction_step r
-                JOIN source_document d ON d.id = r.source_document_id
-                WHERE r.deleted_at IS NULL AND d.deleted_at IS NULL
-                ORDER BY d.created_at ASC, r.step_index ASC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-            for row in rows:
-                yield {key: row[key] for key in row.keys()}
+        with self.session() as s:
+            from sqlalchemy import select
+            stmt = select(
+                ReactionStepModel,
+                SourceDocumentModel.file_path,
+                SourceDocumentModel.title,
+                SourceDocumentModel.doi
+            ).join(
+                SourceDocumentModel,
+                SourceDocumentModel.id == ReactionStepModel.source_document_id
+            ).where(
+                ReactionStepModel.deleted_at.is_(None),
+                SourceDocumentModel.deleted_at.is_(None)
+            ).order_by(
+                SourceDocumentModel.created_at.asc(),
+                ReactionStepModel.step_index.asc()
+            ).limit(limit)
+            results = s.execute(stmt).all()
+            for rxn, file_path, title, doi in results:
+                row_dict = rxn.to_dict()
+                row_dict.update({
+                    "file_path": file_path,
+                    "title": title,
+                    "doi": doi
+                })
+                yield row_dict
 
-    def list_reaction_steps_for_index(self, limit: int = 10000) -> list[ReactionStep]:
-        with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM reaction_step WHERE deleted_at IS NULL ORDER BY created_at ASC LIMIT ?", (limit,)).fetchall()
-        return [self._reaction_from_row(row) for row in rows]
+    def list_reaction_steps_for_index(self, limit: int = 10000) -> list[ReactionStepModel]:
+        with self.session() as s:
+            from sqlalchemy import select
+            stmt = select(ReactionStepModel).where(
+                ReactionStepModel.deleted_at.is_(None)
+            ).order_by(
+                ReactionStepModel.created_at.asc()
+            ).limit(limit)
+            return list(s.scalars(stmt).all())
 
     def upsert_embedding(self, reaction_step_id: str, *, model: str, embedding: list[float], error: str | None = None) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO vector_index (reaction_step_id, model, embedding, dimensions, updated_at, error)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(reaction_step_id) DO UPDATE SET
-                  model = excluded.model, embedding = excluded.embedding, dimensions = excluded.dimensions,
-                  updated_at = excluded.updated_at, error = excluded.error
-                """,
-                (reaction_step_id, model, json.dumps(embedding), len(embedding), utc_now(), error),
-            )
+        from .orm import VectorIndexModel
+        now = utc_now()
+        with self.session() as s:
+            idx = s.get(VectorIndexModel, reaction_step_id)
+            if idx:
+                idx.model = model
+                idx.embedding = embedding
+                idx.dimensions = len(embedding)
+                idx.updated_at = now
+                idx.error = error
+            else:
+                idx = VectorIndexModel(
+                    reaction_step_id=reaction_step_id,
+                    model=model,
+                    embedding=embedding,
+                    dimensions=len(embedding),
+                    updated_at=now,
+                    error=error
+                )
+                s.add(idx)
+            s.commit()
 
     def vector_index_status(self) -> dict[str, Any]:
-        with self.connect() as conn:
-            total = conn.execute("SELECT COUNT(*) AS total FROM reaction_step WHERE deleted_at IS NULL").fetchone()["total"]
-            indexed = conn.execute("SELECT COUNT(*) AS total FROM vector_index v JOIN reaction_step r ON r.id = v.reaction_step_id WHERE v.error IS NULL AND r.deleted_at IS NULL").fetchone()["total"]
-            last = conn.execute("SELECT * FROM vector_index ORDER BY updated_at DESC LIMIT 1").fetchone()
-            errors = conn.execute("SELECT COUNT(*) AS total FROM vector_index v JOIN reaction_step r ON r.id = v.reaction_step_id WHERE v.error IS NOT NULL AND r.deleted_at IS NULL").fetchone()["total"]
+        from .orm import ReactionStepModel, VectorIndexModel
+        from sqlalchemy import select, func
+        with self.session() as s:
+            total = s.scalar(select(func.count(ReactionStepModel.id)).where(ReactionStepModel.deleted_at.is_(None))) or 0
+            indexed_stmt = select(func.count(VectorIndexModel.reaction_step_id)).join(
+                ReactionStepModel,
+                ReactionStepModel.id == VectorIndexModel.reaction_step_id
+            ).where(
+                VectorIndexModel.error.is_(None),
+                ReactionStepModel.deleted_at.is_(None)
+            )
+            indexed = s.scalar(indexed_stmt) or 0
+            last_stmt = select(VectorIndexModel).order_by(VectorIndexModel.updated_at.desc()).limit(1)
+            last = s.scalars(last_stmt).first()
+            errors_stmt = select(func.count(VectorIndexModel.reaction_step_id)).join(
+                ReactionStepModel,
+                ReactionStepModel.id == VectorIndexModel.reaction_step_id
+            ).where(
+                VectorIndexModel.error.is_not(None),
+                ReactionStepModel.deleted_at.is_(None)
+            )
+            errors = s.scalar(errors_stmt) or 0
+            
         return {
             "total_steps": int(total),
             "indexed_steps": int(indexed),
             "error_count": int(errors),
-            "last_updated_at": last["updated_at"] if last else None,
-            "last_error": last["error"] if last and last["error"] else None,
-            "model": last["model"] if last else None,
+            "last_updated_at": last.updated_at if last else None,
+            "last_error": last.error if last and last.error else None,
+            "model": last.model if last else None,
         }
 
-    def semantic_search(self, embedding: list[float], *, limit: int = 10) -> list[tuple[ReactionStep, float]]:
-        with self.connect() as conn:
-            rows = conn.execute("SELECT v.reaction_step_id, v.embedding FROM vector_index v JOIN reaction_step r ON r.id = v.reaction_step_id WHERE v.error IS NULL AND r.deleted_at IS NULL").fetchall()
-        scored: list[tuple[ReactionStep, float]] = []
-        for row in rows:
+    def semantic_search(self, embedding: list[float], *, limit: int = 10) -> list[tuple[ReactionStepModel, float]]:
+        from .orm import VectorIndexModel, ReactionStepModel
+        from sqlalchemy import select
+        with self.session() as s:
+            stmt = select(VectorIndexModel.reaction_step_id, VectorIndexModel.embedding).join(
+                ReactionStepModel,
+                ReactionStepModel.id == VectorIndexModel.reaction_step_id
+            ).where(
+                VectorIndexModel.error.is_(None),
+                ReactionStepModel.deleted_at.is_(None)
+            )
+            rows = s.execute(stmt).all()
+            
+        scored: list[tuple[ReactionStepModel, float]] = []
+        for step_id, emb in rows:
+            if not isinstance(emb, list):
+                continue
             try:
-                candidate = [float(item) for item in json.loads(row["embedding"])]
-            except (TypeError, ValueError, json.JSONDecodeError):
+                candidate = [float(item) for item in emb]
+            except (TypeError, ValueError):
                 continue
             score = cosine_similarity(embedding, candidate)
-            step = self.get_reaction_step(row["reaction_step_id"])
+            step = self.get_reaction_step(step_id)
             if step:
                 scored.append((step, score))
         scored.sort(key=lambda item: item[1], reverse=True)
         return scored[:limit]
 
     def record_integration_status(self, kind: str, *, configured: bool, status: str, detail: str | None = None) -> dict[str, Any]:
+        from .orm import IntegrationStatusModel
         checked_at = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO integration_status (kind, configured, status, detail, checked_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(kind) DO UPDATE SET configured = excluded.configured, status = excluded.status,
-                  detail = excluded.detail, checked_at = excluded.checked_at
-                """,
-                (kind, 1 if configured else 0, status, detail, checked_at),
-            )
+        configured_val = 1 if configured else 0
+        with self.session() as s:
+            item = s.get(IntegrationStatusModel, kind)
+            if item:
+                item.configured = configured_val
+                item.status = status
+                item.detail = detail
+                item.checked_at = checked_at
+            else:
+                item = IntegrationStatusModel(
+                    kind=kind,
+                    configured=configured_val,
+                    status=status,
+                    detail=detail,
+                    checked_at=checked_at
+                )
+                s.add(item)
+            s.commit()
         return {"kind": kind, "configured": configured, "status": status, "detail": detail, "checked_at": checked_at}
 
     def list_integration_statuses(self) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM integration_status ORDER BY kind").fetchall()
-        return [
-            {"kind": row["kind"], "configured": bool(row["configured"]), "status": row["status"], "detail": row["detail"], "checked_at": row["checked_at"]}
-            for row in rows
-        ]
+        from .orm import IntegrationStatusModel
+        from sqlalchemy import select
+        with self.session() as s:
+            stmt = select(IntegrationStatusModel).order_by(IntegrationStatusModel.kind)
+            rows = s.scalars(stmt).all()
+            return [
+                {"kind": row.kind, "configured": bool(row.configured), "status": row.status, "detail": row.detail, "checked_at": row.checked_at}
+                for row in rows
+            ]
 
     def count_ocr_backlog(self) -> int:
-        with self.connect() as conn:
-            return int(conn.execute("SELECT COUNT(*) AS total FROM reaction_step WHERE needs_ocr = 1 AND deleted_at IS NULL").fetchone()["total"])
+        from .orm import ReactionStepModel
+        from sqlalchemy import select, func
+        with self.session() as s:
+            stmt = select(func.count(ReactionStepModel.id)).where(
+                ReactionStepModel.needs_ocr.is_(True),
+                ReactionStepModel.deleted_at.is_(None)
+            )
+            return s.scalar(stmt) or 0
 
     def low_confidence_doi_queue(self, threshold: float, limit: int = 50) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM reaction_step WHERE deleted_at IS NULL AND (confidence < ? OR verification_status != 'doi_verified') ORDER BY confidence ASC LIMIT ?",
-                (threshold, limit),
-            ).fetchall()
-        return [self._reaction_from_row(row).to_dict() for row in rows]
+        from .orm import ReactionStepModel
+        from sqlalchemy import select, or_
+        with self.session() as s:
+            stmt = select(ReactionStepModel).where(
+                ReactionStepModel.deleted_at.is_(None),
+                or_(
+                    ReactionStepModel.confidence < threshold,
+                    ReactionStepModel.verification_status != 'doi_verified'
+                )
+            ).order_by(
+                ReactionStepModel.confidence.asc()
+            ).limit(limit)
+            steps = s.scalars(stmt).all()
+            return [step.to_dict() for step in steps]
 
     def upsert_zotero_endpoint(self, data: dict[str, Any]) -> dict[str, Any]:
+        from .orm import ZoteroMcpEndpointModel
         now = utc_now()
         endpoint_id = str(data.get("id") or data.get("alias") or new_id("zotep")).strip()
         alias = str(data.get("alias") or endpoint_id).strip()
         group_name = str(data.get("group_name") or data.get("group") or alias).strip()
         url = str(data.get("url") or "").strip()
         headers = data.get("headers") if isinstance(data.get("headers"), dict) else {}
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO zotero_mcp_endpoint
-                (id, alias, group_name, url, enabled, priority, timeout_seconds, headers, write_note_enabled, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET alias = excluded.alias, group_name = excluded.group_name,
-                  url = excluded.url, enabled = excluded.enabled, priority = excluded.priority,
-                  timeout_seconds = excluded.timeout_seconds, headers = excluded.headers,
-                  write_note_enabled = excluded.write_note_enabled, updated_at = excluded.updated_at
-                """,
-                (endpoint_id, alias, group_name, url, 1 if data.get("enabled", True) else 0, int(data.get("priority") or 100), float(data.get("timeout_seconds") or 10), json.dumps(headers, ensure_ascii=False, sort_keys=True), 1 if data.get("write_note_enabled") else 0, now, now),
-            )
-            row = conn.execute("SELECT * FROM zotero_mcp_endpoint WHERE id = ?", (endpoint_id,)).fetchone()
-        return endpoint_row_to_dict(row, include_headers=True)
+        enabled = 1 if data.get("enabled", True) else 0
+        priority = int(data.get("priority") or 100)
+        timeout_seconds = float(data.get("timeout_seconds") or 10.0)
+        write_note_enabled = 1 if data.get("write_note_enabled") else 0
+        
+        with self.session() as s:
+            ep = s.get(ZoteroMcpEndpointModel, endpoint_id)
+            if ep:
+                ep.alias = alias
+                ep.group_name = group_name
+                ep.url = url
+                ep.enabled = enabled
+                ep.priority = priority
+                ep.timeout_seconds = timeout_seconds
+                ep.headers = headers
+                ep.write_note_enabled = write_note_enabled
+                ep.updated_at = now
+            else:
+                ep = ZoteroMcpEndpointModel(
+                    id=endpoint_id,
+                    alias=alias,
+                    group_name=group_name,
+                    url=url,
+                    enabled=enabled,
+                    priority=priority,
+                    timeout_seconds=timeout_seconds,
+                    headers=headers,
+                    write_note_enabled=write_note_enabled,
+                    created_at=now,
+                    updated_at=now
+                )
+                s.add(ep)
+            s.commit()
+            return _endpoint_to_dict(ep, include_headers=True)
 
     def list_zotero_endpoints(self, *, include_headers: bool = False) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM zotero_mcp_endpoint ORDER BY group_name, priority, alias").fetchall()
-        return [endpoint_row_to_dict(row, include_headers=include_headers) for row in rows]
+        from .orm import ZoteroMcpEndpointModel
+        from sqlalchemy import select
+        with self.session() as s:
+            stmt = select(ZoteroMcpEndpointModel).order_by(
+                ZoteroMcpEndpointModel.group_name,
+                ZoteroMcpEndpointModel.priority,
+                ZoteroMcpEndpointModel.alias
+            )
+            endpoints = s.scalars(stmt).all()
+            return [_endpoint_to_dict(ep, include_headers=include_headers) for ep in endpoints]
 
     def delete_zotero_endpoint(self, endpoint_id: str) -> dict[str, Any]:
-        with self.connect() as conn:
-            count = conn.execute("DELETE FROM zotero_mcp_endpoint WHERE id = ?", (endpoint_id,)).rowcount
+        from .orm import ZoteroMcpEndpointModel
+        from sqlalchemy import delete
+        with self.session() as s:
+            count = s.execute(delete(ZoteroMcpEndpointModel).where(ZoteroMcpEndpointModel.id == endpoint_id)).rowcount
+            s.commit()
         return {"status": "deleted", "id": endpoint_id, "deleted": count}
 
     def update_zotero_endpoint_status(self, endpoint_id: str, *, status: str, latency_ms: int | None = None, error: str | None = None) -> dict[str, Any] | None:
+        from .orm import ZoteroMcpEndpointModel
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute("UPDATE zotero_mcp_endpoint SET last_status = ?, last_latency_ms = ?, last_error = ?, last_checked_at = ?, updated_at = ? WHERE id = ?", (status, latency_ms, error, now, now, endpoint_id))
-            row = conn.execute("SELECT * FROM zotero_mcp_endpoint WHERE id = ?", (endpoint_id,)).fetchone()
-        return endpoint_row_to_dict(row, include_headers=False) if row else None
+        with self.session() as s:
+            ep = s.get(ZoteroMcpEndpointModel, endpoint_id)
+            if not ep:
+                return None
+            ep.last_status = status
+            ep.last_latency_ms = latency_ms
+            ep.last_error = error
+            ep.last_checked_at = now
+            ep.updated_at = now
+            s.commit()
+            return _endpoint_to_dict(ep, include_headers=False)
 
     def create_literature_link_job(self, document_id: str | None = None, *, status: str = "queued", stage: str = "queued") -> dict[str, Any]:
+        from .orm import LiteratureLinkJobModel
         job_id = new_id("litjob")
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute("INSERT INTO literature_link_job (id, document_id, status, stage, started_at, created_at) VALUES (?, ?, ?, ?, ?, ?)", (job_id, document_id, status, stage, now if status == "running" else None, now))
-            row = conn.execute("SELECT * FROM literature_link_job WHERE id = ?", (job_id,)).fetchone()
-        return job_row_to_dict(row)
+        with self.session() as s:
+            job = LiteratureLinkJobModel(
+                id=job_id,
+                document_id=document_id,
+                status=status,
+                stage=stage,
+                started_at=now if status == "running" else None,
+                created_at=now
+            )
+            s.add(job)
+            s.commit()
+            return job.to_dict()
 
     def update_literature_link_job(self, job_id: str, *, status: str, stage: str, error: str | None = None) -> dict[str, Any] | None:
-        finished_at = utc_now() if status in {"completed", "failed"} else None
-        started_at = utc_now() if status == "running" else None
-        with self.connect() as conn:
-            conn.execute("UPDATE literature_link_job SET status = ?, stage = ?, error = ?, started_at = COALESCE(started_at, ?), finished_at = COALESCE(?, finished_at) WHERE id = ?", (status, stage, error, started_at, finished_at, job_id))
-            row = conn.execute("SELECT * FROM literature_link_job WHERE id = ?", (job_id,)).fetchone()
-        return job_row_to_dict(row) if row else None
+        from .orm import LiteratureLinkJobModel
+        now = utc_now()
+        with self.session() as s:
+            job = s.get(LiteratureLinkJobModel, job_id)
+            if not job:
+                return None
+            job.status = status
+            job.stage = stage
+            job.error = error
+            if status == "running" and job.started_at is None:
+                job.started_at = now
+            if status in {"completed", "failed"} and job.finished_at is None:
+                job.finished_at = now
+            s.commit()
+            return job.to_dict()
 
     def list_literature_link_jobs(self, *, status: str = "", limit: int = 50) -> list[dict[str, Any]]:
-        with self.connect() as conn:
+        from .orm import LiteratureLinkJobModel
+        from sqlalchemy import select
+        with self.session() as s:
+            stmt = select(LiteratureLinkJobModel)
             if status:
-                rows = conn.execute("SELECT * FROM literature_link_job WHERE status = ? ORDER BY created_at DESC LIMIT ?", (status, limit)).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM literature_link_job ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-        return [job_row_to_dict(row) for row in rows]
+                stmt = stmt.where(LiteratureLinkJobModel.status == status)
+            stmt = stmt.order_by(LiteratureLinkJobModel.created_at.desc()).limit(limit)
+            jobs = s.scalars(stmt).all()
+            return [job.to_dict() for job in jobs]
 
-    def list_reaction_steps_for_document(self, document_id: str | None = None, *, limit: int = 100) -> list[ReactionStep]:
-        with self.connect() as conn:
+    def list_reaction_steps_for_document(self, document_id: str | None = None, *, limit: int = 100) -> list[ReactionStepModel]:
+        with self.session() as s:
+            from sqlalchemy import select
+            stmt = select(ReactionStepModel).where(ReactionStepModel.deleted_at.is_(None))
             if document_id:
-                rows = conn.execute("SELECT * FROM reaction_step WHERE source_document_id = ? AND deleted_at IS NULL ORDER BY step_index ASC LIMIT ?", (document_id, limit)).fetchall()
+                stmt = stmt.where(ReactionStepModel.source_document_id == document_id).order_by(ReactionStepModel.step_index.asc())
             else:
-                rows = conn.execute("SELECT * FROM reaction_step WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-        return [self._reaction_from_row(row) for row in rows]
+                stmt = stmt.order_by(ReactionStepModel.created_at.desc())
+            stmt = stmt.limit(limit)
+            return list(s.scalars(stmt).all())
 
     def upsert_literature_link(self, data: dict[str, Any]) -> dict[str, Any]:
+        from .orm import ZoteroLiteratureLinkModel
+        from sqlalchemy import select
         now = utc_now()
         link_id = str(data.get("id") or "") or new_id("litlink")
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO zotero_literature_link
-                (id, reaction_step_id, source_document_id, endpoint_id, endpoint_alias, endpoint_group, zotero_item_key,
-                 zotero_attachment_key, doi, title, authors, year, abstract, source_kind, status, confidence,
-                 match_signals, method_excerpt, si_excerpt, extracted_fields, field_diff, user_note, confirmed_by,
-                 confirmed_at, rejected_reason, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(reaction_step_id, endpoint_group, zotero_item_key) DO UPDATE SET
-                  endpoint_id = excluded.endpoint_id, endpoint_alias = excluded.endpoint_alias, doi = excluded.doi,
-                  title = excluded.title, authors = excluded.authors, year = excluded.year, abstract = excluded.abstract,
-                  status = CASE WHEN zotero_literature_link.status = 'confirmed' THEN 'confirmed' ELSE excluded.status END,
-                  confidence = MAX(zotero_literature_link.confidence, excluded.confidence), match_signals = excluded.match_signals,
-                  method_excerpt = excluded.method_excerpt, si_excerpt = excluded.si_excerpt, extracted_fields = excluded.extracted_fields,
-                  field_diff = excluded.field_diff, updated_at = excluded.updated_at
-                """,
-                (link_id, data["reaction_step_id"], data["source_document_id"], data.get("endpoint_id"), data.get("endpoint_alias"), data.get("endpoint_group"), data["zotero_item_key"], data.get("zotero_attachment_key"), data.get("doi"), data.get("title"), json.dumps(data.get("authors") or [], ensure_ascii=False), data.get("year"), data.get("abstract"), data.get("source_kind") or "zotero", data.get("status") or "candidate", float(data.get("confidence") or 0), json.dumps(data.get("match_signals") or {}, ensure_ascii=False, sort_keys=True), data.get("method_excerpt"), data.get("si_excerpt"), json.dumps(data.get("extracted_fields") or {}, ensure_ascii=False, sort_keys=True), json.dumps(data.get("field_diff") or {}, ensure_ascii=False, sort_keys=True), data.get("user_note"), data.get("confirmed_by"), data.get("confirmed_at"), data.get("rejected_reason"), now, now),
+        
+        rxn_step_id = data["reaction_step_id"]
+        group = data.get("endpoint_group")
+        item_key = data["zotero_item_key"]
+        
+        with self.session() as s:
+            stmt = select(ZoteroLiteratureLinkModel).where(
+                ZoteroLiteratureLinkModel.reaction_step_id == rxn_step_id,
+                ZoteroLiteratureLinkModel.endpoint_group == group,
+                ZoteroLiteratureLinkModel.zotero_item_key == item_key
             )
-            row = conn.execute("SELECT * FROM zotero_literature_link WHERE reaction_step_id = ? AND endpoint_group = ? AND zotero_item_key = ?", (data["reaction_step_id"], data.get("endpoint_group"), data["zotero_item_key"])).fetchone()
-        return literature_link_row_to_dict(row)
+            link = s.scalars(stmt).first()
+            
+            new_status = data.get("status") or "candidate"
+            new_confidence = float(data.get("confidence") or 0.0)
+            
+            if link:
+                link.endpoint_id = data.get("endpoint_id")
+                link.endpoint_alias = data.get("endpoint_alias")
+                link.doi = data.get("doi")
+                link.title = data.get("title")
+                link.authors = data.get("authors") or []
+                link.year = data.get("year")
+                link.abstract = data.get("abstract")
+                
+                if link.status != "confirmed":
+                    link.status = new_status
+                
+                link.confidence = max(link.confidence, new_confidence)
+                link.match_signals = data.get("match_signals") or {}
+                link.method_excerpt = data.get("method_excerpt")
+                link.si_excerpt = data.get("si_excerpt")
+                link.extracted_fields = data.get("extracted_fields") or {}
+                link.field_diff = data.get("field_diff") or {}
+                link.updated_at = now
+            else:
+                link = ZoteroLiteratureLinkModel(
+                    id=link_id,
+                    reaction_step_id=rxn_step_id,
+                    source_document_id=data["source_document_id"],
+                    endpoint_id=data.get("endpoint_id"),
+                    endpoint_alias=data.get("endpoint_alias"),
+                    endpoint_group=group,
+                    zotero_item_key=item_key,
+                    zotero_attachment_key=data.get("zotero_attachment_key"),
+                    doi=data.get("doi"),
+                    title=data.get("title"),
+                    authors=data.get("authors") or [],
+                    year=data.get("year"),
+                    abstract=data.get("abstract"),
+                    source_kind=data.get("source_kind") or "zotero",
+                    status=new_status,
+                    confidence=new_confidence,
+                    match_signals=data.get("match_signals") or {},
+                    method_excerpt=data.get("method_excerpt"),
+                    si_excerpt=data.get("si_excerpt"),
+                    extracted_fields=data.get("extracted_fields") or {},
+                    field_diff=data.get("field_diff") or {},
+                    user_note=data.get("user_note"),
+                    confirmed_by=data.get("confirmed_by"),
+                    confirmed_at=data.get("confirmed_at"),
+                    rejected_reason=data.get("rejected_reason"),
+                    created_at=now,
+                    updated_at=now
+                )
+                s.add(link)
+            s.commit()
+            return link.to_dict()
 
     def list_literature_links(self, *, status: str = "", reaction_step_id: str = "", document_id: str = "", limit: int = 50) -> list[dict[str, Any]]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if status:
-            clauses.append("status = ?")
-            params.append(status)
-        if reaction_step_id:
-            clauses.append("reaction_step_id = ?")
-            params.append(reaction_step_id)
-        if document_id:
-            clauses.append("source_document_id = ?")
-            params.append(document_id)
-        where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        with self.connect() as conn:
-            rows = conn.execute(f"SELECT * FROM zotero_literature_link {where} ORDER BY confidence DESC, updated_at DESC LIMIT ?", (*params, limit)).fetchall()
-        return [literature_link_row_to_dict(row) for row in rows]
+        from .orm import ZoteroLiteratureLinkModel
+        from sqlalchemy import select
+        with self.session() as s:
+            stmt = select(ZoteroLiteratureLinkModel)
+            if status:
+                stmt = stmt.where(ZoteroLiteratureLinkModel.status == status)
+            if reaction_step_id:
+                stmt = stmt.where(ZoteroLiteratureLinkModel.reaction_step_id == reaction_step_id)
+            if document_id:
+                stmt = stmt.where(ZoteroLiteratureLinkModel.source_document_id == document_id)
+            stmt = stmt.order_by(ZoteroLiteratureLinkModel.confidence.desc(), ZoteroLiteratureLinkModel.updated_at.desc()).limit(limit)
+            links = s.scalars(stmt).all()
+            return [link.to_dict() for link in links]
 
     def update_literature_link_status(self, link_id: str, *, status: str, confirmed_by: str | None = None, reason: str | None = None) -> dict[str, Any]:
+        from .orm import ZoteroLiteratureLinkModel
         now = utc_now()
-        with self.connect() as conn:
-            conn.execute("UPDATE zotero_literature_link SET status = ?, confirmed_by = COALESCE(?, confirmed_by), confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END, rejected_reason = ?, updated_at = ? WHERE id = ?", (status, confirmed_by, status, now, reason, now, link_id))
-            row = conn.execute("SELECT * FROM zotero_literature_link WHERE id = ?", (link_id,)).fetchone()
-        if not row:
-            raise KeyError(f"Literature link not found: {link_id}")
-        return literature_link_row_to_dict(row)
+        with self.session() as s:
+            link = s.get(ZoteroLiteratureLinkModel, link_id)
+            if not link:
+                raise KeyError(f"Literature link not found: {link_id}")
+            link.status = status
+            if confirmed_by is not None:
+                link.confirmed_by = confirmed_by
+            if status == "confirmed":
+                link.confirmed_at = now
+            link.rejected_reason = reason
+            link.updated_at = now
+            s.commit()
+            return link.to_dict()
 
     def record_zotero_writeback(self, *, literature_link_id: str, endpoint_id: str | None, zotero_item_key: str, operation: str, payload: dict[str, Any], status: str, error: str | None = None) -> dict[str, Any]:
+        from .orm import ZoteroWritebackLogModel
         log_id = new_id("zwb")
         created_at = utc_now()
-        with self.connect() as conn:
-            conn.execute("INSERT INTO zotero_writeback_log (id, literature_link_id, endpoint_id, zotero_item_key, operation, payload, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (log_id, literature_link_id, endpoint_id, zotero_item_key, operation, json.dumps(payload, ensure_ascii=False, sort_keys=True), status, error, created_at))
+        with self.session() as s:
+            log = ZoteroWritebackLogModel(
+                id=log_id,
+                literature_link_id=literature_link_id,
+                endpoint_id=endpoint_id,
+                zotero_item_key=zotero_item_key,
+                operation=operation,
+                payload=payload,
+                status=status,
+                error=error,
+                created_at=created_at
+            )
+            s.add(log)
+            s.commit()
         return {"id": log_id, "literature_link_id": literature_link_id, "endpoint_id": endpoint_id, "zotero_item_key": zotero_item_key, "operation": operation, "payload": payload, "status": status, "error": error, "created_at": created_at}
 
     def record_evaluation_metrics(self, gold_set_path: str, metrics: dict[str, Any]) -> dict[str, Any]:
+        from .orm import EvaluationMetricModel
         metric_id = new_id("metric")
         created_at = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                "INSERT INTO evaluation_metric (id, gold_set_path, metrics, created_at) VALUES (?, ?, ?, ?)",
-                (metric_id, gold_set_path, json.dumps(metrics, ensure_ascii=False, sort_keys=True), created_at),
+        with self.session() as s:
+            metric = EvaluationMetricModel(
+                id=metric_id,
+                gold_set_path=gold_set_path,
+                metrics=metrics,
+                created_at=created_at
             )
+            s.add(metric)
+            s.commit()
         return {"id": metric_id, "gold_set_path": gold_set_path, "metrics": metrics, "created_at": created_at}
 
     def latest_evaluation_metrics(self) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM evaluation_metric ORDER BY created_at DESC LIMIT 1").fetchone()
-        if not row:
-            return None
-        return {"id": row["id"], "gold_set_path": row["gold_set_path"], "metrics": json.loads(row["metrics"]), "created_at": row["created_at"]}
+        from .orm import EvaluationMetricModel
+        from sqlalchemy import select
+        with self.session() as s:
+            stmt = select(EvaluationMetricModel).order_by(EvaluationMetricModel.created_at.desc()).limit(1)
+            row = s.scalars(stmt).first()
+            if not row:
+                return None
+            return row.to_dict()
 
     def backup_sqlite(self, output_path: Path) -> dict[str, Any]:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1640,82 +1805,157 @@ class RouteStorage:
         source: str = "text",
         confidence: float = 0.5,
         aliases: list[tuple[str, str]] | None = None,
-    ) -> Compound:
+    ) -> CompoundModel:
+        from .orm import CompoundModel, CompoundAliasModel
+        from sqlalchemy import select, func
         now = utc_now()
-        with self.connect() as conn:
-            row = None
+        
+        with self.session() as s:
+            comp = None
             if cas:
-                row = conn.execute("SELECT * FROM compound WHERE cas = ?", (cas,)).fetchone()
-            if not row and inchikey:
-                row = conn.execute("SELECT * FROM compound WHERE inchikey = ?", (inchikey,)).fetchone()
-            if not row:
-                row = conn.execute("SELECT c.* FROM compound c JOIN compound_alias a ON a.compound_id = c.id WHERE LOWER(a.alias) = LOWER(?) LIMIT 1", (primary_name,)).fetchone()
-            if row:
-                compound_id = row["id"]
-                conn.execute(
-                    """
-                    UPDATE compound SET primary_name = COALESCE(?, primary_name), cas = COALESCE(?, cas), smiles = COALESCE(?, smiles),
-                      canonical_smiles = COALESCE(?, canonical_smiles), inchikey = COALESCE(?, inchikey), fingerprint = COALESCE(?, fingerprint),
-                      confidence = MAX(confidence, ?), updated_at = ? WHERE id = ?
-                    """,
-                    (primary_name, cas, smiles, canonical_smiles, inchikey, fingerprint, confidence, now, compound_id),
-                )
+                comp = s.scalars(select(CompoundModel).where(CompoundModel.cas == cas)).first()
+            if not comp and inchikey:
+                comp = s.scalars(select(CompoundModel).where(CompoundModel.inchikey == inchikey)).first()
+            if not comp:
+                comp_stmt = select(CompoundModel).join(
+                    CompoundAliasModel,
+                    CompoundAliasModel.compound_id == CompoundModel.id
+                ).where(
+                    func.lower(CompoundAliasModel.alias) == primary_name.lower()
+                ).limit(1)
+                comp = s.scalars(comp_stmt).first()
+                
+            if comp:
+                if primary_name is not None:
+                    comp.primary_name = primary_name
+                if cas is not None:
+                    comp.cas = cas
+                if smiles is not None:
+                    comp.smiles = smiles
+                if canonical_smiles is not None:
+                    comp.canonical_smiles = canonical_smiles
+                if inchikey is not None:
+                    comp.inchikey = inchikey
+                if fingerprint is not None:
+                    comp.fingerprint = fingerprint
+                comp.confidence = max(comp.confidence, confidence)
+                comp.updated_at = now
             else:
-                compound_id = new_id("cmpd")
-                conn.execute(
-                    """
-                    INSERT INTO compound (id, primary_name, cas, smiles, canonical_smiles, inchikey, fingerprint, source, confidence, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (compound_id, primary_name, cas, smiles, canonical_smiles, inchikey, fingerprint, source, confidence, now, now),
+                comp_id = new_id("cmpd")
+                comp = CompoundModel(
+                    id=comp_id,
+                    primary_name=primary_name,
+                    cas=cas,
+                    smiles=smiles,
+                    canonical_smiles=canonical_smiles,
+                    inchikey=inchikey,
+                    fingerprint=fingerprint,
+                    source=source,
+                    confidence=confidence,
+                    created_at=now,
+                    updated_at=now
                 )
-            for alias, alias_type in aliases or [(primary_name, "name")]:
-                conn.execute(
-                    "INSERT OR IGNORE INTO compound_alias (id, compound_id, alias, alias_type) VALUES (?, ?, ?, ?)",
-                    (new_id("alias"), compound_id, alias, alias_type),
-                )
-            updated = conn.execute("SELECT * FROM compound WHERE id = ?", (compound_id,)).fetchone()
-        return self._compound_from_row(updated)
+                s.add(comp)
+                
+            s.flush()
+            
+            alias_list = aliases or [(primary_name, "name")]
+            for alias_name, alias_type in alias_list:
+                exist = s.scalar(select(1).select_from(CompoundAliasModel).where(
+                    CompoundAliasModel.compound_id == comp.id,
+                    CompoundAliasModel.alias == alias_name,
+                    CompoundAliasModel.alias_type == alias_type
+                ).limit(1))
+                if not exist:
+                    new_alias = CompoundAliasModel(
+                        id=new_id("alias"),
+                        compound_id=comp.id,
+                        alias=alias_name,
+                        alias_type=alias_type
+                    )
+                    s.add(new_alias)
+                    
+            s.commit()
+            return comp
 
     def link_compound_to_reaction(self, reaction_step_id: str, compound_id: str, *, role: str, confidence: float, source: str) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                "INSERT INTO reaction_compound_role (id, reaction_step_id, compound_id, role, confidence, source) VALUES (?, ?, ?, ?, ?, ?)",
-                (new_id("role"), reaction_step_id, compound_id, role, confidence, source),
+        from .orm import ReactionCompoundRoleModel
+        with self.session() as s:
+            role_item = ReactionCompoundRoleModel(
+                id=new_id("role"),
+                reaction_step_id=reaction_step_id,
+                compound_id=compound_id,
+                role=role,
+                confidence=confidence,
+                source=source
             )
+            s.add(role_item)
+            s.commit()
 
-    def search_compounds(self, query: str = "", limit: int = 20) -> list[Compound]:
-        with self.connect() as conn:
+    def search_compounds(self, query: str = "", limit: int = 20) -> list[CompoundModel]:
+        from .orm import CompoundModel, CompoundAliasModel
+        from sqlalchemy import select, or_, func
+        with self.session() as s:
             if query:
-                rows = conn.execute(
-                    """
-                    SELECT DISTINCT c.* FROM compound c LEFT JOIN compound_alias a ON a.compound_id = c.id
-                    WHERE LOWER(c.primary_name) LIKE ? OR LOWER(COALESCE(c.cas,'')) LIKE ? OR LOWER(COALESCE(c.smiles,'')) LIKE ? OR LOWER(COALESCE(c.inchikey,'')) LIKE ? OR LOWER(COALESCE(a.alias,'')) LIKE ?
-                    ORDER BY c.updated_at DESC LIMIT ?
-                    """,
-                    tuple([f"%{query.lower()}%"] * 5 + [limit]),
-                ).fetchall()
+                like = f"%{query.lower()}%"
+                stmt = select(CompoundModel).outerjoin(
+                    CompoundAliasModel,
+                    CompoundAliasModel.compound_id == CompoundModel.id
+                ).where(
+                    or_(
+                        func.lower(CompoundModel.primary_name).like(like),
+                        func.lower(func.coalesce(CompoundModel.cas, "")).like(like),
+                        func.lower(func.coalesce(CompoundModel.smiles, "")).like(like),
+                        func.lower(func.coalesce(CompoundModel.inchikey, "")).like(like),
+                        func.lower(func.coalesce(CompoundAliasModel.alias, "")).like(like)
+                    )
+                ).distinct().order_by(CompoundModel.updated_at.desc()).limit(limit)
             else:
-                rows = conn.execute("SELECT * FROM compound ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
-        return [self._compound_from_row(row) for row in rows]
+                stmt = select(CompoundModel).order_by(CompoundModel.updated_at.desc()).limit(limit)
+            return list(s.scalars(stmt).all())
 
     def get_compound(self, compound_id: str) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            row = conn.execute("SELECT * FROM compound WHERE id = ?", (compound_id,)).fetchone()
-            if not row:
+        from .orm import CompoundModel, CompoundAliasModel, ReactionCompoundRoleModel
+        from sqlalchemy import select
+        with self.session() as s:
+            comp = s.get(CompoundModel, compound_id)
+            if not comp:
                 return None
-            aliases = conn.execute("SELECT alias, alias_type FROM compound_alias WHERE compound_id = ? ORDER BY alias", (compound_id,)).fetchall()
-            reactions = conn.execute("SELECT reaction_step_id, role, confidence, source FROM reaction_compound_role WHERE compound_id = ?", (compound_id,)).fetchall()
-        data = self._compound_from_row(row).to_dict()
-        data["aliases"] = [{key: item[key] for key in item.keys()} for item in aliases]
-        data["reaction_roles"] = [{key: item[key] for key in item.keys()} for item in reactions]
-        return data
+            
+            alias_stmt = select(CompoundAliasModel.alias, CompoundAliasModel.alias_type).where(
+                CompoundAliasModel.compound_id == compound_id
+            ).order_by(CompoundAliasModel.alias)
+            aliases = s.execute(alias_stmt).all()
+            
+            reactions_stmt = select(
+                ReactionCompoundRoleModel.reaction_step_id,
+                ReactionCompoundRoleModel.role,
+                ReactionCompoundRoleModel.confidence,
+                ReactionCompoundRoleModel.source
+            ).where(
+                ReactionCompoundRoleModel.compound_id == compound_id
+            )
+            reactions = s.execute(reactions_stmt).all()
+            
+            data = comp.to_dict()
+            data["aliases"] = [{"alias": a, "alias_type": t} for a, t in aliases]
+            data["reaction_roles"] = [{
+                "reaction_step_id": step_id,
+                "role": role,
+                "confidence": conf,
+                "source": src
+            } for step_id, role, conf, src in reactions]
+            return data
 
     def merge_compounds(self, source_compound_id: str, target_compound_id: str) -> dict[str, Any]:
-        with self.connect() as conn:
-            conn.execute("UPDATE compound_alias SET compound_id = ? WHERE compound_id = ?", (target_compound_id, source_compound_id))
-            conn.execute("UPDATE reaction_compound_role SET compound_id = ? WHERE compound_id = ?", (target_compound_id, source_compound_id))
-            conn.execute("DELETE FROM compound WHERE id = ?", (source_compound_id,))
+        from .orm import CompoundAliasModel, ReactionCompoundRoleModel, CompoundModel
+        from sqlalchemy import update, delete
+        with self.session() as s:
+            s.execute(update(CompoundAliasModel).where(CompoundAliasModel.compound_id == source_compound_id).values(compound_id=target_compound_id))
+            s.execute(update(ReactionCompoundRoleModel).where(ReactionCompoundRoleModel.compound_id == source_compound_id).values(compound_id=target_compound_id))
+            s.execute(delete(CompoundModel).where(CompoundModel.id == source_compound_id))
+            s.commit()
+            
         target = self.get_compound(target_compound_id)
         if not target:
             raise KeyError(f"Target compound not found: {target_compound_id}")
@@ -1724,115 +1964,6 @@ class RouteStorage:
     def _fts_query(self, query: str) -> str:
         terms = [term.strip().replace('"', "") for term in query.split() if term.strip()]
         return " OR ".join(f'"{term}"' for term in terms) if terms else '""'
-
-    def _document_from_row(self, row: sqlite3.Row) -> SourceDocument:
-        return SourceDocument(
-            id=row["id"],
-            file_path=row["file_path"],
-            file_hash=row["file_hash"],
-            file_type=row["file_type"],
-            title=row["title"],
-            doi=row["doi"],
-            scifinder_metadata=json.loads(row["scifinder_metadata"]) if "scifinder_metadata" in row.keys() and row["scifinder_metadata"] else {},
-            ingest_status=row["ingest_status"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-        )
-
-    def _document_summary_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
-        data = self._document_from_row(row).to_dict()
-        data.update(
-            {
-                "file_name": Path(row["file_path"]).name,
-                "parsed_chunk_count": int(row["parsed_chunk_count"] or 0),
-                "reaction_step_count": int(row["reaction_step_count"] or 0),
-                "last_job_status": row["last_job_status"],
-                "last_job_error": row["last_job_error"],
-                "last_job_finished_at": row["last_job_finished_at"],
-            }
-        )
-        return data
-
-    def _job_from_row(self, row: sqlite3.Row) -> ParseJob:
-        return ParseJob(
-            id=row["id"],
-            document_id=row["document_id"],
-            status=row["status"],
-            stage=row["stage"],
-            error=row["error"],
-            started_at=row["started_at"],
-            finished_at=row["finished_at"],
-        )
-
-    def _reaction_from_row(self, row: sqlite3.Row) -> ReactionStep:
-        return ReactionStep(
-            id=row["id"],
-            source_document_id=row["source_document_id"],
-            step_index=row["step_index"],
-            reaction_name=row["reaction_name"],
-            substrate_text=row["substrate_text"],
-            product_text=row["product_text"],
-            reagent_text=row["reagent_text"],
-            catalyst_text=row["catalyst_text"],
-            solvent_text=row["solvent_text"],
-            temperature=row["temperature"],
-            time=row["time"],
-            atmosphere=row["atmosphere"],
-            yield_text=row["yield_text"],
-            scale=row["scale"],
-            workup=row["workup"],
-            purification=row["purification"],
-            original_text=row["original_text"],
-            confidence=row["confidence"],
-            verification_status=row["verification_status"],
-            needs_ocr=bool(row["needs_ocr"]),
-            extraction_method=row["extraction_method"] if "extraction_method" in row.keys() else "rules",
-            schema_version=row["schema_version"] if "schema_version" in row.keys() else "reaction_step.v1",
-            llm_confidence=row["llm_confidence"] if "llm_confidence" in row.keys() else None,
-            metadata=json.loads(row["metadata"]) if "metadata" in row.keys() and row["metadata"] else {},
-        )
-
-    def _provenance_from_row(self, row: sqlite3.Row) -> Provenance:
-        return Provenance(
-            id=row["id"],
-            reaction_step_id=row["reaction_step_id"],
-            source_document_id=row["source_document_id"],
-            page_number=row["page_number"],
-            text_span=row["text_span"],
-            image_region_path=row["image_region_path"],
-            ocr_output=row["ocr_output"],
-            parser_name=row["parser_name"],
-            parser_version=row["parser_version"],
-            confidence=row["confidence"],
-        )
-
-    def _compound_from_row(self, row: sqlite3.Row) -> Compound:
-        return Compound(
-            id=row["id"],
-            primary_name=row["primary_name"],
-            cas=row["cas"],
-            smiles=row["smiles"],
-            canonical_smiles=row["canonical_smiles"],
-            inchikey=row["inchikey"],
-            fingerprint=row["fingerprint"],
-            source=row["source"],
-            confidence=row["confidence"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-        )
-
-    def _rdf_reaction_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
-        data = {key: row[key] for key in row.keys()}
-        for key in ["reagents", "catalysts", "solvents", "warnings"]:
-            data[key] = json.loads(data[key]) if data.get(key) else []
-        for key in ["reference", "fields"]:
-            data[key] = json.loads(data[key]) if data.get(key) else {}
-        return data
-
-    def _rdf_structure_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
-        data = {key: row[key] for key in row.keys()}
-        data["warnings"] = json.loads(data["warnings"]) if data.get("warnings") else []
-        return data
 
 
 def document_role(file_type: str) -> str:
@@ -1851,20 +1982,7 @@ def document_role(file_type: str) -> str:
     return mapping.get(file_type.lower(), "unknown")
 
 
-def parsed_chunk_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "id": row["id"],
-        "source_document_id": row["source_document_id"],
-        "chunk_index": row["chunk_index"],
-        "page_number": row["page_number"],
-        "text": row["text"],
-        "parser_name": row["parser_name"],
-        "parser_version": row["parser_version"],
-        "created_at": row["created_at"],
-    }
-
-
-def batch_match_score(document: SourceDocument, row: sqlite3.Row) -> tuple[float, dict[str, Any]]:
+def batch_match_score(document: SourceDocument, row: Any) -> tuple[float, dict[str, Any]]:
     signals: list[dict[str, Any]] = []
     score = 0.0
     document_stem = Path(document.file_path).stem.lower()
@@ -1905,48 +2023,11 @@ def normalize_for_match(value: str) -> str:
     return " ".join(value.lower().split())
 
 
-def plain_batch_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    data = {key: row[key] for key in row.keys()}
-    data["explanation"] = json.loads(data["explanation"]) if data.get("explanation") else {}
-    return data
-
-
-def batch_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    data = plain_batch_row_to_dict(row)
-    if data.get("document_explanation"):
-        data["document_explanation"] = json.loads(data["document_explanation"])
-    return data
-
-
-def endpoint_row_to_dict(row: sqlite3.Row, *, include_headers: bool = False) -> dict[str, Any]:
-    headers = json.loads(row["headers"]) if row["headers"] else {}
-    return {
-        "id": row["id"],
-        "alias": row["alias"],
-        "group_name": row["group_name"],
-        "url": row["url"],
-        "enabled": bool(row["enabled"]),
-        "priority": row["priority"],
-        "timeout_seconds": row["timeout_seconds"],
-        "headers": headers if include_headers else {key: "****" for key in headers},
-        "write_note_enabled": bool(row["write_note_enabled"]),
-        "last_status": row["last_status"],
-        "last_latency_ms": row["last_latency_ms"],
-        "last_error": row["last_error"],
-        "last_checked_at": row["last_checked_at"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }
-
-
-def job_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return {key: row[key] for key in row.keys()}
-
-
-def literature_link_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    json_fields = {"authors", "match_signals", "extracted_fields", "field_diff"}
-    data = {key: json.loads(row[key]) if key in json_fields and row[key] else row[key] for key in row.keys()}
-    return data
+def _endpoint_to_dict(ep, *, include_headers: bool = False) -> dict[str, Any]:
+    d = ep.to_dict()
+    if not include_headers:
+        d["headers"] = {key: "****" for key in d["headers"]}
+    return d
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -1958,3 +2039,4 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
+

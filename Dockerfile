@@ -41,7 +41,7 @@ RUN apt-get update -qq \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --upgrade pip \
-    && python -m pip install .
+    && python -m pip install ".[postgres]"
 
 RUN useradd --create-home --uid 10001 appuser \
     && mkdir -p /data /data/uploads /data/evidence /inbox \
