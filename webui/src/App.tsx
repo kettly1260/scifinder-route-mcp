@@ -36,7 +36,8 @@ import {
   FlaskConical,
   Search,
   BookOpen,
-  Wrench
+  Wrench,
+  Menu
 } from 'lucide-react';
 
 const IconComponents: Record<string, React.ComponentType<any>> = {
@@ -207,9 +208,14 @@ export function App() {
 
       <main className="workspace">
         <header className="topbar">
-          <div>
-            <p className="eyebrow">{t(active.description)}</p>
-            <h1>{t(active.label)}</h1>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <button className="mobile-menu-btn" onClick={() => setSidebarOpen(true)} aria-label="打开菜单">
+              <Menu size={24} />
+            </button>
+            <div>
+              <p className="eyebrow">{t(active.description)}</p>
+              <h1>{t(active.label)}</h1>
+            </div>
           </div>
           <div className="topbar-actions">
             <Button variant="ghost" className="lang-toggle" onClick={() => setLanguage(language.startsWith('zh') ? 'en' : 'zh')} aria-label="切换语言">

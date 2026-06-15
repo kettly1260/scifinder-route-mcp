@@ -336,6 +336,30 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._require_role("admin")
                 self._send_json(self.server.service.empty_trash())
                 return
+            if parsed.path == "/api/provider/test":
+                self._require_role("admin")
+                payload = self._read_json()
+                self._send_json(self.server.service.test_provider_endpoint(str(payload.get("id") or "")))
+                return
+            if parsed.path == "/api/provider/models":
+                self._require_role("admin")
+                payload = self._read_json()
+                self._send_json(self.server.service.list_provider_models(str(payload.get("id") or "")))
+                return
+            if parsed.path == "/api/provider/models/update":
+                self._require_role("admin")
+                payload = self._read_json()
+                self._send_json(self.server.service.update_provider_models(
+                    str(payload.get("id") or ""),
+                    payload.get("available_models") or [],
+                    payload.get("enabled_models") or []
+                ))
+                return
+            if parsed.path == "/api/provider/models/enabled":
+                self._require_role("viewer")
+                payload = self._read_json()
+                self._send_json(self.server.service.get_provider_enabled_models(str(payload.get("id") or "")))
+                return
         except PermissionError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             return

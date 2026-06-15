@@ -15,6 +15,7 @@ from typing import Any
 
 from .chem import fingerprint_from_query, install_rdkit, rdkit_info, render_structure_svg, substructure_match, tanimoto
 from .config import AppConfig, DEFAULT_ZOTERO_MCP_ENDPOINTS
+from .models import AiProvider
 from .extractor import extract_reaction_steps
 from .integrations import EmbeddingAdapter, ExternalParserAdapter, LLMStructuringAdapter, OCRAdapter, StructureRecognitionAdapter, RerankerAdapter, list_http_models, test_http_endpoint
 from .literature import ZoteroMcpClient, build_query, diff_reaction_fields, extract_method_fields, item_doi, item_key, item_title, item_year, normalize_doi, title_similarity, trim_text
@@ -423,12 +424,59 @@ class RouteService:
         return self.storage.record_integration_status(kind, configured=result.configured, status=result.status, detail=result.detail)
 
     def list_integration_models(self, kind: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-        endpoint, model, provider, api_key = self._integration_endpoint_settings(kind, overrides)
-        result = list_http_models(endpoint, provider=provider, api_key=api_key, kind=kind, model=model)
+        endpoint, model, provider_format, api_key = self._integration_endpoint_settings(kind, overrides)
+        provider_id = self._override_value(overrides, "integrations", f"{kind}_provider_id", getattr(self.config, f"{kind}_provider_id", None))
+        if kind == "extraction":
+            provider_id = self._override_value(overrides, "integrations", "extraction_provider_id", getattr(self.config, "extraction_provider_id", None))
+        provider = self._resolve_provider(provider_id, overrides)
+        
+        models_endpoint = provider.models_endpoint if provider else None
+        
+        result = list_http_models(endpoint, provider=provider_format, api_key=api_key, kind=kind, model=model, models_endpoint=models_endpoint)
         if result.status != "ok":
-            LOGGER.warning("Integration model listing failed kind=%s provider=%s configured=%s detail=%s", kind, provider, result.configured, result.detail)
+            LOGGER.warning("Integration model listing failed kind=%s provider=%s configured=%s detail=%s", kind, provider_format, result.configured, result.detail)
         payload = result.payload if isinstance(result.payload, dict) else {}
         return {"kind": kind, "configured": result.configured, "status": result.status, "detail": result.detail, "models": payload.get("models", [])}
+
+    def test_provider_endpoint(self, provider_id: str) -> dict[str, Any]:
+        provider = self._resolve_provider(provider_id)
+        if not provider:
+            return {"status": "error", "detail": "Provider not found"}
+        # Do a generic model list or health check
+        result = test_http_endpoint(provider.endpoint, provider=provider.format, api_key=provider.api_key, kind="generic")
+        return {"configured": result.configured, "status": result.status, "detail": result.detail}
+
+    def list_provider_models(self, provider_id: str) -> dict[str, Any]:
+        provider = self._resolve_provider(provider_id)
+        if not provider:
+            return {"status": "error", "detail": "Provider not found", "models": []}
+        result = list_http_models(provider.endpoint, provider=provider.format, api_key=provider.api_key, kind="generic", models_endpoint=provider.models_endpoint)
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        return {"status": result.status, "detail": result.detail, "models": payload.get("models", [])}
+
+    def update_provider_models(self, provider_id: str, available_models: list[str], enabled_models: list[str]) -> dict[str, Any]:
+        providers = list(getattr(self.config, "ai_providers", []))
+        for i, p in enumerate(providers):
+            if p.id == provider_id:
+                providers[i] = AiProvider(
+                    id=p.id,
+                    name=p.name,
+                    format=p.format,
+                    endpoint=p.endpoint,
+                    api_key=p.api_key,
+                    models_endpoint=p.models_endpoint,
+                    available_models=tuple(available_models),
+                    enabled_models=tuple(enabled_models)
+                )
+                self.update_config({"ai_providers": [p.to_dict() for p in providers]})
+                return {"status": "ok"}
+        return {"status": "error", "detail": "Provider not found"}
+
+    def get_provider_enabled_models(self, provider_id: str) -> list[str]:
+        provider = self._resolve_provider(provider_id)
+        if provider:
+            return list(provider.enabled_models)
+        return []
 
     def _resolve_provider(self, provider_id: str | None, overrides: dict[str, Any] | None = None) -> Any | None:
         ai_providers_list = None
@@ -446,7 +494,7 @@ class RouteService:
 
     def _integration_endpoint_settings(self, kind: str, overrides: dict[str, Any] | None = None) -> tuple[str | None, str | None, str, str | None]:
         feature_map = {
-            "llm": ("extraction_provider_id", "extraction_model"),
+            "extraction": ("extraction_provider_id", "extraction_model"),
             "embedding": ("embedding_provider_id", "embedding_model"),
             "ocr": ("ocr_provider_id", "ocr_model"),
             "document_parser": ("document_parser_provider_id", "document_parser_model"),

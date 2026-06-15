@@ -4,7 +4,6 @@ import type { IntegrationGroup } from '../../constants';
 import { configFieldByKey } from '../../constants';
 import { Button } from '../../components';
 import { ConfigControl } from './ConfigControl';
-import { ModelSuggestions } from './ModelSuggestions';
 import { ActionResult } from './ActionResult';
 import { useTranslation } from '../../i18n';
 import { X, Pencil, CircleCheck, CircleAlert } from 'lucide-react';
@@ -24,13 +23,10 @@ const ROUTE_ICONS: Record<string, string> = {
 export interface ConfigIntegrationCardProps {
   group: IntegrationGroup;
   values: Record<string, string>;
-  models: string[];
   providers?: JsonObject[];
   testResult?: JsonObject;
-  modelResult?: JsonObject;
   onChange: (key: string, value: string) => void;
   onTest: () => void;
-  onLoadModels: () => void;
   onSave: () => void;
 }
 
@@ -97,13 +93,10 @@ export function ConfigIntegrationCard(props: ConfigIntegrationCardProps) {
 function IntegrationModal({
   group,
   values,
-  models,
   providers,
   testResult,
-  modelResult,
   onChange,
   onTest,
-  onLoadModels,
   onSave,
   onClose,
 }: ConfigIntegrationCardProps & { onClose: () => void }) {
@@ -156,23 +149,20 @@ function IntegrationModal({
                   field={field}
                   value={values[key] ?? ''}
                   onChange={onChange}
-                  suggestions={key === group.modelKey ? models : undefined}
                   providers={providers}
+                  values={values}
+                  group={group}
                 />
               );
             })}
           </div>
 
-          <ModelSuggestions models={models} modelKey={group.modelKey} onChange={onChange} />
-
           <div className="route-modal-actions">
             <Button variant="secondary" size="sm" onClick={onTest}>{t('测试端点')}</Button>
-            <Button variant="ghost" size="sm" onClick={onLoadModels}>{t('拉取模型')}</Button>
           </div>
 
           <div className="result-grid" style={{ marginTop: '8px' }}>
             <ActionResult title={t("端点测试")} result={testResult} />
-            <ActionResult title={t("模型拉取")} result={modelResult} />
           </div>
         </div>
 

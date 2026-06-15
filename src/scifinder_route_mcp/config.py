@@ -885,6 +885,13 @@ def parse_ai_providers(value: Any) -> tuple[AiProvider, ...]:
         provider_id = str(item.get("id") or "").strip()
         if not provider_id:
             continue
+        available_models = item.get("available_models", [])
+        if not isinstance(available_models, (list, tuple)):
+            available_models = []
+        enabled_models = item.get("enabled_models", [])
+        if not isinstance(enabled_models, (list, tuple)):
+            enabled_models = []
+            
         providers.append(
             AiProvider(
                 id=provider_id,
@@ -892,6 +899,9 @@ def parse_ai_providers(value: Any) -> tuple[AiProvider, ...]:
                 format=str(item.get("format") or "openai_compatible").strip(),
                 endpoint=none_if_empty(item.get("endpoint")),
                 api_key=none_if_empty(item.get("api_key")),
+                models_endpoint=none_if_empty(item.get("models_endpoint")),
+                available_models=tuple(str(m) for m in available_models),
+                enabled_models=tuple(str(m) for m in enabled_models),
             )
         )
     return tuple(providers)

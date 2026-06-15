@@ -8,9 +8,11 @@ export interface ConfigControlProps {
   onChange: (key: string, value: string) => void;
   suggestions?: string[];
   providers?: JsonObject[];
+  values?: Record<string, string>;
+  group?: { providerKey: string; modelKey: string };
 }
 
-export function ConfigControl({ field, value, onChange, suggestions, providers }: ConfigControlProps) {
+export function ConfigControl({ field, value, onChange, suggestions, providers, values, group }: ConfigControlProps) {
   const { t } = useTranslation();
   const key = `${field.section}.${field.name}`;
 
@@ -51,6 +53,26 @@ export function ConfigControl({ field, value, onChange, suggestions, providers }
         </select>
       </label>
     );
+  }
+
+  // If this is a model field and the selected provider has enabled_models, use a select
+  if (group && key === group.modelKey && providers && values) {
+    const providerId = values[group.providerKey];
+    const provider = providers.find(p => p.id === providerId);
+    const enabledModels = (provider?.enabled_models as string[]) || [];
+    if (enabledModels.length > 0) {
+      return (
+        <label className="form-group">
+          {field.label}
+          <select value={value} onChange={(event) => onChange(key, event.target.value)}>
+            <option value="">{t('(空 - 不使用)')}</option>
+            {enabledModels.map((m) => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+          </select>
+        </label>
+      );
+    }
   }
 
   const listId = suggestions?.length ? `list-${field.section}-${field.name}` : undefined;

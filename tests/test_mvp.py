@@ -670,18 +670,18 @@ def test_integration_model_listing_uses_unsaved_form_overrides(tmp_path: Path, m
     service = make_service(tmp_path)
     seen: dict[str, object] = {}
 
-    def fake_list_models(endpoint: str | None, *, provider: str = "openai_compatible", api_key: str | None = None, kind: str = "generic", model: str | None = None) -> EndpointResult:
-        seen.update({"endpoint": endpoint, "provider": provider, "api_key": api_key, "kind": kind, "model": model})
+    def fake_list_models(endpoint: str | None, *, provider: str = "openai_compatible", api_key: str | None = None, kind: str = "generic", model: str | None = None, models_endpoint: str | None = None) -> EndpointResult:
+        seen.update({"endpoint": endpoint, "provider": provider, "api_key": api_key, "kind": kind, "model": model, "models_endpoint": models_endpoint})
         return EndpointResult(True, "ok", "Loaded 1 models", {"models": ["gpt-test"]})
 
     monkeypatch.setattr("scifinder_route_mcp.service.list_http_models", fake_list_models)
 
     result = service.list_integration_models(
-        "llm",
+        "extraction",
         overrides={"integrations": {"ai_providers": [{"id": "new", "endpoint": "https://llm.example/v1", "format": "gemini", "api_key": "new-secret"}], "extraction_provider_id": "new"}},
     )
 
-    assert seen == {"endpoint": "https://llm.example/v1", "provider": "gemini", "api_key": "new-secret", "kind": "llm", "model": None}
+    assert seen == {"endpoint": "https://llm.example/v1", "provider": "gemini", "api_key": "new-secret", "kind": "extraction", "model": None, "models_endpoint": None}
     assert result["models"] == ["gpt-test"]
 
 

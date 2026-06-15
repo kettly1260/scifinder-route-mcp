@@ -10,6 +10,9 @@ class AiProvider:
     format: str
     endpoint: str | None
     api_key: str | None
+    models_endpoint: str | None = None
+    available_models: tuple[str, ...] = ()
+    enabled_models: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

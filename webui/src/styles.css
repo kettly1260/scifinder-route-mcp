@@ -174,7 +174,7 @@ button, input, select { font: inherit; max-width: 100%; }
   flex-direction: column;
   gap: 18px;
 }
-.sidebar-backdrop, .mobile-menu-button { display: none !important; }
+.sidebar-backdrop, .mobile-menu-btn { display: none !important; }
 
 .brand-block { display: flex; align-items: center; gap: 13px; }
 .brand-block.large { align-items: flex-start; }
@@ -524,6 +524,19 @@ pre {
     box-shadow: none;
     backdrop-filter: blur(4px);
   }
+  .mobile-menu-btn {
+    display: flex !important;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--text);
+    cursor: pointer;
+    border-radius: 6px;
+    padding: 4px;
+    flex-shrink: 0;
+  }
+  .mobile-menu-btn:hover { background: var(--line); }
   .sidebar {
     position: fixed;
     z-index: 40;

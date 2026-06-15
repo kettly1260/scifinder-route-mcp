@@ -122,7 +122,7 @@ def test_http_endpoint(endpoint: str | None, *, model: str | None = None, provid
         return EndpointResult(configured=True, status="ok", detail="PaddleOCR-VL job endpoint configured. This provider has no lightweight health endpoint; submit a document to verify job execution.")
     if kind in {"document_parser", "structure_recognition"} and _looks_like_paddleocr_job_endpoint(endpoint, model):
         return EndpointResult(configured=True, status="ok", detail="PaddleOCR-VL job endpoint configured. It does not expose /health or /models; runtime calls will submit OCR jobs and use configured fallbacks where available.")
-    if kind == "llm":
+    if kind == "extraction":
         try:
             return _test_llm_endpoint(endpoint, model=model, provider=provider, api_key=api_key)
         except Exception as exc:
@@ -159,7 +159,7 @@ def model_list_url(endpoint: str, provider: str, api_key: str | None = None) -> 
     return _openai_resource_url(base, "models")
 
 
-def list_http_models(endpoint: str | None, *, provider: str = "openai_compatible", api_key: str | None = None, kind: str = "generic", model: str | None = None) -> EndpointResult:
+def list_http_models(endpoint: str | None, *, provider: str = "openai_compatible", api_key: str | None = None, kind: str = "generic", model: str | None = None, models_endpoint: str | None = None) -> EndpointResult:
     if not endpoint:
         return EndpointResult(configured=False, status="unknown", detail="Endpoint is not configured", payload={"models": []})
     if provider == "paddleocr_vl" or (kind in {"ocr", "document_parser"} and _looks_like_paddleocr_job_endpoint(endpoint, model)):
@@ -168,7 +168,7 @@ def list_http_models(endpoint: str | None, *, provider: str = "openai_compatible
     if kind in {"document_parser", "structure_recognition"}:
         models = [model] if model else []
         return EndpointResult(configured=True, status="ok", detail="This integration type does not define a standard model-list endpoint; using the configured model value.", payload={"models": models})
-    models_url = model_list_url(endpoint, provider, api_key)
+    models_url = models_endpoint if models_endpoint else model_list_url(endpoint, provider, api_key)
     try:
         payload = get_json(models_url, headers=auth_headers(provider, api_key))
     except Exception as exc:
