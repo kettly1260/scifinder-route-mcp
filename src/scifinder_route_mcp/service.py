@@ -1283,11 +1283,14 @@ class RouteService:
             self.storage.update_job(job_id, status="running", stage="document_parse")
             parsed_document = parsed or self._parse_with_optional_external(Path(document.file_path))
             visual_metadata = self._extract_visual_evidence(Path(document.file_path), document_id)
-            if self._should_run_ocr(parsed_document) and self.config.ocr_endpoint:
+            
+            ocr_endpoint, _, _, _ = self._integration_endpoint_settings("ocr")
+            if self._should_run_ocr(parsed_document) and ocr_endpoint:
                 self.storage.update_job(job_id, status="running", stage="ocr")
                 parsed_document = self._augment_with_ocr(document.file_path, parsed_document)
             
-            if visual_metadata and visual_metadata.get("rendered_paths") and self.config.structure_recognition_endpoint:
+            struct_endpoint, _, _, _ = self._integration_endpoint_settings("structure_recognition")
+            if visual_metadata and visual_metadata.get("rendered_paths") and struct_endpoint:
                 self.storage.update_job(job_id, status="running", stage="vision_structure_extraction")
                 vision_smiles = []
                 for img_path in visual_metadata["rendered_paths"]:
