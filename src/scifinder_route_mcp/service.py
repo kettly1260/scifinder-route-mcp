@@ -468,7 +468,7 @@ class RouteService:
                     available_models=tuple(available_models),
                     enabled_models=tuple(enabled_models)
                 )
-                self.update_config({"ai_providers": [p.to_dict() for p in providers]})
+                self.update_config({"integrations": {"ai_providers": [p.to_dict() for p in providers]}})
                 return {"status": "ok"}
         return {"status": "error", "detail": "Provider not found"}
 
