@@ -610,6 +610,19 @@ def mask_secret(value: str | None) -> str | None:
     return f"{value[:2]}***{value[-2:]}"
 
 
+def _unmask_value(new_val: Any, old_val: Any) -> Any:
+    if isinstance(new_val, str) and "***" in new_val and isinstance(old_val, str):
+        return old_val
+    if isinstance(new_val, dict) and isinstance(old_val, dict):
+        return {k: _unmask_value(new_val[k], old_val.get(k)) for k in new_val}
+    if isinstance(new_val, list) and isinstance(old_val, list):
+        if all(isinstance(x, dict) and "id" in x for x in new_val) and all(isinstance(x, dict) and "id" in x for x in old_val):
+            old_by_id = {x["id"]: x for x in old_val}
+            return [_unmask_value(x, old_by_id.get(x["id"])) for x in new_val]
+        return [_unmask_value(nv, old_val[i]) if i < len(old_val) else nv for i, nv in enumerate(new_val)]
+    return new_val
+
+
 def merge_hot_config(current: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
     rejected = sorted(set(updates) - HOT_CONFIG_SECTIONS)
     if rejected:
@@ -624,7 +637,8 @@ def merge_hot_config(current: dict[str, Any], updates: dict[str, Any]) -> dict[s
         existing = merged.get(key, {})
         if not isinstance(existing, dict):
             existing = {}
-        existing.update(value)
+        for k, v in value.items():
+            existing[k] = _unmask_value(v, existing.get(k))
         merged[key] = existing
     return {key: merged.get(key, {}) for key in sorted(HOT_CONFIG_SECTIONS)}
 
