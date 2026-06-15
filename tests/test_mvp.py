@@ -613,9 +613,9 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
             "ingest": {"scan_extensions": [".html"], "upload_extensions": [".html", ".rdf"], "upload_max_bytes": 4096},
             "integrations": {
                 "ai_providers": [
-                    {"id": "test-embed", "endpoint": "http://embedding:8000/v1"},
-                    {"id": "test-ocr", "endpoint": "http://ocr-worker:9000"},
-                    {"id": "test-parser", "endpoint": "http://parser:9100"}
+                    {"id": "test-embed", "name": "Embed", "format": "openai_compatible", "endpoint": "http://embedding:8000/v1", "api_key": ""},
+                    {"id": "test-ocr", "name": "OCR", "format": "paddleocr_vl", "endpoint": "http://ocr-worker:9000", "api_key": ""},
+                    {"id": "test-parser", "name": "Parser", "format": "doc2x", "endpoint": "http://parser:9100", "api_key": ""}
                 ],
                 "embedding_provider_id": "test-embed",
                 "embedding_model": "bge-m3",
@@ -687,8 +687,9 @@ def test_integration_model_listing_uses_unsaved_form_overrides(tmp_path: Path, m
 
 def test_integration_endpoint_uses_saved_ocr_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = make_service(tmp_path)
-    from scifinder_route_mcp.models import AiProvider
-    service.config = service.config.__class__(**{**service.config.__dict__, "ai_providers": [AiProvider(id="paddle", name="Paddle", format="paddleocr_vl", endpoint="https://paddleocr.aistudio-app.com/api/v2/ocr/jobs", api_key="secret")], "ocr_provider_id": "paddle", "ocr_model": "PaddleOCR-VL-1.6"})
+    from scifinder_route_mcp.config import AiProvider
+    service.storage.upsert_ai_provider(AiProvider(id="paddle", name="Paddle", format="paddleocr_vl", endpoint="https://paddleocr.aistudio-app.com/api/v2/ocr/jobs", api_key="secret"))
+    service.config = service.config.model_copy(update={"ocr_provider_id": "paddle", "ocr_model": "PaddleOCR-VL-1.6"})
     seen: dict[str, object] = {}
 
     def fake_test_endpoint(endpoint: str | None, *, model: str | None = None, provider: str = "openai_compatible", api_key: str | None = None, kind: str = "generic") -> EndpointResult:
@@ -818,7 +819,7 @@ def test_validate_config_reports_invalid_threshold(tmp_path: Path) -> None:
     assert validation["warnings"]
 
 
-def test_webui_config_manages_zotero_endpoints_separately(tmp_path: Path) -> None:
+def test_database_manages_zotero_endpoints_separately(tmp_path: Path) -> None:
     service = make_service(tmp_path)
 
     endpoint = service.upsert_zotero_mcp_endpoint(
@@ -830,12 +831,11 @@ def test_webui_config_manages_zotero_endpoints_separately(tmp_path: Path) -> Non
             "write_note_enabled": True,
         }
     )
-    webui_config = read_config_yaml(service.config.data_dir / "webui-config.yaml")
 
     assert endpoint["alias"] == "lab-zotero"
     assert service.config.config_path.exists() is False
-    assert webui_config["integrations"]["zotero_mcp_endpoints"][0]["alias"] == "lab-zotero"
     listed = service.list_zotero_mcp_endpoints()
+    assert listed[0]["alias"] == "lab-zotero"
     assert listed[0]["headers"]["Authorization"] == "****"
     assert service.get_config()["paths"]["webui_config_path"].endswith("webui-config.yaml")
 
@@ -1441,22 +1441,29 @@ def test_legacy_config_migration(tmp_path: Path) -> None:
     # Load overrides
     config = config.apply_file_overrides()
     
-    # Verify migration results
-    assert len(config.ai_providers) == 4
+    # Init service to trigger migration
+    from scifinder_route_mcp.storage import RouteStorage
+    from scifinder_route_mcp.service import RouteService
+    storage = RouteStorage(config.database_path)
+    service = RouteService(config=config, storage=storage)
     
-    extraction = next(p for p in config.ai_providers if p.id == "legacy-extraction")
+    # Verify migration results
+    providers = storage.list_ai_providers()
+    assert len(providers) == 4
+    
+    extraction = next(p for p in providers if p.id == "legacy-extraction")
     assert extraction.format == "openai_compatible"
     assert extraction.endpoint == "https://api.openai.com/v1"
     assert extraction.api_key == "sk-proj-testkey"
-    assert config.extraction_provider_id == "legacy-extraction"
-    assert config.extraction_model == "gpt-4o-mini"
+    assert service.config.extraction_provider_id == "legacy-extraction"
+    assert service.config.extraction_model == "gpt-4o-mini"
     
-    ocr = next(p for p in config.ai_providers if p.id == "legacy-ocr")
+    ocr = next(p for p in providers if p.id == "legacy-ocr")
     assert ocr.format == "paddleocr_vl"
     assert ocr.endpoint == "http://127.0.0.1:8866"
-    assert config.ocr_provider_id == "legacy-ocr"
+    assert service.config.ocr_provider_id == "legacy-ocr"
     
-    doc_parser = next(p for p in config.ai_providers if p.id == "legacy-document_parser")
+    doc_parser = next(p for p in providers if p.id == "legacy-document_parser")
     assert doc_parser.format == "doc2x"
     assert config.document_parser_provider_id == "legacy-document_parser"
     

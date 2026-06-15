@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .models import Compound, ParseJob, Provenance, ReactionStep, SourceDocument
+from .models import Compound, ParseJob, Provenance, ReactionStep, SourceDocument, AiProvider
 
 
 def utc_now() -> str:
@@ -148,6 +148,19 @@ class RouteStorage:
                     confidence REAL NOT NULL,
                     explanation TEXT NOT NULL DEFAULT '{}',
                     status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_provider (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    format TEXT NOT NULL,
+                    endpoint TEXT,
+                    api_key TEXT,
+                    models_endpoint TEXT,
+                    available_models TEXT NOT NULL DEFAULT '[]',
+                    enabled_models TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -348,6 +361,103 @@ class RouteStorage:
                 """
             )
             self._migrate_schema(conn)
+            
+            # Initialize default Zotero endpoint if empty
+            count = conn.execute("SELECT COUNT(*) FROM zotero_mcp_endpoint").fetchone()[0]
+            if count == 0:
+                conn.execute("""
+                    INSERT INTO zotero_mcp_endpoint (id, alias, group_name, url, enabled, priority, timeout_seconds, headers, write_note_enabled, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    "local-zotero",
+                    "Local Zotero",
+                    "local",
+                    "http://127.0.0.1:23120/mcp",
+                    1,
+                    100,
+                    10.0,
+                    "{}",
+                    1,
+                    utc_now(),
+                    utc_now(),
+                ))
+
+    # --- AI Providers ---
+
+    def list_ai_providers(self) -> list[AiProvider]:
+        with self.connect() as conn:
+            rows = conn.execute("""
+                SELECT id, name, format, endpoint, api_key, models_endpoint, available_models, enabled_models
+                FROM ai_provider
+                ORDER BY created_at ASC
+            """).fetchall()
+        
+        providers = []
+        for row in rows:
+            providers.append(AiProvider(
+                id=row['id'],
+                name=row['name'],
+                format=row['format'],
+                endpoint=row['endpoint'],
+                api_key=row['api_key'],
+                models_endpoint=row['models_endpoint'],
+                available_models=tuple(json.loads(row['available_models'])),
+                enabled_models=tuple(json.loads(row['enabled_models'])),
+            ))
+        return providers
+
+    def get_ai_provider(self, provider_id: str) -> AiProvider | None:
+        with self.connect() as conn:
+            row = conn.execute("""
+                SELECT id, name, format, endpoint, api_key, models_endpoint, available_models, enabled_models
+                FROM ai_provider WHERE id = ?
+            """, (provider_id,)).fetchone()
+        
+        if not row:
+            return None
+        return AiProvider(
+            id=row['id'],
+            name=row['name'],
+            format=row['format'],
+            endpoint=row['endpoint'],
+            api_key=row['api_key'],
+            models_endpoint=row['models_endpoint'],
+            available_models=tuple(json.loads(row['available_models'])),
+            enabled_models=tuple(json.loads(row['enabled_models'])),
+        )
+
+    def upsert_ai_provider(self, provider: AiProvider) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("""
+                INSERT INTO ai_provider (id, name, format, endpoint, api_key, models_endpoint, available_models, enabled_models, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    format = excluded.format,
+                    endpoint = excluded.endpoint,
+                    api_key = excluded.api_key,
+                    models_endpoint = excluded.models_endpoint,
+                    available_models = excluded.available_models,
+                    enabled_models = excluded.enabled_models,
+                    updated_at = excluded.updated_at
+            """, (
+                provider.id,
+                provider.name,
+                provider.format,
+                provider.endpoint,
+                provider.api_key,
+                provider.models_endpoint,
+                json.dumps(provider.available_models),
+                json.dumps(provider.enabled_models),
+                now, now
+            ))
+
+    def delete_ai_provider(self, provider_id: str) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute("DELETE FROM ai_provider WHERE id = ?", (provider_id,))
+            return cur.rowcount > 0
+
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         reaction_columns = {row["name"] for row in conn.execute("PRAGMA table_info(reaction_step)")}

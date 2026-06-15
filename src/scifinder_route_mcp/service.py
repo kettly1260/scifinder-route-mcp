@@ -53,20 +53,143 @@ class RouteService:
         self.config.ensure_directories()
         self.storage_backend_status = self._resolve_storage_backend_status()
         self.storage = storage or RouteStorage(self.config.database_path)
+        self._migrate_legacy_providers()
         self._stop_event = threading.Event()
         self._workers: list[threading.Thread] = []
         self._active_jobs: set[str] = set()
         self._active_jobs_lock = threading.Lock()
         self._rdkit_install_job: dict[str, Any] | None = None
         self._rdkit_install_lock = threading.Lock()
-        self._sync_zotero_endpoint_config()
         if self.config.async_jobs:
             self._start_workers()
 
+    def _migrate_legacy_providers(self) -> None:
+        from .config import read_config_yaml, write_config_yaml, AiProvider
+        target = self.config.webui_config_path or self.config.data_dir / "webui-config.yaml"
+        target = Path(target)
+        if not target.exists():
+            return
+            
+        data = read_config_yaml(target)
+        integrations = data.get("integrations", {})
+        if not isinstance(integrations, dict):
+            return
+        dirty = False
+        
+        # Legacy flat key migration
+        legacy_keys = [
+            ("llm_endpoint", "llm_api_key", "llm_model", "llm_provider", "legacy-extraction", ["gpt-4o-mini", "claude-3-5-sonnet-20240620"], "extraction_provider_id", "extraction_model"),
+            ("embedding_endpoint", "embedding_api_key", "embedding_model", "openai_compatible", "legacy-embedding", ["text-embedding-3-small"], "embedding_provider_id", "embedding_model"),
+            ("ocr_endpoint", "ocr_api_key", "ocr_model", "ocr_provider", "legacy-ocr", ["paddleocr_vl", "got_ocr2_vl"], "ocr_provider_id", "ocr_model"),
+            ("document_parser_endpoint", "document_parser_api_key", "document_parser_model", "document_parser_provider", "legacy-document_parser", ["doc2x", "marker"], "document_parser_provider_id", "document_parser_model"),
+            ("structure_recognition_endpoint", "structure_recognition_api_key", "structure_recognition_model", "structure_recognition_provider", "legacy-structure_recognition", ["molar"], "structure_recognition_provider_id", "structure_recognition_model"),
+        ]
+        
+        for ep_key, apik_key, mod_key, prov_key, provider_id, avail_models, pid_key, mod_config_key in legacy_keys:
+            if ep_key in integrations:
+                model_val = integrations.get(mod_key)
+                if not self.storage.get_ai_provider(provider_id):
+                    p = AiProvider(
+                        id=provider_id,
+                        name=provider_id.replace("legacy-", "").title() + " Provider",
+                        format=integrations.get(prov_key, "openai_compatible"),
+                        endpoint=integrations[ep_key],
+                        api_key=integrations.get(apik_key) or "",
+                        available_models=tuple(avail_models),
+                        enabled_models=tuple([model_val] if model_val else [])
+                    )
+                    self.storage.upsert_ai_provider(p)
+                del integrations[ep_key]
+                integrations.pop(apik_key, None)
+                integrations.pop(mod_key, None)
+                integrations.pop(prov_key, None)
+                if pid_key not in integrations:
+                    integrations[pid_key] = provider_id
+                if model_val and mod_config_key not in integrations:
+                    integrations[mod_config_key] = model_val
+                dirty = True
+        
+        if "ai_providers" in integrations:
+            existing_providers = self.storage.list_ai_providers()
+            if not existing_providers:
+                for p_dict in integrations["ai_providers"]:
+                    try:
+                        self.storage.upsert_ai_provider(AiProvider(**p_dict))
+                    except Exception:
+                        pass
+            del integrations["ai_providers"]
+            dirty = True
+            
+        if "zotero_mcp_endpoints" in integrations:
+            existing_endpoints = self.storage.list_zotero_endpoints()
+            if not existing_endpoints:
+                for z_dict in integrations["zotero_mcp_endpoints"]:
+                    try:
+                        self.storage.upsert_zotero_endpoint(z_dict)
+                    except Exception:
+                        pass
+            del integrations["zotero_mcp_endpoints"]
+            dirty = True
+            
+        if dirty:
+            write_config_yaml(target, data)
+
     def get_config(self, include_secrets: bool = False) -> dict[str, Any]:
-        return self.config.effective_config(include_secrets=include_secrets)
+        cfg = self.config.effective_config(include_secrets=include_secrets)
+        if "integrations" not in cfg:
+            cfg["integrations"] = {}
+        
+        cfg["integrations"]["ai_providers"] = [p.to_dict() for p in self.storage.list_ai_providers()]
+        if not include_secrets:
+            for p in cfg["integrations"]["ai_providers"]:
+                if p.get("api_key"):
+                    p["api_key"] = "****"
+
+        cfg["integrations"]["zotero_mcp_endpoints"] = self.storage.list_zotero_endpoints(include_headers=include_secrets)
+        
+        return cfg
 
     def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
+        if "integrations" in updates:
+            from .config import AiProvider
+            integrations = updates["integrations"]
+            
+            if "ai_providers" in integrations:
+                incoming_ids = {p.get("id") for p in integrations["ai_providers"] if p.get("id")}
+                existing_ids = {p.id for p in self.storage.list_ai_providers()}
+                
+                for p_dict in integrations["ai_providers"]:
+                    try:
+                        if p_dict.get("api_key") == "****":
+                            existing = self.storage.get_ai_provider(p_dict["id"])
+                            if existing:
+                                p_dict["api_key"] = existing.api_key
+                        self.storage.upsert_ai_provider(AiProvider(**p_dict))
+                    except Exception as e:
+                        LOGGER.warning("Failed to upsert ai_provider from config UI: %s", e)
+                        
+                for to_delete in existing_ids - incoming_ids:
+                    self.storage.delete_ai_provider(to_delete)
+                del integrations["ai_providers"]
+            
+            if "zotero_mcp_endpoints" in integrations:
+                incoming_ids = {z.get("id") for z in integrations["zotero_mcp_endpoints"] if z.get("id")}
+                existing_ids = {z["id"] for z in self.storage.list_zotero_endpoints()}
+                
+                for z_dict in integrations["zotero_mcp_endpoints"]:
+                    try:
+                        if any(v == "****" for v in z_dict.get("headers", {}).values()):
+                            existing = next((item for item in self.storage.list_zotero_endpoints(include_headers=True) if item["id"] == z_dict["id"]), None)
+                            if existing:
+                                z_dict["headers"] = existing.get("headers", {})
+                        self.storage.upsert_zotero_endpoint(z_dict)
+                    except Exception as e:
+                        LOGGER.warning("Failed to upsert zotero endpoint from config UI: %s", e)
+                        
+                for to_delete in existing_ids - incoming_ids:
+                    self.storage.delete_zotero_endpoint(to_delete)
+                del integrations["zotero_mcp_endpoints"]
+                
         self.config.write_hot_config(updates)
         return self.reload_config()
 
@@ -78,7 +201,6 @@ class RouteService:
         self.storage_backend_status = self._resolve_storage_backend_status()
         if old_async != self.config.async_jobs or old_workers != self.config.max_workers:
             self._restart_workers()
-        self._sync_zotero_endpoint_config()
         return self.get_config()
 
     def validate_config(self) -> dict[str, Any]:
@@ -408,7 +530,7 @@ class RouteService:
             result = self._test_postgres(self._override_value(overrides, "integrations", "postgres_url", self.config.postgres_url))
             return self.storage.record_integration_status("postgres", **result)
         if kind == "zotero_mcp":
-            endpoints = self._configured_zotero_endpoints()
+            endpoints = self.storage.list_zotero_endpoints()
             if not endpoints:
                 return self.storage.record_integration_status("zotero_mcp", configured=False, status="unknown", detail="No Zotero MCP endpoints configured")
             results = [self.test_zotero_mcp_endpoint(endpoint["id"]) for endpoint in endpoints]
@@ -455,21 +577,21 @@ class RouteService:
         return {"status": result.status, "detail": result.detail, "models": payload.get("models", [])}
 
     def update_provider_models(self, provider_id: str, available_models: list[str], enabled_models: list[str]) -> dict[str, Any]:
-        providers = list(getattr(self.config, "ai_providers", []))
-        for i, p in enumerate(providers):
-            if p.id == provider_id:
-                providers[i] = AiProvider(
-                    id=p.id,
-                    name=p.name,
-                    format=p.format,
-                    endpoint=p.endpoint,
-                    api_key=p.api_key,
-                    models_endpoint=p.models_endpoint,
-                    available_models=tuple(available_models),
-                    enabled_models=tuple(enabled_models)
-                )
-                self.update_config({"integrations": {"ai_providers": [p.to_dict() for p in providers]}})
-                return {"status": "ok"}
+        provider = self.storage.get_ai_provider(provider_id)
+        if provider:
+            from .config import AiProvider
+            updated = AiProvider(
+                id=provider.id,
+                name=provider.name,
+                format=provider.format,
+                endpoint=provider.endpoint,
+                api_key=provider.api_key,
+                models_endpoint=provider.models_endpoint,
+                available_models=tuple(available_models),
+                enabled_models=tuple(enabled_models)
+            )
+            self.storage.upsert_ai_provider(updated)
+            return {"status": "ok"}
         return {"status": "error", "detail": "Provider not found"}
 
     def get_provider_enabled_models(self, provider_id: str) -> list[str]:
@@ -479,18 +601,16 @@ class RouteService:
         return []
 
     def _resolve_provider(self, provider_id: str | None, overrides: dict[str, Any] | None = None) -> Any | None:
-        ai_providers_list = None
+        if not provider_id:
+            return None
         if isinstance(overrides, dict) and isinstance(overrides.get("integrations"), dict):
             ai_providers_list = overrides["integrations"].get("ai_providers")
-        if ai_providers_list is None:
-            ai_providers_list = getattr(self.config, "ai_providers", [])
-        for p_dict in ai_providers_list:
-            if isinstance(p_dict, dict) and p_dict.get("id") == provider_id:
+            if ai_providers_list:
                 from .config import parse_ai_providers
-                return parse_ai_providers([p_dict])[0]
-            elif hasattr(p_dict, "id") and p_dict.id == provider_id:
-                return p_dict
-        return None
+                for p_dict in ai_providers_list:
+                    if isinstance(p_dict, dict) and p_dict.get("id") == provider_id:
+                        return parse_ai_providers([p_dict])[0]
+        return self.storage.get_ai_provider(provider_id)
 
     def _integration_endpoint_settings(self, kind: str, overrides: dict[str, Any] | None = None) -> tuple[str | None, str | None, str, str | None]:
         feature_map = {
@@ -920,15 +1040,15 @@ class RouteService:
     def list_zotero_mcp_endpoints(self, *, include_headers: bool = False) -> list[dict[str, Any]]:
         status_by_id = {item["id"]: item for item in self.storage.list_zotero_endpoints(include_headers=False)}
         endpoints = []
-        for endpoint in self._configured_zotero_endpoints(include_headers=include_headers):
+        for endpoint in self.storage.list_zotero_endpoints(include_headers=include_headers):
             status = status_by_id.get(endpoint["id"], {})
             endpoints.append({**endpoint, "last_status": status.get("last_status"), "last_latency_ms": status.get("last_latency_ms"), "last_error": status.get("last_error"), "last_checked_at": status.get("last_checked_at")})
         return endpoints
 
     def upsert_zotero_mcp_endpoint(self, endpoint: dict[str, Any]) -> dict[str, Any]:
-        endpoints = [dict(item) for item in self.config.zotero_mcp_endpoints]
         endpoint_id = str(endpoint.get("id") or endpoint.get("alias") or "").strip()
         if not endpoint_id:
+            endpoints = self.storage.list_zotero_endpoints()
             endpoint_id = str(endpoint.get("alias") or f"zotero-{len(endpoints) + 1}").strip()
         url = str(endpoint.get("url") or "").strip()
         enabled = endpoint.get("enabled", True)
@@ -936,30 +1056,26 @@ class RouteService:
             raise ValueError("Zotero MCP endpoint URL is required when the endpoint is enabled")
         if url and not url.startswith(("http://", "https://")):
             raise ValueError("Zotero MCP endpoint URL must start with http:// or https://")
-        endpoint = {**endpoint, "url": url}
-        endpoint = {**endpoint, "id": endpoint_id}
-        replaced = False
-        for index, item in enumerate(endpoints):
-            if item.get("id") == endpoint_id or item.get("alias") == endpoint.get("alias"):
-                endpoints[index] = {**item, **endpoint}
-                replaced = True
-                break
-        if not replaced:
-            endpoints.append(endpoint)
-        self.update_config({"integrations": {"zotero_mcp_endpoints": endpoints}})
-        normalized = [item for item in self._configured_zotero_endpoints(include_headers=True) if item["id"] == endpoint_id]
+        endpoint = {**endpoint, "url": url, "id": endpoint_id}
+        
+        if any(v == "****" for v in endpoint.get("headers", {}).values()):
+            existing = next((item for item in self.storage.list_zotero_endpoints(include_headers=True) if item["id"] == endpoint_id), None)
+            if existing:
+                endpoint["headers"] = existing.get("headers", {})
+                
+        self.storage.upsert_zotero_endpoint(endpoint)
+        
+        normalized = [item for item in self.storage.list_zotero_endpoints(include_headers=True) if item["id"] == endpoint_id]
         if not normalized:
             raise KeyError(f"Zotero MCP endpoint not found after update: {endpoint_id}")
         return normalized[0]
 
     def delete_zotero_mcp_endpoint(self, endpoint_id: str) -> dict[str, Any]:
-        endpoints = [dict(item) for item in self.config.zotero_mcp_endpoints if item.get("id") != endpoint_id]
-        self.update_config({"integrations": {"zotero_mcp_endpoints": endpoints}})
         self.storage.delete_zotero_endpoint(endpoint_id)
         return {"status": "deleted", "id": endpoint_id}
 
     def test_zotero_mcp_endpoint(self, endpoint_id: str) -> dict[str, Any]:
-        endpoint = next((item for item in self._configured_zotero_endpoints(include_headers=True) if item["id"] == endpoint_id), None)
+        endpoint = next((item for item in self.storage.list_zotero_endpoints(include_headers=True) if item["id"] == endpoint_id), None)
         if not endpoint:
             raise KeyError(f"Zotero MCP endpoint not found: {endpoint_id}")
         result = ZoteroMcpClient(endpoint).test()
@@ -996,7 +1112,7 @@ class RouteService:
         link = next((item for item in self.list_literature_links(limit=1000) if item["id"] == link_id), None)
         if not link:
             raise KeyError(f"Literature link not found: {link_id}")
-        endpoint = next((item for item in self._configured_zotero_endpoints(include_headers=True) if item["id"] == link.get("endpoint_id")), None)
+        endpoint = next((item for item in self.storage.list_zotero_endpoints(include_headers=True) if item["id"] == link.get("endpoint_id")), None)
         if not endpoint:
             raise KeyError("Configured Zotero endpoint for this link is no longer available")
         if not endpoint.get("write_note_enabled"):
@@ -1009,21 +1125,6 @@ class RouteService:
             return self.storage.record_zotero_writeback(literature_link_id=link_id, endpoint_id=endpoint["id"], zotero_item_key=link["zotero_item_key"], operation="write_note", payload={"note": note}, status="error", error=str(exc))
         return self.storage.record_zotero_writeback(literature_link_id=link_id, endpoint_id=endpoint["id"], zotero_item_key=link["zotero_item_key"], operation="write_note", payload={"note": note, "result": result}, status="ok")
 
-    def _configured_zotero_endpoints(self, *, include_headers: bool = True) -> list[dict[str, Any]]:
-        endpoints = []
-        configured = self.config.zotero_mcp_endpoints or DEFAULT_ZOTERO_MCP_ENDPOINTS
-        for endpoint in configured:
-            item = dict(endpoint)
-            headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
-            if not include_headers:
-                headers = {key: "****" for key in headers}
-            item["headers"] = headers
-            endpoints.append(item)
-        return endpoints
-
-    def _sync_zotero_endpoint_config(self) -> None:
-        for endpoint in self._configured_zotero_endpoints(include_headers=True):
-            self.storage.upsert_zotero_endpoint(endpoint)
 
     def _process_literature_link_job(self, job_id: str, document_id: str | None = None) -> None:
         try:
@@ -1044,7 +1145,7 @@ class RouteService:
 
     def _select_zotero_endpoints(self) -> list[dict[str, Any]]:
         grouped: dict[str, list[dict[str, Any]]] = {}
-        for endpoint in self._configured_zotero_endpoints(include_headers=True):
+        for endpoint in self.storage.list_zotero_endpoints(include_headers=True):
             grouped.setdefault(str(endpoint.get("group_name") or endpoint.get("alias")), []).append(endpoint)
         selected = []
         for endpoints in grouped.values():
