@@ -627,10 +627,17 @@ class RouteService:
         if isinstance(overrides, dict) and isinstance(overrides.get("integrations"), dict):
             ai_providers_list = overrides["integrations"].get("ai_providers")
             if ai_providers_list:
-                from .config import parse_ai_providers
+                from .config import parse_ai_providers, _unmask_value
+                import dataclasses
                 for p_dict in ai_providers_list:
                     if isinstance(p_dict, dict) and p_dict.get("id") == provider_id:
-                        return parse_ai_providers([p_dict])[0]
+                        parsed = parse_ai_providers([p_dict])[0]
+                        stored = self.storage.get_ai_provider(provider_id)
+                        if stored and parsed.api_key and stored.api_key:
+                            unmasked_key = _unmask_value(parsed.api_key, stored.api_key)
+                            if unmasked_key != parsed.api_key:
+                                parsed = dataclasses.replace(parsed, api_key=unmasked_key)
+                        return parsed
         return self.storage.get_ai_provider(provider_id)
 
     def _integration_endpoint_settings(self, kind: str, overrides: dict[str, Any] | None = None) -> tuple[str | None, str | None, str, str | None]:
