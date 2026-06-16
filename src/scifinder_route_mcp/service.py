@@ -571,9 +571,23 @@ class RouteService:
         provider = self._resolve_provider(provider_id)
         if not provider:
             return {"status": "error", "detail": "Provider not found"}
-        # Do a generic model list or health check
-        result = test_http_endpoint(provider.endpoint, provider=provider.format, api_key=provider.api_key, kind="generic")
-        return {"configured": result.configured, "status": result.status, "detail": result.detail}
+        # Use model listing as connectivity test – the same path that
+        # "fetch models" uses.  Most OpenAI-compatible / Gemini / Claude
+        # providers expose /models but not /health, so a generic health
+        # check almost always fails while model listing succeeds.
+        result = list_http_models(
+            provider.endpoint,
+            provider=provider.format,
+            api_key=provider.api_key,
+            kind="llm",
+            models_endpoint=provider.models_endpoint,
+        )
+        if result.status == "ok":
+            model_count = len((result.payload or {}).get("models", []))
+            detail = f"Endpoint reachable – {model_count} model(s) available"
+        else:
+            detail = result.detail
+        return {"configured": result.configured, "status": result.status, "detail": detail}
 
     def list_provider_models(self, provider_id: str) -> dict[str, Any]:
         provider = self._resolve_provider(provider_id)
