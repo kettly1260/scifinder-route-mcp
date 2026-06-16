@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import type { AdminState, JsonObject } from '../types';
+import type { JsonObject } from '../types';
 import type { PageProps, ZoteroEndpointForm } from '../constants';
 import { defaultZoteroEndpoint, buildConfigValues, configFieldByKey, integrationGroups, runtimeGroups, configFields } from '../constants';
 import { getJson, postJson } from '../api';
@@ -14,12 +14,12 @@ import { useTranslation } from '../i18n';
 import { X, Pencil, CircleCheck, CircleAlert } from 'lucide-react';
 
 export interface ConfigPageProps extends PageProps {
-  refresh: () => Promise<AdminState>;
+  onConfigSaved: (config: JsonObject) => void;
 }
 
 type TabId = 'providers' | 'routes' | 'runtime';
 
-export function ConfigPage({ token, state, guarded, refresh }: ConfigPageProps) {
+export function ConfigPage({ token, state, guarded, onConfigSaved }: ConfigPageProps) {
   const { t } = useTranslation();
   const [activeTab, setActiveTab] = useState<TabId>('providers');
   const [values, setValues] = useState<Record<string, string>>(() => buildConfigValues(state.config));
@@ -58,10 +58,10 @@ export function ConfigPage({ token, state, guarded, refresh }: ConfigPageProps) 
 
   async function save() {
     const payload = buildPayload(false);
-    await postJson('/api/config', token, payload);
-    const next = await refresh();
-    setValues(buildConfigValues(next.config));
-    const p = (next.config.integrations as JsonObject | undefined)?.ai_providers;
+    const nextConfig = await postJson<JsonObject>('/api/config', token, payload);
+    onConfigSaved(nextConfig);
+    setValues(buildConfigValues(nextConfig));
+    const p = (nextConfig.integrations as JsonObject | undefined)?.ai_providers;
     setProviders(Array.isArray(p) ? (p as JsonObject[]) : []);
   }
 
@@ -78,8 +78,8 @@ export function ConfigPage({ token, state, guarded, refresh }: ConfigPageProps) 
 
   return (
     <div className="page-stack">
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--line)', paddingBottom: '12px', marginBottom: '16px' }}>
-        <div className="config-tabs-list" style={{ marginBottom: 0, borderBottom: 'none' }}>
+      <div className="config-tabs-bar">
+        <div className="config-tabs-list">
           <button className={`config-tab-trigger ${activeTab === 'providers' ? 'active' : ''}`} onClick={() => setActiveTab('providers')}>
             {t('AI 供应商')}
           </button>
@@ -90,12 +90,12 @@ export function ConfigPage({ token, state, guarded, refresh }: ConfigPageProps) 
             {t('运行时与存储')}
           </button>
         </div>
-        <Button onClick={() => guarded(save, t('配置已保存并重载'))}>{t('保存全局配置')}</Button>
+        <Button onClick={() => guarded(save, t('配置已保存'))}>{t('保存全局配置')}</Button>
       </div>
 
       {/* AI Providers Tab */}
       <div className={`config-tab-content ${activeTab === 'providers' ? 'active' : ''}`}>
-        <AiProvidersPanel providers={providers} setProviders={setProviders} token={token} guarded={guarded} refresh={refresh} />
+        <AiProvidersPanel providers={providers} setProviders={setProviders} token={token} guarded={guarded} />
       </div>
 
       {/* Integration Routes Tab */}
@@ -114,7 +114,7 @@ export function ConfigPage({ token, state, guarded, refresh }: ConfigPageProps) 
               testResult={actionResults[group.id]}
               onChange={update}
               onTest={() => guarded(() => runEndpointTest(group.id), `${group.title} ${t('测试完成')}`)}
-              onSave={() => guarded(save, t('配置已保存并重载'))}
+              onSave={() => guarded(save, t('配置已保存'))}
             />
           ))}
           <ZoteroRouteCard
@@ -131,7 +131,7 @@ export function ConfigPage({ token, state, guarded, refresh }: ConfigPageProps) 
         <RuntimePanel
           values={values}
           onChange={update}
-          onSave={() => guarded(save, t('配置已保存并重载'))}
+          onSave={() => guarded(save, t('配置已保存'))}
           onTestPostgres={() => guarded(() => runEndpointTest('postgres'), t('Postgres 测试完成'))}
           postgresResult={actionResults.postgres}
         />

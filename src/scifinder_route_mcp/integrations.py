@@ -72,13 +72,21 @@ def _http_error_detail(exc: Exception, *, url: str, model: str | None = None) ->
     return "; ".join(parts)
 
 
-def _openai_resource_url(endpoint: str, resource: str) -> str:
+def _resource_url(endpoint: str, resource: str, known_suffixes: tuple[str, ...]) -> str:
     base = endpoint.rstrip("/")
-    for suffix in ("/chat/completions", "/responses", "/embeddings", "/models"):
+    for suffix in known_suffixes:
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
     return base + "/" + resource.lstrip("/")
+
+
+def _openai_resource_url(endpoint: str, resource: str) -> str:
+    return _resource_url(endpoint, resource, ("/chat/completions", "/responses", "/embeddings", "/models"))
+
+
+def _integration_resource_url(endpoint: str, resource: str) -> str:
+    return _resource_url(endpoint, resource, ("/health", "/ocr", "/parse", "/recognize", "/rerank"))
 
 
 def _gemini_base_url(endpoint: str) -> str:
@@ -107,7 +115,7 @@ def _test_llm_endpoint(endpoint: str, *, model: str | None, provider: str, api_k
             url += "?" + urllib.parse.urlencode({"key": api_key})
         response = post_json(url, {"contents": [{"role": "user", "parts": [{"text": "Reply with OK."}]}]}, timeout=30, headers={})
     elif provider == "claude":
-        url = base + "/messages"
+        url = _resource_url(base, "messages", ("/messages",))
         response = post_json(url, {"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply with OK."}]}, timeout=30, headers=auth_headers(provider, api_key))
     else:
         url = _openai_resource_url(base, "chat/completions")
@@ -136,13 +144,13 @@ def test_http_endpoint(endpoint: str | None, *, model: str | None = None, provid
         except Exception as exc:
             return EndpointResult(configured=True, status="error", detail=_http_error_detail(exc, url=embeddings_url, model=model))
     if kind == "reranker":
-        rerank_url = endpoint.rstrip("/") + "/rerank"
+        rerank_url = _integration_resource_url(endpoint, "rerank")
         try:
             payload = post_json(rerank_url, {"model": model or "default", "query": "ping", "texts": ["ping"], "documents": ["ping"]}, timeout=30, headers=auth_headers("openai_compatible", api_key))
             return EndpointResult(configured=True, status="ok", detail=f"Reranker endpoint accepted a test request at {_display_url(rerank_url)}", payload=payload)
         except Exception as exc:
             return EndpointResult(configured=True, status="error", detail=_http_error_detail(exc, url=rerank_url, model=model))
-    health_url = endpoint.rstrip("/") + "/health"
+    health_url = _integration_resource_url(endpoint, "health")
     try:
         payload = get_json(health_url, headers=auth_headers(provider, api_key))
         return EndpointResult(configured=True, status="ok", detail=json.dumps(payload, ensure_ascii=False)[:500], payload=payload)
@@ -205,7 +213,7 @@ class EmbeddingAdapter:
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not self.endpoint:
             raise RuntimeError("Embedding endpoint is not configured")
-        url = self.endpoint.rstrip("/") + "/embeddings"
+        url = _openai_resource_url(self.endpoint, "embeddings")
         payload = post_json(url, {"model": self.model, "input": texts}, headers=auth_headers("openai_compatible", self.api_key))
         data = payload.get("data")
         if isinstance(data, list):
@@ -254,7 +262,7 @@ class LLMStructuringAdapter:
     def _complete(self, system: str, user: str) -> str | None:
         base = self.endpoint.rstrip("/") if self.endpoint else ""
         if self.provider == "openai_responses":
-            payload = post_json(base + "/responses", {"model": self.model, "input": [{"role": "system", "content": system}, {"role": "user", "content": user}], "temperature": 0}, headers=auth_headers(self.provider, self.api_key))
+            payload = post_json(_openai_resource_url(base, "responses"), {"model": self.model, "input": [{"role": "system", "content": system}, {"role": "user", "content": user}], "temperature": 0}, headers=auth_headers(self.provider, self.api_key))
             if isinstance(payload.get("output_text"), str):
                 return payload["output_text"]
             output = payload.get("output") or []
@@ -264,16 +272,18 @@ class LLMStructuringAdapter:
                         return content["text"]
             return None
         if self.provider == "gemini":
-            url = base + f"/models/{self.model}:generateContent" + (("?key=" + self.api_key) if self.api_key else "")
+            url = _gemini_base_url(base) + f"/models/{self.model}:generateContent"
+            if self.api_key:
+                url += "?" + urllib.parse.urlencode({"key": self.api_key})
             payload = post_json(url, {"systemInstruction": {"parts": [{"text": system}]}, "contents": [{"role": "user", "parts": [{"text": user}]}], "generationConfig": {"temperature": 0}}, headers={})
             candidates = payload.get("candidates") or []
             parts = candidates[0].get("content", {}).get("parts", []) if candidates and isinstance(candidates[0], dict) else []
             return "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict)) or None
         if self.provider == "claude":
-            payload = post_json(base + "/messages", {"model": self.model, "system": system, "max_tokens": 2048, "temperature": 0, "messages": [{"role": "user", "content": user}]}, headers=auth_headers(self.provider, self.api_key))
+            payload = post_json(_resource_url(base, "messages", ("/messages",)), {"model": self.model, "system": system, "max_tokens": 2048, "temperature": 0, "messages": [{"role": "user", "content": user}]}, headers=auth_headers(self.provider, self.api_key))
             content = payload.get("content") or []
             return "".join(str(item.get("text") or "") for item in content if isinstance(item, dict)) or None
-        payload = post_json(base + "/chat/completions", {"model": self.model, "temperature": 0, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}, headers=auth_headers(self.provider, self.api_key))
+        payload = post_json(_openai_resource_url(base, "chat/completions"), {"model": self.model, "temperature": 0, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}, headers=auth_headers(self.provider, self.api_key))
         return payload.get("choices", [{}])[0].get("message", {}).get("content")
 
 
@@ -293,7 +303,7 @@ class OCRAdapter:
             raise RuntimeError("OCR endpoint is not configured")
         if self.provider == "paddleocr_vl":
             return self._ocr_paddleocr_vl(file_path)
-        return post_json(self.endpoint.rstrip("/") + "/ocr", {"model": self.model, "file_path": file_path}, headers=auth_headers("openai_compatible", self.api_key))
+        return post_json(_integration_resource_url(self.endpoint, "ocr"), {"model": self.model, "file_path": file_path}, headers=auth_headers("openai_compatible", self.api_key))
 
     def _ocr_paddleocr_vl(self, file_path: str) -> dict[str, Any]:
         endpoint = self.endpoint.rstrip("/")
@@ -360,7 +370,7 @@ class ExternalParserAdapter:
     def parse(self, file_path: str) -> ParsedDocument:
         if not self.endpoint:
             raise RuntimeError("Document parser endpoint is not configured")
-        payload = post_json(self.endpoint.rstrip("/") + "/parse", {"model": self.model, "file_path": file_path}, headers=auth_headers("openai_compatible", self.api_key))
+        payload = post_json(_integration_resource_url(self.endpoint, "parse"), {"model": self.model, "file_path": file_path}, headers=auth_headers("openai_compatible", self.api_key))
         chunks: list[TextChunk] = []
         for item in payload.get("chunks", []):
             if not isinstance(item, dict):
@@ -403,7 +413,7 @@ class StructureRecognitionAdapter:
         if self.provider != "generic":
             return self._recognize_vision_llm(image_path)
             
-        payload = post_json(self.endpoint.rstrip("/") + "/recognize", {"model": self.model, "image_path": image_path}, headers=auth_headers("openai_compatible", self.api_key))
+        payload = post_json(_integration_resource_url(self.endpoint, "recognize"), {"model": self.model, "image_path": image_path}, headers=auth_headers("openai_compatible", self.api_key))
         results = payload.get("structures", [])
         return results if isinstance(results, list) else []
 
@@ -418,17 +428,19 @@ class StructureRecognitionAdapter:
         base = self.endpoint.rstrip("/")
         content: str | None = None
         if self.provider == "gemini":
-            url = base + f"/models/{self.model}:generateContent" + (("?key=" + self.api_key) if self.api_key else "")
+            url = _gemini_base_url(base) + f"/models/{self.model}:generateContent"
+            if self.api_key:
+                url += "?" + urllib.parse.urlencode({"key": self.api_key})
             payload = post_json(url, {"systemInstruction": {"parts": [{"text": system}]}, "contents": [{"role": "user", "parts": [{"text": user}, {"inlineData": {"mimeType": "image/jpeg", "data": b64_image}}]}]}, headers={})
             candidates = payload.get("candidates") or []
             parts = candidates[0].get("content", {}).get("parts", []) if candidates and isinstance(candidates[0], dict) else []
             content = "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict)) or None
         elif self.provider == "claude":
-            payload = post_json(base + "/messages", {"model": self.model, "system": system, "max_tokens": 2048, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_image}}, {"type": "text", "text": user}]}]}, headers=auth_headers(self.provider, self.api_key))
+            payload = post_json(_resource_url(base, "messages", ("/messages",)), {"model": self.model, "system": system, "max_tokens": 2048, "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_image}}, {"type": "text", "text": user}]}]}, headers=auth_headers(self.provider, self.api_key))
             parts = payload.get("content") or []
             content = "".join(str(item.get("text") or "") for item in parts if isinstance(item, dict)) or None
         else:
-            payload = post_json(base + "/chat/completions", {"model": self.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": [{"type": "text", "text": user}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}]}]}, headers=auth_headers(self.provider, self.api_key))
+            payload = post_json(_openai_resource_url(base, "chat/completions"), {"model": self.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": [{"type": "text", "text": user}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}]}]}, headers=auth_headers(self.provider, self.api_key))
             content = payload.get("choices", [{}])[0].get("message", {}).get("content")
             
         if not content:
@@ -473,8 +485,8 @@ class RerankerAdapter:
             raise RuntimeError("Reranker endpoint is not configured")
         
         payload = post_json(
-            self.endpoint.rstrip("/") + "/rerank",
-            {"model": self.model, "query": query, "texts": texts},
+            _integration_resource_url(self.endpoint, "rerank"),
+            {"model": self.model, "query": query, "texts": texts, "documents": texts},
             headers=auth_headers("openai_compatible", self.api_key)
         )
         

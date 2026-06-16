@@ -133,6 +133,7 @@ const translations: Record<Language, Record<string, string>> = {
     '每个集成单独测试和拉取模型。按钮会使用当前表单内容，不需要先保存；保存后才会写入 `webui-config.yaml`。': 'Test each integration and pull models separately. Buttons use current form content without saving; only saves write to `webui-config.yaml`.',
     '保存并重载': 'Save & Reload',
     '配置已保存并重载': 'Config saved and reloaded',
+    '配置已保存': 'Config saved',
     '功能路由配置': 'Function Routing Config',
     '服务、队列与抽取策略': 'Services, Queues & Extraction Policies',
     '测试 Postgres': 'Test Postgres',

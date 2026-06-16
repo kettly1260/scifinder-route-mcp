@@ -8,7 +8,7 @@ import { useTranslation } from '../i18n';
 
 export type StructurePageProps = PageProps;
 
-export function StructurePage({ token, state, guarded }: StructurePageProps) {
+export function StructurePage({ token, state, guarded, isBusy }: StructurePageProps) {
   const { t } = useTranslation();
   const [query, setQuery] = useState('');
   const [mode, setMode] = useState('similarity');
@@ -40,8 +40,8 @@ export function StructurePage({ token, state, guarded }: StructurePageProps) {
 
   return (
     <div className="page-stack">
-      <div className="grid two">
-        <Card eyebrow="RDKit" title={t('结构检索')} extra={<Button onClick={() => guarded(search, t('结构检索完成'))}>{t('检索')}</Button>}>
+      <div className="grid two wide-first">
+        <Card eyebrow="RDKit" title={t('结构检索')} extra={<Button loading={isBusy('structure-search')} onClick={() => guarded(search, t('结构检索完成'), 'structure-search')}>{t('检索')}</Button>}>
           <div className="form-grid compact-form">
             <Input label={t('查询')} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('SMILES、SMARTS、CAS 或名称')} />
             <label className="form-group">
@@ -61,10 +61,12 @@ export function StructurePage({ token, state, guarded }: StructurePageProps) {
             extra={
               <Button
                 variant="secondary"
+                loading={isBusy('install-rdkit')}
                 onClick={() =>
                   guarded(
                     () => postJson('/api/chem/install-rdkit', token),
-                    t('临时 RDKit 安装任务已启动；完成后若提示需要重启，请重启容器')
+                    t('临时 RDKit 安装任务已启动；完成后若提示需要重启，请重启容器'),
+                    'install-rdkit'
                   )
                 }
               >

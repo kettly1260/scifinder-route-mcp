@@ -180,5 +180,6 @@ export function rdfRoleOrder(role: unknown): number {
 export interface PageProps {
   token: string;
   state: AdminState;
-  guarded: <T>(action: () => Promise<T>, success?: string) => Promise<T | undefined>;
+  guarded: <T>(action: () => Promise<T>, success?: string, busyKey?: string) => Promise<T | undefined>;
+  isBusy: (busyKey: string) => boolean;
 }

@@ -1,4 +1,4 @@
-import type { AdminState, JsonObject } from './types';
+import type { AdminState, AdminStatusState, JsonObject } from './types';
 
 const SESSION_KEY = 'scifinderRouteAdminToken';
 const LOCAL_KEY = 'scifinderRouteAdminTrustedToken';
@@ -65,6 +65,10 @@ export async function uploadFile(token: string, file: File): Promise<JsonObject>
 
 export function loadState(token: string): Promise<AdminState> {
   return getJson<AdminState>('/api/state', token);
+}
+
+export function loadStatus(token: string): Promise<AdminStatusState> {
+  return getJson<AdminStatusState>('/api/status', token);
 }
 
 export async function getBlobUrl(url: string, token: string): Promise<string> {

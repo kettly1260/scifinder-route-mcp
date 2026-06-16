@@ -60,6 +60,18 @@ class AdminHandler(BaseHTTPRequestHandler):
                 if not self._send_lock_error(exc):
                     raise
             return
+        if parsed.path == "/api/status":
+            try:
+                self._require_role("viewer")
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+                return
+            try:
+                self._send_json(admin_status(self.server.service))
+            except Exception as exc:
+                if not self._send_lock_error(exc):
+                    raise
+            return
         if parsed.path == "/api/documents":
             try:
                 self._require_role("viewer")
@@ -68,8 +80,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                     self.server.service.list_documents(
                         query=first_query(query, "q"),
                         file_type=first_query(query, "file_type"),
-                        limit=int(first_query(query, "limit", "100")),
-                        offset=int(first_query(query, "offset", "0")),
+                        limit=first_int(query, "limit", 100, max_value=500),
+                        offset=first_int(query, "offset", 0, max_value=100000),
                     )
                 )
             except PermissionError as exc:
@@ -87,8 +99,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                     self._send_json(
                         self.server.service.list_document_parsed_chunks(
                             document_id,
-                            limit=int(first_query(query, "limit", "50")),
-                            offset=int(first_query(query, "offset", "0")),
+                            limit=first_int(query, "limit", 50, max_value=500),
+                            offset=first_int(query, "offset", 0, max_value=100000),
                         )
                     )
                 else:
@@ -96,9 +108,9 @@ class AdminHandler(BaseHTTPRequestHandler):
                     self._send_json(
                         self.server.service.get_document_parse_result(
                             document_id,
-                            chunk_limit=int(first_query(query, "chunk_limit", "50")),
-                            chunk_offset=int(first_query(query, "chunk_offset", "0")),
-                            reaction_limit=int(first_query(query, "reaction_limit", "100")),
+                            chunk_limit=first_int(query, "chunk_limit", 50, max_value=500),
+                            chunk_offset=first_int(query, "chunk_offset", 0, max_value=100000),
+                            reaction_limit=first_int(query, "reaction_limit", 100, max_value=500),
                         )
                     )
             except PermissionError as exc:
@@ -110,7 +122,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             try:
                 self._require_role("viewer")
                 query = parse_qs(parsed.query)
-                self._send_json(self.server.service.list_rdf_reactions(document_id=first_query(query, "document_id"), query=first_query(query, "q"), limit=int(first_query(query, "limit", "50")), offset=int(first_query(query, "offset", "0"))))
+                self._send_json(self.server.service.list_rdf_reactions(document_id=first_query(query, "document_id"), query=first_query(query, "q"), limit=first_int(query, "limit", 50, max_value=500), offset=first_int(query, "offset", 0, max_value=100000)))
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
@@ -120,7 +132,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             try:
                 self._require_role("viewer")
                 query = parse_qs(parsed.query)
-                self._send_json(self.server.service.list_rdf_structures(document_id=first_query(query, "document_id"), query=first_query(query, "q"), limit=int(first_query(query, "limit", "50")), offset=int(first_query(query, "offset", "0"))))
+                self._send_json(self.server.service.list_rdf_structures(document_id=first_query(query, "document_id"), query=first_query(query, "q"), limit=first_int(query, "limit", 50, max_value=500), offset=first_int(query, "offset", 0, max_value=100000)))
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
@@ -165,7 +177,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             try:
                 self._require_role("viewer")
                 query = parse_qs(parsed.query)
-                self._send_json(self.server.service.list_trash(limit=int(first_query(query, "limit", "100"))))
+                self._send_json(self.server.service.list_trash(limit=first_int(query, "limit", 100, max_value=500)))
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
@@ -184,7 +196,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             try:
                 self._require_role("viewer")
                 query = parse_qs(parsed.query)
-                self._send_json(self.server.service.list_literature_link_jobs(status=first_query(query, "status"), limit=int(first_query(query, "limit", "50"))))
+                self._send_json(self.server.service.list_literature_link_jobs(status=first_query(query, "status"), limit=first_int(query, "limit", 50, max_value=500)))
             except PermissionError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
             except Exception as exc:
@@ -199,7 +211,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                         status=first_query(query, "status"),
                         reaction_step_id=first_query(query, "reaction_step_id"),
                         document_id=first_query(query, "document_id"),
-                        limit=int(first_query(query, "limit", "50")),
+                        limit=first_int(query, "limit", 50, max_value=500),
                     )
                 )
             except PermissionError as exc:
@@ -315,12 +327,12 @@ class AdminHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/chem/similarity-search":
                 self._require_role("viewer")
                 payload = self._read_json()
-                self._send_json(self.server.service.similarity_search_structures(str(payload.get("query") or ""), query_type=str(payload.get("query_type") or "smiles"), min_similarity=float(payload.get("min_similarity") or 0.2), limit=int(payload.get("limit") or 20)))
+                self._send_json(self.server.service.similarity_search_structures(str(payload.get("query") or ""), query_type=str(payload.get("query_type") or "smiles"), min_similarity=payload_float(payload, "min_similarity", 0.2, min_value=0.0, max_value=1.0), limit=payload_int(payload, "limit", 20, max_value=200)))
                 return
             if parsed.path == "/api/chem/substructure-search":
                 self._require_role("viewer")
                 payload = self._read_json()
-                self._send_json(self.server.service.substructure_search_structures(str(payload.get("query") or ""), query_type=str(payload.get("query_type") or "smarts"), limit=int(payload.get("limit") or 20)))
+                self._send_json(self.server.service.substructure_search_structures(str(payload.get("query") or ""), query_type=str(payload.get("query_type") or "smarts"), limit=payload_int(payload, "limit", 20, max_value=200)))
                 return
             if parsed.path == "/api/trash/delete":
                 self._require_role("operator")
@@ -485,6 +497,13 @@ def start_admin_server(service: RouteService, config: AdminRunConfig | None = No
 
 
 def admin_state(service: RouteService) -> dict[str, Any]:
+    return {
+        **admin_status(service),
+        "config": service.get_config(),
+    }
+
+
+def admin_status(service: RouteService) -> dict[str, Any]:
     try:
         jobs = service.list_parse_jobs(limit=20)
     except Exception as exc:
@@ -494,7 +513,6 @@ def admin_state(service: RouteService) -> dict[str, Any]:
     return {
         "auth_required": bool(service.config.auth_token or service.config.users),
         "health": service.health_check(),
-        "config": service.get_config(),
         "validation": service.validate_config(),
         "jobs": jobs,
         "production": service.get_production_status(),
@@ -531,6 +549,30 @@ def safe_upload_name(value: str) -> str:
 def first_query(query: dict[str, list[str]], key: str, default: str = "") -> str:
     values = query.get(key)
     return values[0] if values else default
+
+
+def bounded_int(value: Any, default: int, *, min_value: int = 0, max_value: int = 500) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        parsed = default
+    return max(min_value, min(max_value, parsed))
+
+
+def first_int(query: dict[str, list[str]], key: str, default: int, *, min_value: int = 0, max_value: int = 500) -> int:
+    return bounded_int(first_query(query, key, str(default)), default, min_value=min_value, max_value=max_value)
+
+
+def payload_int(payload: dict[str, Any], key: str, default: int, *, min_value: int = 0, max_value: int = 500) -> int:
+    return bounded_int(payload.get(key, default), default, min_value=min_value, max_value=max_value)
+
+
+def payload_float(payload: dict[str, Any], key: str, default: float, *, min_value: float = 0.0, max_value: float = 1.0) -> float:
+    try:
+        parsed = float(str(payload.get(key, default)).strip())
+    except (TypeError, ValueError):
+        parsed = default
+    return max(min_value, min(max_value, parsed))
 
 
 def parse_multipart_upload(content_type: str, body: bytes) -> tuple[str, bytes]:

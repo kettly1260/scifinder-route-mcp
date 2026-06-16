@@ -773,6 +773,76 @@ def test_embedding_endpoint_test_posts_to_embeddings(monkeypatch: pytest.MonkeyP
     }
 
 
+def test_runtime_adapters_do_not_duplicate_resource_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scifinder_route_mcp.integrations import EmbeddingAdapter, ExternalParserAdapter, LLMStructuringAdapter, OCRAdapter, RerankerAdapter, StructureRecognitionAdapter
+
+    seen: list[str] = []
+    rerank_payload: dict[str, object] = {}
+
+    def fake_post_json(url: str, payload: dict[str, object], *, timeout: float = 30.0, headers: dict[str, str] | None = None) -> dict[str, object]:
+        seen.append(url)
+        if url.endswith("/embeddings"):
+            return {"data": [{"embedding": [0.1]}]}
+        if url.endswith("/responses"):
+            return {"output_text": "{}"}
+        if url.endswith("/chat/completions"):
+            return {"choices": [{"message": {"content": "{}"}}]}
+        if url.endswith("/rerank"):
+            rerank_payload.update(payload)
+            return {"results": [{"index": 0, "relevance_score": 0.7}]}
+        if url.endswith("/parse"):
+            return {"file_type": "pdf", "chunks": [{"text": "parsed text"}]}
+        if url.endswith("/recognize"):
+            return {"structures": [{"smiles": "C"}]}
+        return {"text": "ocr text"}
+
+    monkeypatch.setattr("scifinder_route_mcp.integrations.post_json", fake_post_json)
+
+    EmbeddingAdapter("https://embed.example/v1/embeddings", "embed-model").embed(["ping"])
+    LLMStructuringAdapter("https://api.example/v1/responses", "gpt", enabled=True, schema_version="v1", prompt_profile="default", provider="openai_responses").structure("text", {})
+    LLMStructuringAdapter("https://api.example/v1/chat/completions", "gpt", enabled=True, schema_version="v1", prompt_profile="default").structure("text", {})
+    RerankerAdapter("https://rank.example/rerank", "rerank-model").rerank("query", ["doc"])
+    ExternalParserAdapter("https://parser.example/parse", "parser-model").parse("sample.pdf")
+    OCRAdapter("https://ocr.example/ocr", "ocr-model").ocr_document("sample.pdf")
+    StructureRecognitionAdapter("https://struct.example/recognize", "struct-model").recognize("sample.png")
+
+    assert seen == [
+        "https://embed.example/v1/embeddings",
+        "https://api.example/v1/responses",
+        "https://api.example/v1/chat/completions",
+        "https://rank.example/rerank",
+        "https://parser.example/parse",
+        "https://ocr.example/ocr",
+        "https://struct.example/recognize",
+    ]
+    assert rerank_payload == {"model": "rerank-model", "query": "query", "texts": ["doc"], "documents": ["doc"]}
+
+
+def test_gemini_runtime_url_encodes_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scifinder_route_mcp.integrations import LLMStructuringAdapter
+
+    seen: dict[str, str] = {}
+
+    def fake_post_json(url: str, payload: dict[str, object], *, timeout: float = 30.0, headers: dict[str, str] | None = None) -> dict[str, object]:
+        seen["url"] = url
+        return {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
+
+    monkeypatch.setattr("scifinder_route_mcp.integrations.post_json", fake_post_json)
+
+    adapter = LLMStructuringAdapter(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        "gemini-1.5-pro",
+        enabled=True,
+        schema_version="v1",
+        prompt_profile="default",
+        provider="gemini",
+        api_key="a+b/c?d",
+    )
+    adapter.structure("text", {})
+
+    assert seen["url"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=a%2Bb%2Fc%3Fd"
+
+
 def test_auto_batch_links_similar_scifinder_exports(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     rdf = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
@@ -1017,6 +1087,36 @@ def test_admin_server_serves_react_webui_and_management_apis(tmp_path: Path) -> 
         status, body = admin_request(port, "GET", "/api/literature/links?status=candidate&limit=5")
         assert status == 200
         assert json.loads(body) == []
+
+        status, body = admin_request(port, "GET", "/api/status")
+        assert status == 200
+        status_payload = json.loads(body)
+        assert "config" not in status_payload
+        assert "jobs" in status_payload
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_admin_api_clamps_bad_numeric_parameters(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    fixture = Path(__file__).parent / "fixtures" / "sample_scifinder_export.rdf"
+    service.register_document(str(fixture))
+    server = start_admin_server(service, AdminRunConfig(host="127.0.0.1", port=0))
+    assert server is not None
+    port = server.server_address[1]
+    try:
+        status, body = admin_request(port, "GET", "/api/rdf/reactions?limit=not-a-number&offset=-10")
+        assert status == 200
+        assert isinstance(json.loads(body), list)
+
+        status, body = admin_request(port, "GET", "/api/documents?limit=999999&offset=bad")
+        assert status == 200
+        assert isinstance(json.loads(body), list)
+
+        status, body = admin_request(port, "POST", "/api/chem/similarity-search", {"query": "19694-02-1", "min_similarity": "bad", "limit": "999999"})
+        assert status == 200
+        assert json.loads(body)["configured"] is True
     finally:
         server.shutdown()
         server.server_close()

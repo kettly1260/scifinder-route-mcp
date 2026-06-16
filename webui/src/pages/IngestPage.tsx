@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { AdminState, JsonObject } from '../types';
+import type { AdminStatusState, JsonObject } from '../types';
 import type { PageProps, UploadResultRow } from '../constants';
 import { postJson } from '../api';
 import { Button, Card, DataTable } from '../components';
@@ -9,7 +9,7 @@ import { useToast } from '../components/Toast';
 import { Upload } from 'lucide-react';
 
 export interface IngestPageProps extends PageProps {
-  refresh: () => Promise<AdminState>;
+  refresh: () => Promise<AdminStatusState>;
   openDocument: (documentId: string) => void;
 }
 
@@ -56,7 +56,7 @@ function uploadFileWithProgress(
   });
 }
 
-export function IngestPage({ token, state, guarded, refresh, openDocument }: IngestPageProps) {
+export function IngestPage({ token, state, guarded, refresh, openDocument, isBusy }: IngestPageProps) {
   const { t } = useTranslation();
   const toast = useToast();
   const [files, setFiles] = useState<File[]>([]);
@@ -168,13 +168,13 @@ export function IngestPage({ token, state, guarded, refresh, openDocument }: Ing
 
   return (
     <div className="page-stack">
-      <div className="grid two">
+      <div className="grid two wide-first">
         <Card
           eyebrow="Upload"
           title={t('上传并导入')}
           extra={
             <div className="button-row">
-              <Button disabled={!files.length} onClick={() => guarded(uploadSelectedFiles)}>{t('批量上传并导入')}</Button>
+              <Button disabled={!files.length} loading={isBusy('upload-files')} onClick={() => guarded(uploadSelectedFiles, undefined, 'upload-files')}>{t('批量上传并导入')}</Button>
               <Button variant="ghost" disabled={!files.length && !uploadResults.length} onClick={() => {
                 setFiles([]);
                 setUploadResults([]);
@@ -245,7 +245,7 @@ export function IngestPage({ token, state, guarded, refresh, openDocument }: Ing
           )}
           <p className="muted" style={{ marginTop: '12px' }}>{t('支持 PDF/RTF/RDF/HTML/MHTML/Markdown/TXT。上传仍会经过后端扩展名、嗅探和安全校验。')}</p>
         </Card>
-        <Card eyebrow="Inbox" title={t('扫描收件箱')} extra={<Button onClick={() => guarded(async () => { const result = await postJson<JsonObject>('/api/scan', token); await refresh(); return result; }, t('扫描完成'))}>{t('扫描')}</Button>}>
+        <Card eyebrow="Inbox" title={t('扫描收件箱')} extra={<Button loading={isBusy('scan-inbox')} onClick={() => guarded(async () => { const result = await postJson<JsonObject>('/api/scan', token); await refresh(); return result; }, t('扫描完成'), 'scan-inbox')}>{t('扫描')}</Button>}>
           <p className="muted">{t('从服务端可见 inbox 中登记新增 SciFinder 导出文件。不会绕过导入规则。')}</p>
         </Card>
       </div>
@@ -269,7 +269,7 @@ export function IngestPage({ token, state, guarded, refresh, openDocument }: Ing
           />
         </Card>
       )}
-      <Card eyebrow="Jobs" title={t('最近解析任务')} extra={<Button variant="secondary" onClick={() => guarded(() => postJson('/api/retry-failed', token), t('已提交失败任务重试'))}>{t('重试失败任务')}</Button>}>
+      <Card eyebrow="Jobs" title={t('最近解析任务')} extra={<Button variant="secondary" loading={isBusy('retry-failed-jobs')} onClick={() => guarded(() => postJson('/api/retry-failed', token), t('已提交失败任务重试'), 'retry-failed-jobs')}>{t('重试失败任务')}</Button>}>
         <DataTable rows={state.jobs} columns={[{ key: 'id', label: 'ID' }, { key: 'status', label: t('状态') }, { key: 'stage', label: t('阶段') }, { key: 'error', label: t('错误') }]} />
       </Card>
     </div>

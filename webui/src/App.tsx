@@ -1,8 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Routes, Route, Navigate, useNavigate, useLocation, Link } from 'react-router-dom';
-import { clearToken, getStoredToken, hasTrustedToken, loadState, storeToken, postJson } from './api';
+import { clearToken, getStoredToken, hasTrustedToken, loadState, loadStatus, storeToken, postJson } from './api';
 import { Button } from './components';
-import type { AdminState } from './types';
+import type { AdminState, JsonObject } from './types';
 import { useTranslation } from "./i18n";
 import { useToast } from './components/Toast';
 import {
@@ -55,10 +55,11 @@ export function App() {
   const { language, setLanguage, t } = useTranslation();
   const toast = useToast();
   const [token, setToken] = useState(getStoredToken());
-  const [trusted, setTrusted] = useState(hasTrustedToken());
+  const [trusted, setTrusted] = useState(() => hasTrustedToken() || !getStoredToken());
   const [state, setState] = useState<AdminState | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [busyActions, setBusyActions] = useState<Record<string, boolean>>({});
   const [authRequired, setAuthRequired] = useState(true);
   const [theme, setTheme] = useState<ThemeId>(initialTheme);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -72,12 +73,26 @@ export function App() {
       setState(data);
       setAuthRequired(Boolean(data.auth_required));
       setError('');
-      if (!silent) toast.success(t('状态已刷新'));
       return data;
     } catch (err) {
       const errMsg = authError(err);
-      setError(errMsg);
-      toast.error(errMsg);
+      setError(silent && !nextToken ? '' : errMsg);
+      if (!silent) toast.error(errMsg);
+      throw err;
+    }
+  }
+
+  async function refreshStatus(nextToken = token, silent = false) {
+    try {
+      const data = await loadStatus(nextToken);
+      setState((current) => current ? { ...current, ...data } : current);
+      setAuthRequired(Boolean(data.auth_required));
+      setError('');
+      return data;
+    } catch (err) {
+      const errMsg = authError(err);
+      setError(silent && !nextToken ? '' : errMsg);
+      if (!silent) toast.error(errMsg);
       throw err;
     }
   }
@@ -120,8 +135,12 @@ export function App() {
     toast.success(t('已退出登录'));
   }
 
-  async function guarded<T>(action: () => Promise<T>, success?: string): Promise<T | undefined> {
-    setBusy(true);
+  async function guarded<T>(action: () => Promise<T>, success?: string, busyKey?: string): Promise<T | undefined> {
+    if (busyKey) {
+      setBusyActions((current) => ({ ...current, [busyKey]: true }));
+    } else {
+      setBusy(true);
+    }
     try {
       const result = await action();
       if (success) toast.success(success);
@@ -133,8 +152,20 @@ export function App() {
       toast.error(errMsg);
       return undefined;
     } finally {
-      setBusy(false);
+      if (busyKey) {
+        setBusyActions((current) => ({ ...current, [busyKey]: false }));
+      } else {
+        setBusy(false);
+      }
     }
+  }
+
+  function isBusy(busyKey: string): boolean {
+    return Boolean(busyActions[busyKey]);
+  }
+
+  function applyConfig(config: JsonObject) {
+    setState((current) => current ? { ...current, config } : current);
   }
 
 
@@ -228,7 +259,7 @@ export function App() {
                 {themes.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
               </select>
             </label>
-            <Button variant="secondary" onClick={() => guarded(() => refresh(), t('状态已刷新'))} loading={busy}>{t('刷新')}</Button>
+            <Button variant="secondary" onClick={() => guarded(() => refreshStatus(), t('状态已刷新'), 'refresh-status')} loading={isBusy('refresh-status')}>{t('刷新')}</Button>
           </div>
         </header>
         <Routes>
@@ -240,19 +271,20 @@ export function App() {
                 token={token}
                 state={state}
                 guarded={guarded}
-                refresh={refresh}
+                refresh={refreshStatus}
+                isBusy={isBusy}
                 openDocument={(documentId) => navigate(`/documents/${documentId}`)}
               />
             }
           />
           <Route path="/documents" element={<DocumentsListPage token={token} guarded={guarded} />} />
           <Route path="/documents/:documentId" element={<DocumentDetailPage token={token} guarded={guarded} />} />
-          <Route path="/config" element={<ConfigPage token={token} state={state} guarded={guarded} refresh={refresh} />} />
+          <Route path="/config" element={<ConfigPage token={token} state={state} guarded={guarded} isBusy={isBusy} onConfigSaved={applyConfig} />} />
           <Route path="/rdf" element={<RdfPage token={token} guarded={guarded} />} />
           <Route path="/rdf/:reactionId" element={<RdfDetailPage token={token} guarded={guarded} />} />
-          <Route path="/structures" element={<StructurePage token={token} state={state} guarded={guarded} />} />
-          <Route path="/literature" element={<LiteraturePage token={token} state={state} guarded={guarded} />} />
-          <Route path="/ops" element={<OpsPage token={token} state={state} guarded={guarded} refresh={refresh} />} />
+          <Route path="/structures" element={<StructurePage token={token} state={state} guarded={guarded} isBusy={isBusy} />} />
+          <Route path="/literature" element={<LiteraturePage token={token} state={state} guarded={guarded} isBusy={isBusy} />} />
+          <Route path="/ops" element={<OpsPage token={token} state={state} guarded={guarded} isBusy={isBusy} refresh={refreshStatus} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

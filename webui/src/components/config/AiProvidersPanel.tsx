@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import type { JsonObject, AdminState } from '../../types';
+import type { JsonObject } from '../../types';
 import { Card, Input, Button, DataTable } from '../../components';
 import { useTranslation } from '../../i18n';
 import { postJson } from '../../api';
@@ -11,10 +11,9 @@ export interface AiProvidersPanelProps {
   setProviders: (p: JsonObject[]) => void;
   token: string;
   guarded: <T>(action: () => Promise<T>, success?: string) => Promise<T | undefined>;
-  refresh: () => Promise<AdminState>;
 }
 
-export function AiProvidersPanel({ providers, setProviders, token, guarded, refresh }: AiProvidersPanelProps) {
+export function AiProvidersPanel({ providers, setProviders, token, guarded }: AiProvidersPanelProps) {
   const { t } = useTranslation();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<JsonObject>({ id: '', name: '', format: 'openai_chat', endpoint: '', api_key: '', models_endpoint: '' });
@@ -108,15 +107,13 @@ export function AiProvidersPanel({ providers, setProviders, token, guarded, refr
       available_models: availableModels,
       enabled_models: enabledModels
     });
-    // reload config so new lists are populated
-    const next = await refresh();
-    const pList = (next.config.integrations as JsonObject)?.ai_providers;
-    if (Array.isArray(pList)) {
-      setProviders(pList as JsonObject[]);
-      // update modal provider reference to new state
-      const updated = pList.find(p => p.id === modalProvider.id);
-      if (updated) setModalProvider(updated);
-    }
+    const updatedProvider = {
+      ...modalProvider,
+      available_models: availableModels,
+      enabled_models: enabledModels
+    };
+    setProviders(providers.map((p) => (p.id === modalProvider.id ? updatedProvider : p)));
+    setModalProvider(updatedProvider);
   }
 
   return (

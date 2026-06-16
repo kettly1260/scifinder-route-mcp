@@ -11,6 +11,14 @@ export interface AdminState {
   production: JsonObject;
 }
 
+export interface AdminStatusState {
+  auth_required: boolean;
+  health: JsonObject;
+  validation: { valid?: boolean; warnings?: string[] };
+  jobs: JsonObject[];
+  production: JsonObject;
+}
+
 export interface Column<T> {
   key: string;
   label: string;

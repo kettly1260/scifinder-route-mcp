@@ -1,15 +1,15 @@
 import { useState } from 'react';
-import type { AdminState, JsonObject } from '../types';
+import type { AdminStatusState, JsonObject } from '../types';
 import type { PageProps } from '../constants';
 import { getJson, postJson } from '../api';
 import { Button, Card, DataTable, JsonBlock } from '../components';
 import { useTranslation } from '../i18n';
 
 export interface OpsPageProps extends PageProps {
-  refresh: () => Promise<AdminState>;
+  refresh: () => Promise<AdminStatusState>;
 }
 
-export function OpsPage({ token, state, guarded, refresh }: OpsPageProps) {
+export function OpsPage({ token, state, guarded, refresh, isBusy }: OpsPageProps) {
   const { t } = useTranslation();
   const [trash, setTrash] = useState<JsonObject[]>([]);
 
@@ -21,12 +21,13 @@ export function OpsPage({ token, state, guarded, refresh }: OpsPageProps) {
           title={t("向量索引")}
           extra={
             <Button
+              loading={isBusy('vector-rebuild')}
               onClick={() =>
                 guarded(async () => {
                   const result = await postJson('/api/vector/rebuild', token);
                   await refresh();
                   return result;
-                }, t('向量索引已提交重建'))
+                }, t('向量索引已提交重建'), 'vector-rebuild')
               }
             >
               {t('重建')}
@@ -40,8 +41,8 @@ export function OpsPage({ token, state, guarded, refresh }: OpsPageProps) {
           title={t("备份与清理")}
           extra={
             <div className="button-row">
-              <Button onClick={() => guarded(() => postJson('/api/backup', token), t('数据库已备份'))}>{t('备份')}</Button>
-              <Button variant="secondary" onClick={() => guarded(() => postJson('/api/cleanup', token, { dry_run: true }), t('清理试运行完成'))}>
+              <Button loading={isBusy('backup-db')} onClick={() => guarded(() => postJson('/api/backup', token), t('数据库已备份'), 'backup-db')}>{t('备份')}</Button>
+              <Button variant="secondary" loading={isBusy('cleanup-dry-run')} onClick={() => guarded(() => postJson('/api/cleanup', token, { dry_run: true }), t('清理试运行完成'), 'cleanup-dry-run')}>
                 {t('清理试运行')}
               </Button>
             </div>
@@ -55,14 +56,14 @@ export function OpsPage({ token, state, guarded, refresh }: OpsPageProps) {
         title={t("回收站")}
         extra={
           <div className="button-row">
-            <Button variant="secondary" onClick={() => guarded(async () => setTrash(await getJson<JsonObject[]>('/api/trash?limit=100', token)), t('回收站已加载'))}>
+            <Button variant="secondary" loading={isBusy('load-trash')} onClick={() => guarded(async () => setTrash(await getJson<JsonObject[]>('/api/trash?limit=100', token)), t('回收站已加载'), 'load-trash')}>
               {t('加载')}
             </Button>
             <Button variant="danger" onClick={() => {
               if (window.confirm(t('确定要永久清空回收站吗？此操作无法撤销。'))) {
-                guarded(() => postJson('/api/trash/empty', token), t('回收站已清空'));
+                guarded(() => postJson('/api/trash/empty', token), t('回收站已清空'), 'empty-trash');
               }
-            }}>
+            }} loading={isBusy('empty-trash')}>
               {t('清空')}
             </Button>
           </div>
@@ -75,7 +76,10 @@ export function OpsPage({ token, state, guarded, refresh }: OpsPageProps) {
             { key: 'id', label: 'ID' },
             { key: 'title', label: t('标题') },
             { key: 'deleted_at', label: t('删除时间') },
-            { key: 'restore', label: t('还原'), render: (row) => <Button size="sm" variant="ghost" onClick={() => guarded(() => postJson('/api/trash/restore', token, { entity_type: row.entity_type, entity_id: row.id }), t('项目已还原'))}>{t('还原')}</Button> }
+            { key: 'restore', label: t('还原'), render: (row) => {
+              const restoreKey = `restore-trash-${String(row.entity_type)}-${String(row.id)}`;
+              return <Button size="sm" variant="ghost" loading={isBusy(restoreKey)} onClick={() => guarded(() => postJson('/api/trash/restore', token, { entity_type: row.entity_type, entity_id: row.id }), t('项目已还原'), restoreKey)}>{t('还原')}</Button>;
+            } }
           ]}
         />
       </Card>
