@@ -1,7 +1,7 @@
 import { useState, useMemo, type ButtonHTMLAttributes, type InputHTMLAttributes, type PropsWithChildren, type ReactNode } from 'react';
 import type { Column } from './types';
 import { useTranslation } from './i18n';
-import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight } from 'lucide-react';
+import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Copy, Check } from 'lucide-react';
 
 type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
 type ButtonSize = 'md' | 'sm';
@@ -233,7 +233,43 @@ export function DataTable<T extends Record<string, any>>({
 }
 
 export function JsonBlock({ value, maxHeight }: { value: unknown; maxHeight?: number }) {
-  return <pre style={maxHeight ? { maxHeight } : undefined}>{JSON.stringify(value ?? {}, null, 2)}</pre>;
+  const [copied, setCopied] = useState(false);
+  
+  const handleCopy = () => {
+    navigator.clipboard.writeText(JSON.stringify(value ?? {}, null, 2)).catch(console.error);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <button 
+        onClick={handleCopy}
+        style={{
+          position: 'absolute',
+          top: '8px',
+          right: '8px',
+          background: 'var(--panel)',
+          border: '1px solid var(--line-strong)',
+          borderRadius: '4px',
+          padding: '4px',
+          cursor: 'pointer',
+          color: copied ? '#10b981' : 'inherit',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          transition: 'all 0.2s',
+          zIndex: 10
+        }}
+        title="Copy JSON"
+      >
+        {copied ? <Check size={16} /> : <Copy size={16} />}
+      </button>
+      <pre style={maxHeight ? { maxHeight, margin: 0 } : { margin: 0 }}>
+        {JSON.stringify(value ?? {}, null, 2)}
+      </pre>
+    </div>
+  );
 }
 
 export function StatCard({ label, value, tone = 'default' }: { label: string; value: ReactNode; tone?: 'default' | 'good' | 'warn' | 'danger' }) {

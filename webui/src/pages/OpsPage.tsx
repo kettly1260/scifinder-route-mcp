@@ -99,9 +99,46 @@ export function OpsPage({ token, state, guarded, refresh }: OpsPageProps) {
           />
         </Card>
       </div>
-      <Card eyebrow="Production" title={t('诊断快照')} style={{ marginTop: '16px' }}>
-        <JsonBlock value={state.production} maxHeight={420} />
-      </Card>
+      <div className="grid two" style={{ marginTop: '16px' }}>
+        <Card eyebrow="System & Health" title={t('系统与运行状态')}>
+          <JsonBlock 
+            value={{ 
+              ...((state.production.health as JsonObject) || {}), 
+              integrations: undefined, 
+              zotero_endpoints: undefined, 
+              evaluation: state.production.evaluation 
+            }} 
+            maxHeight={280} 
+          />
+        </Card>
+        <Card eyebrow="Integrations" title={t('第三方集成与端点')}>
+          <JsonBlock 
+            value={{ 
+              integrations: (state.production.health as JsonObject)?.integrations, 
+              zotero_endpoints: (state.production.health as JsonObject)?.zotero_endpoints 
+            }} 
+            maxHeight={280} 
+          />
+        </Card>
+        <Card eyebrow="Chemistry" title={t('化学组件诊断')}>
+          <JsonBlock 
+            value={{ 
+              chem: state.production.chem, 
+              compound_count: state.production.compound_count 
+            }} 
+            maxHeight={280} 
+          />
+        </Card>
+        <Card eyebrow="Queues" title={t('异常与流转队列')}>
+          <JsonBlock 
+            value={{ 
+              doi_low_confidence_queue: state.production.doi_low_confidence_queue, 
+              literature_candidates: state.production.literature_candidates 
+            }} 
+            maxHeight={280} 
+          />
+        </Card>
+      </div>
     </div>
   );
 }
