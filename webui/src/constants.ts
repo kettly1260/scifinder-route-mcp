@@ -64,6 +64,7 @@ export const pages: PageConfig[] = [
   { id: 'ingest',    path: '/ingest',    label: '导入与任务', description: '上传、扫描、解析队列', iconName: 'Upload' },
   { id: 'documents', path: '/documents', label: 'Documents', description: '查看 PDF/RTF/HTML 解析结果', iconName: 'FileText' },
   { id: 'config',    path: '/config',    label: '配置',      description: '集成、运行时、热配置', iconName: 'Settings' },
+  { id: 'reaction_links', path: '/reaction_links', label: '反应关联', description: 'RDF 与 PDF 关联确认', iconName: 'FlaskConical' },
   { id: 'rdf',       path: '/rdf',       label: 'RDF 反应',  description: 'CAS 反应记录与 molfile', iconName: 'FlaskConical' },
   { id: 'structures',path: '/structures',label: '结构检索',   description: '相似度、子结构、文本过滤', iconName: 'Search' },
   { id: 'literature',path: '/literature',label: '文献 / Zotero',description: '端点、候选链接、写回', iconName: 'BookOpen' },
@@ -77,14 +78,21 @@ export const configFields: ConfigField[] = [
   { section: 'integrations', name: 'embedding_provider_id', label: '嵌入供应商 ID' },
   { section: 'integrations', name: 'embedding_model', label: '嵌入模型', placeholder: 'bge-m3' },
   { section: 'integrations', name: 'ocr_provider_id', label: 'OCR 供应商 ID' },
+  { section: 'integrations', name: 'ocr_provider_ids', label: 'OCR Fallback 供应商列表', type: 'list', placeholder: 'paddleocr,mineru' },
   { section: 'integrations', name: 'ocr_model', label: 'OCR 模型', placeholder: 'mineru-layout / PaddleOCR-VL-1.6' },
   { section: 'integrations', name: 'document_parser_provider_id', label: '文档解析供应商 ID' },
+  { section: 'integrations', name: 'document_parser_provider_ids', label: '文档解析 Fallback 供应商列表', type: 'list', placeholder: 'mineru,paddleocr' },
   { section: 'integrations', name: 'document_parser_model', label: '文档解析模型', placeholder: 'pymupdf / mineru' },
   { section: 'integrations', name: 'document_parser_fallback', label: '解析失败回退', type: 'bool' },
   { section: 'integrations', name: 'structure_recognition_provider_id', label: '结构识别供应商 ID' },
   { section: 'integrations', name: 'structure_recognition_model', label: '结构识别模型', placeholder: 'decimer / molscribe / osra' },
   { section: 'integrations', name: 'reranker_provider_id', label: '重排供应商 ID' },
   { section: 'integrations', name: 'reranker_model', label: '重排模型', placeholder: 'bge-reranker-v2-m3' },
+  { section: 'integrations', name: 'ai_evidence_review_enabled', label: 'AI 证据复核启用', type: 'bool' },
+  { section: 'integrations', name: 'ai_evidence_review_provider_id', label: 'AI 证据复核供应商 ID' },
+  { section: 'integrations', name: 'ai_evidence_review_model', label: 'AI 证据复核模型', placeholder: 'gpt-4o / gemini-2.5-pro' },
+  { section: 'integrations', name: 'ai_evidence_review_schema_version', label: 'AI 证据复核 Schema', placeholder: 'reaction_evidence_review.v1' },
+  { section: 'integrations', name: 'ai_evidence_review_prompt_profile', label: 'AI 证据复核提示词配置', placeholder: 'strict-evidence-review-json' },
   { section: 'integrations', name: 'postgres_url', label: 'PostgreSQL URL', type: 'password', secret: true, placeholder: '留空则不变' },
   { section: 'server', name: 'max_workers', label: '最大工作线程', type: 'number', min: '1' },
   { section: 'server', name: 'async_jobs', label: '异步任务', type: 'bool' },
@@ -100,7 +108,14 @@ export const configFields: ConfigField[] = [
   { section: 'extraction', name: 'llm_cost_limit_usd', label: 'LLM 成本上限 USD', type: 'number', min: '0', step: '0.01' },
   { section: 'retention', name: 'evidence_retention_days', label: '证据保留天数', type: 'number', min: '1' },
   { section: 'retention', name: 'cache_retention_days', label: '缓存保留天数', type: 'number', min: '1' },
-  { section: 'integrations', name: 'zotero_linking_enabled', label: 'Zotero 自动链接', type: 'bool' }
+  { section: 'integrations', name: 'zotero_linking_enabled', label: 'Zotero 自动链接', type: 'bool' },
+  { section: 'integrations', name: 'pdf_evidence_enabled', label: 'PDF 证据关联启用', type: 'bool' },
+  { section: 'integrations', name: 'pdf_evidence_render_pages', label: 'PDF 渲染相关页面', type: 'bool' },
+  { section: 'integrations', name: 'pdf_evidence_max_pages_per_document', label: 'PDF 证据页数上限', type: 'number', min: '0' },
+  { section: 'integrations', name: 'structure_recognition_manual_enabled', label: '允许手动结构识别', type: 'bool' },
+  { section: 'integrations', name: 'pdf_only_candidates_enabled', label: '生成 PDF-only 反应候选', type: 'bool' },
+  { section: 'integrations', name: 'pdf_only_low_confidence_enabled', label: '保留低置信 PDF-only 候选', type: 'bool' },
+  { section: 'integrations', name: 'structure_recognition_auto_on_pdf_evidence', label: 'PDF 证据自动结构识别', type: 'bool' }
 ];
 
 export const configFieldByKey = new Map(configFields.map((field) => [`${field.section}.${field.name}`, field]));
@@ -111,10 +126,12 @@ export type IntegrationGroup = ConfigGroup & { id: string; description: string; 
 export const integrationGroups = [
   { id: 'extraction', eyebrow: 'LLM', title: 'LLM 结构化', description: '用于反应步骤结构化、证据整理等。', fields: ['integrations.extraction_provider_id', 'integrations.extraction_model'], modelKey: 'integrations.extraction_model', providerKey: 'integrations.extraction_provider_id' },
   { id: 'embedding', eyebrow: 'Embedding', title: '嵌入模型', description: '用于语义召回和向量索引重建。', fields: ['integrations.embedding_provider_id', 'integrations.embedding_model'], modelKey: 'integrations.embedding_model', providerKey: 'integrations.embedding_provider_id' },
-  { id: 'ocr', eyebrow: 'OCR', title: 'OCR 识别', description: '用于扫描件和页面视觉证据抽取。', fields: ['integrations.ocr_provider_id', 'integrations.ocr_model'], modelKey: 'integrations.ocr_model', providerKey: 'integrations.ocr_provider_id' },
-  { id: 'document_parser', eyebrow: 'Parser', title: '文档解析', description: '用于 PDF/RTF/HTML 正文解析 and 失败回退策略。', fields: ['integrations.document_parser_provider_id', 'integrations.document_parser_model', 'integrations.document_parser_fallback'], modelKey: 'integrations.document_parser_model', providerKey: 'integrations.document_parser_provider_id' },
+  { id: 'ocr', eyebrow: 'OCR', title: 'OCR 识别', description: '用于扫描件和页面视觉证据抽取。', fields: ['integrations.ocr_provider_id', 'integrations.ocr_provider_ids', 'integrations.ocr_model'], modelKey: 'integrations.ocr_model', providerKey: 'integrations.ocr_provider_id' },
+  { id: 'document_parser', eyebrow: 'Parser', title: '文档解析', description: '用于 PDF/RTF/HTML 正文解析 and 失败回退策略。', fields: ['integrations.document_parser_provider_id', 'integrations.document_parser_provider_ids', 'integrations.document_parser_model', 'integrations.document_parser_fallback'], modelKey: 'integrations.document_parser_model', providerKey: 'integrations.document_parser_provider_id' },
   { id: 'structure_recognition', eyebrow: 'Structure', title: '结构识别', description: '用于图片结构识别和结构敏感证据补充。', fields: ['integrations.structure_recognition_provider_id', 'integrations.structure_recognition_model'], modelKey: 'integrations.structure_recognition_model', providerKey: 'integrations.structure_recognition_provider_id' },
-  { id: 'reranker', eyebrow: 'Reranker', title: '重排模型', description: '用于提升搜索召回结果的排序质量。', fields: ['integrations.reranker_provider_id', 'integrations.reranker_model'], modelKey: 'integrations.reranker_model', providerKey: 'integrations.reranker_provider_id' }
+  { id: 'reranker', eyebrow: 'Reranker', title: '重排模型', description: '用于提升搜索召回结果的排序质量。', fields: ['integrations.reranker_provider_id', 'integrations.reranker_model'], modelKey: 'integrations.reranker_model', providerKey: 'integrations.reranker_provider_id' },
+  { id: 'ai_evidence_review', eyebrow: 'AI Review', title: 'AI 证据复核', description: '对 RDF/PDF/SI/专利证据给出人工审核前的结构化建议；只写入建议和冲突标记，不自动确认。', fields: ['integrations.ai_evidence_review_enabled', 'integrations.ai_evidence_review_provider_id', 'integrations.ai_evidence_review_model', 'integrations.ai_evidence_review_schema_version', 'integrations.ai_evidence_review_prompt_profile'], modelKey: 'integrations.ai_evidence_review_model', providerKey: 'integrations.ai_evidence_review_provider_id' },
+  { id: 'pdf_evidence', eyebrow: 'PDF Linking', title: '反应级证据关联', description: '将 RDF 中的反应分配到 PDF 具体页码并提取视觉特征。', fields: ['integrations.pdf_evidence_enabled', 'integrations.pdf_evidence_render_pages', 'integrations.pdf_evidence_max_pages_per_document', 'integrations.pdf_only_candidates_enabled', 'integrations.pdf_only_low_confidence_enabled', 'integrations.structure_recognition_manual_enabled', 'integrations.structure_recognition_auto_on_pdf_evidence'], modelKey: '', providerKey: '' }
 ] as const;
 
 export const runtimeGroups = [

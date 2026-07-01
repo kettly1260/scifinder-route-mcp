@@ -1,12 +1,13 @@
 import { useState } from 'react';
 import type { AdminStatusState, JsonObject } from '../types';
-import type { PageProps, UploadResultRow } from '../constants';
+import { bytes, type PageProps, type UploadResultRow } from '../constants';
 import { postJson } from '../api';
 import { Button, Card, DataTable } from '../components';
 import { StatusBadge } from '../components/StatusBadge';
 import { useTranslation } from '../i18n';
 import { useToast } from '../components/Toast';
-import { Upload } from 'lucide-react';
+import { Search, ShieldCheck, Upload } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 
 export interface IngestPageProps extends PageProps {
   refresh: () => Promise<AdminStatusState>;
@@ -56,14 +57,33 @@ function uploadFileWithProgress(
   });
 }
 
+async function previewUploadFile(token: string, file: File): Promise<JsonObject[]> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const response = await fetch('/api/upload/preview', {
+    method: 'POST',
+    headers: { 'X-Scifinder-Route-Token': token },
+    body: formData
+  });
+  const data = await response.json().catch(() => ({ error: response.statusText }));
+  if (!response.ok || data.error) {
+    throw new Error(String(data.error || response.statusText));
+  }
+  return Array.isArray(data.items) ? data.items as JsonObject[] : [];
+}
+
 export function IngestPage({ token, state, guarded, refresh, openDocument, isBusy }: IngestPageProps) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const toast = useToast();
   const [files, setFiles] = useState<File[]>([]);
   const [uploadStatus, setUploadStatus] = useState('');
   const [uploadResults, setUploadResults] = useState<UploadResultRow[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<Record<string, { percent: number; status: string; error?: string }>>({});
+  const [previewRows, setPreviewRows] = useState<JsonObject[]>([]);
+  const [previewStatus, setPreviewStatus] = useState('');
+  const [inboxPreviewRows, setInboxPreviewRows] = useState<JsonObject[]>([]);
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -87,6 +107,8 @@ export function IngestPage({ token, state, guarded, refresh, openDocument, isBus
     if (filteredFiles.length > 0) {
       setFiles(prev => [...prev, ...filteredFiles]);
       setUploadResults([]);
+      setPreviewRows([]);
+      setPreviewStatus('');
       setUploadStatus(t('已添加拖拽文件，准备上传'));
     } else {
       toast.warning(t('未检测到支持的 SciFinder 格式文件'));
@@ -96,17 +118,40 @@ export function IngestPage({ token, state, guarded, refresh, openDocument, isBus
   async function uploadSelectedFiles() {
     if (!files.length) return;
     const results: UploadResultRow[] = [];
+    const previewByName = new Map(previewRows.map((row) => [String(row.client_file_name || row.file_name || row.original_file_name || ''), row]));
+    const excludedNames = new Set(
+      previewRows
+        .filter((row) => row.include === false)
+        .map((row) => String(row.client_file_name || row.file_name || row.original_file_name || ''))
+    );
+    for (const row of previewRows.filter((item) => item.include === false)) {
+      results.push({
+        file_name: String(row.client_file_name || row.file_name || row.original_file_name || ''),
+        status: '已排除',
+        tone: 'failed',
+        detail: String(row.exclude_reason || row.reason || '预检未通过')
+      });
+    }
+    const filesToUpload = previewRows.length
+      ? files.filter((file) => !excludedNames.has(file.name) && previewByName.has(file.name))
+      : files;
+    if (!filesToUpload.length) {
+      setUploadResults(results);
+      setUploadStatus(t('预检没有可导入文件'));
+      toast.warning(t('预检没有可导入文件'));
+      return;
+    }
     
     // Initialize progress
     const initProgress: Record<string, { percent: number; status: string }> = {};
-    files.forEach(f => {
+    filesToUpload.forEach(f => {
       initProgress[f.name] = { percent: 0, status: 'pending' };
     });
     setUploadProgress(initProgress);
 
-    for (let index = 0; index < files.length; index += 1) {
-      const file = files[index];
-      setUploadStatus(`正在上传 ${index + 1}/${files.length}: ${file.name}`);
+    for (let index = 0; index < filesToUpload.length; index += 1) {
+      const file = filesToUpload[index];
+      setUploadStatus(`正在上传 ${index + 1}/${filesToUpload.length}: ${file.name}`);
       
       setUploadProgress(prev => ({
         ...prev,
@@ -161,6 +206,40 @@ export function IngestPage({ token, state, guarded, refresh, openDocument, isBus
     await refresh();
   }
 
+  async function previewSelectedFiles() {
+    if (!files.length) return;
+    const rows: JsonObject[] = [];
+    setPreviewStatus(t('正在预检证据文件...'));
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      try {
+        const resultRows = await previewUploadFile(token, file);
+        rows.push(...resultRows.map((row) => ({ ...row, client_file_name: file.name, client_size: file.size })));
+      } catch (error) {
+        rows.push({
+          id: `${file.name}-${file.size}`,
+          file_name: file.name,
+          size_bytes: file.size,
+          include: false,
+          import_action: 'exclude',
+          evidence_kind: 'preview_error',
+          evidence_priority: 0,
+          reason: error instanceof Error ? error.message : String(error),
+          exclude_reason: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+    setPreviewRows(rows);
+    const includeCount = rows.filter((row) => row.include !== false).length;
+    setPreviewStatus(`${t('预检完成')}：${includeCount}/${rows.length} ${t('个文件可导入')}`);
+  }
+
+  async function previewInbox() {
+    const data = await postJson<{ items?: JsonObject[] }>('/api/import/preview', token, { inbox: true, limit: 500 });
+    setInboxPreviewRows(Array.isArray(data.items) ? data.items : []);
+    return data as JsonObject;
+  }
+
   const uploadCounts = uploadResults.reduce(
     (counts, item) => ({ ...counts, [item.tone]: counts[item.tone] + 1 }),
     { success: 0, deduped: 0, failed: 0 }
@@ -175,12 +254,19 @@ export function IngestPage({ token, state, guarded, refresh, openDocument, isBus
           extra={
             <div className="button-row">
               <Button disabled={!files.length} loading={isBusy('upload-files')} onClick={() => guarded(uploadSelectedFiles, undefined, 'upload-files')}>{t('批量上传并导入')}</Button>
+              <Button variant="secondary" disabled={!files.length} loading={isBusy('preview-files')} onClick={() => guarded(previewSelectedFiles, undefined, 'preview-files')}>
+                <Search size={16} />
+                {t('证据预检')}
+              </Button>
               <Button variant="ghost" disabled={!files.length && !uploadResults.length} onClick={() => {
                 setFiles([]);
                 setUploadResults([]);
                 setUploadStatus('');
                 setUploadProgress({});
+                setPreviewRows([]);
+                setPreviewStatus('');
               }}>{t('清空')}</Button>
+              <Button variant="secondary" onClick={() => navigate('/reaction_links')}>{t('查看反应关联')}</Button>
             </div>
           }
         >
@@ -206,6 +292,8 @@ export function IngestPage({ token, state, guarded, refresh, openDocument, isBus
                 const selectedFiles = Array.from(event.target.files || []);
                 setFiles(prev => [...prev, ...selectedFiles]);
                 setUploadResults([]);
+                setPreviewRows([]);
+                setPreviewStatus('');
                 setUploadStatus(t('已选择文件，准备上传'));
               }}
             />
@@ -214,6 +302,7 @@ export function IngestPage({ token, state, guarded, refresh, openDocument, isBus
           <div className="upload-summary" style={{ marginTop: '12px' }}>
             <span>{files.length ? `已选择 ${files.length} 个文件` : t('尚未选择文件')}</span>
             {uploadStatus && <strong style={{ marginLeft: '12px' }}>{uploadStatus}</strong>}
+            {previewStatus && <strong style={{ marginLeft: '12px' }}>{previewStatus}</strong>}
           </div>
 
           {files.length > 0 && (
@@ -245,10 +334,57 @@ export function IngestPage({ token, state, guarded, refresh, openDocument, isBus
           )}
           <p className="muted" style={{ marginTop: '12px' }}>{t('支持 PDF/RTF/RDF/HTML/MHTML/Markdown/TXT。上传仍会经过后端扩展名、嗅探和安全校验。')}</p>
         </Card>
-        <Card eyebrow="Inbox" title={t('扫描收件箱')} extra={<Button loading={isBusy('scan-inbox')} onClick={() => guarded(async () => { const result = await postJson<JsonObject>('/api/scan', token); await refresh(); return result; }, t('扫描完成'), 'scan-inbox')}>{t('扫描')}</Button>}>
+        <Card
+          eyebrow="Inbox"
+          title={t('扫描收件箱')}
+          extra={
+            <div className="button-row">
+              <Button variant="secondary" loading={isBusy('preview-inbox')} onClick={() => guarded(previewInbox, t('收件箱预检完成'), 'preview-inbox')}>
+                <ShieldCheck size={16} />
+                {t('预检')}
+              </Button>
+              <Button loading={isBusy('scan-inbox')} onClick={() => guarded(async () => { const result = await postJson<JsonObject>('/api/scan', token); await refresh(); return result; }, t('扫描完成'), 'scan-inbox')}>{t('扫描')}</Button>
+            </div>
+          }
+        >
           <p className="muted">{t('从服务端可见 inbox 中登记新增 SciFinder 导出文件。不会绕过导入规则。')}</p>
         </Card>
       </div>
+      {previewRows.length > 0 && (
+        <Card eyebrow="Evidence Manifest" title={t('上传前证据预检')}>
+          <DataTable
+            rows={previewRows}
+            columns={[
+              { key: 'client_file_name', label: t('文件'), render: (row) => String(row.client_file_name || row.file_name || '') },
+              { key: 'include', label: t('导入'), render: (row) => row.include === false ? <StatusBadge tone="failed">{t('排除')}</StatusBadge> : <StatusBadge tone="success">{t('导入')}</StatusBadge> },
+              { key: 'evidence_kind', label: t('证据类型') },
+              { key: 'evidence_priority', label: t('优先级') },
+              { key: 'cas_count', label: 'CAS' },
+              { key: 'page_count', label: t('页数') },
+              { key: 'size_bytes', label: t('大小'), render: (row) => bytes(row.client_size || row.size_bytes) },
+              { key: 'paired_rdf_name', label: t('精确配对'), render: (row) => String(row.paired_rdf_name || row.paired_pdf_name || '') },
+              { key: 'reason', label: t('原因'), render: (row) => String(row.exclude_reason || row.reason || row.label || '') }
+            ]}
+            empty={t('暂无预检结果')}
+          />
+        </Card>
+      )}
+      {inboxPreviewRows.length > 0 && (
+        <Card eyebrow="Inbox Manifest" title={t('收件箱预检结果')}>
+          <DataTable
+            rows={inboxPreviewRows}
+            columns={[
+              { key: 'file_name', label: t('文件') },
+              { key: 'include', label: t('导入'), render: (row) => row.include === false ? <StatusBadge tone="failed">{t('排除')}</StatusBadge> : <StatusBadge tone="success">{t('导入')}</StatusBadge> },
+              { key: 'evidence_kind', label: t('证据类型') },
+              { key: 'evidence_priority', label: t('优先级') },
+              { key: 'cas_count', label: 'CAS' },
+              { key: 'paired_rdf_name', label: t('配对'), render: (row) => String(row.paired_rdf_name || row.paired_pdf_name || '') },
+              { key: 'reason', label: t('原因'), render: (row) => String(row.exclude_reason || row.reason || row.label || '') }
+            ]}
+          />
+        </Card>
+      )}
       {uploadResults.length > 0 && (
         <Card eyebrow="Upload Results" title={t('批量上传结果')}>
           <div className="upload-result-summary" aria-label="批量上传结果统计">

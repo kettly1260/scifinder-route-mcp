@@ -37,8 +37,10 @@ HOT_CONFIG_KEYS = {
         "embedding_provider_id",
         "embedding_model",
         "ocr_provider_id",
+        "ocr_provider_ids",
         "ocr_model",
         "document_parser_provider_id",
+        "document_parser_provider_ids",
         "document_parser_model",
         "document_parser_fallback",
         "structure_recognition_provider_id",
@@ -48,6 +50,18 @@ HOT_CONFIG_KEYS = {
         "postgres_url",
         "zotero_linking_enabled",
         "zotero_linking_on_import",
+        "pdf_evidence_enabled",
+        "pdf_evidence_render_pages",
+        "pdf_evidence_max_pages_per_document",
+        "structure_recognition_manual_enabled",
+        "structure_recognition_auto_on_pdf_evidence",
+        "pdf_only_candidates_enabled",
+        "pdf_only_low_confidence_enabled",
+        "ai_evidence_review_enabled",
+        "ai_evidence_review_provider_id",
+        "ai_evidence_review_model",
+        "ai_evidence_review_schema_version",
+        "ai_evidence_review_prompt_profile",
         "zotero_extraction_strategy",
         "zotero_llm_priority_terms",
     },
@@ -86,6 +100,15 @@ class AppConfig(BaseModel):
     upload_av_engine: str = "clamav"
     upload_av_endpoint: str | None = None
     upload_av_fail_closed: bool = True
+    pdf_evidence_enabled: bool = True
+    pdf_evidence_render_pages: bool = True
+    # Limit pages scanned by the PDF reaction evidence extractor.
+    pdf_evidence_max_pages_per_document: int = Field(default=200, description="Max pages to process per PDF for reaction evidence")
+    # TODO: Implement manual trigger for structure recognition from UI
+    structure_recognition_manual_enabled: bool = Field(default=True, description="Allow manual bounding box structure recognition from UI")
+    structure_recognition_auto_on_pdf_evidence: bool = False
+    pdf_only_candidates_enabled: bool = True
+    pdf_only_low_confidence_enabled: bool = True
     storage_backend: str = "sqlite"
     queue_backend: str = "sqlite"
     extraction_provider_id: str | None = None
@@ -93,14 +116,21 @@ class AppConfig(BaseModel):
     embedding_provider_id: str | None = None
     embedding_model: str | None = None
     ocr_provider_id: str | None = None
+    ocr_provider_ids: tuple[str, ...] = ()
     ocr_model: str | None = None
     document_parser_provider_id: str | None = None
+    document_parser_provider_ids: tuple[str, ...] = ()
     document_parser_model: str | None = None
     document_parser_fallback: bool = True
     structure_recognition_provider_id: str | None = None
     structure_recognition_model: str | None = None
     reranker_provider_id: str | None = None
     reranker_model: str | None = None
+    ai_evidence_review_enabled: bool = False
+    ai_evidence_review_provider_id: str | None = None
+    ai_evidence_review_model: str | None = None
+    ai_evidence_review_schema_version: str = "reaction_evidence_review.v1"
+    ai_evidence_review_prompt_profile: str = "strict-evidence-review-json"
     postgres_url: str | None = None
     zotero_linking_enabled: bool = False
     zotero_linking_on_import: bool = True
@@ -156,6 +186,13 @@ class AppConfig(BaseModel):
             upload_av_engine=os.getenv("SCIFINDER_ROUTE_UPLOAD_AV_ENGINE", "clamav").strip().lower() or "clamav",
             upload_av_endpoint=os.getenv("SCIFINDER_ROUTE_UPLOAD_AV_ENDPOINT") or None,
             upload_av_fail_closed=parse_bool(os.getenv("SCIFINDER_ROUTE_UPLOAD_AV_FAIL_CLOSED"), default=True),
+            pdf_evidence_enabled=parse_bool(os.getenv("SCIFINDER_ROUTE_PDF_EVIDENCE_ENABLED"), default=True),
+            pdf_evidence_render_pages=parse_bool(os.getenv("SCIFINDER_ROUTE_PDF_EVIDENCE_RENDER_PAGES"), default=True),
+            pdf_evidence_max_pages_per_document=max(0, int(os.getenv("SCIFINDER_ROUTE_PDF_EVIDENCE_MAX_PAGES_PER_DOCUMENT", "200"))),
+            structure_recognition_manual_enabled=parse_bool(os.getenv("SCIFINDER_ROUTE_STRUCTURE_RECOGNITION_MANUAL_ENABLED"), default=True),
+            structure_recognition_auto_on_pdf_evidence=parse_bool(os.getenv("SCIFINDER_ROUTE_STRUCTURE_RECOGNITION_AUTO_ON_PDF_EVIDENCE"), default=False),
+            pdf_only_candidates_enabled=parse_bool(os.getenv("SCIFINDER_ROUTE_PDF_ONLY_CANDIDATES_ENABLED"), default=True),
+            pdf_only_low_confidence_enabled=parse_bool(os.getenv("SCIFINDER_ROUTE_PDF_ONLY_LOW_CONFIDENCE_ENABLED"), default=True),
             storage_backend=os.getenv("SCIFINDER_ROUTE_BACKEND", "sqlite").strip().lower() or "sqlite",
             queue_backend=os.getenv("SCIFINDER_ROUTE_QUEUE_BACKEND", "sqlite").strip().lower() or "sqlite",
             
@@ -164,14 +201,21 @@ class AppConfig(BaseModel):
             embedding_provider_id=os.getenv("SCIFINDER_ROUTE_EMBEDDING_PROVIDER_ID") or None,
             embedding_model=os.getenv("SCIFINDER_ROUTE_EMBEDDING_MODEL") or None,
             ocr_provider_id=os.getenv("SCIFINDER_ROUTE_OCR_PROVIDER_ID") or None,
+            ocr_provider_ids=parse_id_list(os.getenv("SCIFINDER_ROUTE_OCR_PROVIDER_IDS"), ()),
             ocr_model=os.getenv("SCIFINDER_ROUTE_OCR_MODEL") or None,
             document_parser_provider_id=os.getenv("SCIFINDER_ROUTE_DOCUMENT_PARSER_PROVIDER_ID") or None,
+            document_parser_provider_ids=parse_id_list(os.getenv("SCIFINDER_ROUTE_DOCUMENT_PARSER_PROVIDER_IDS"), ()),
             document_parser_model=os.getenv("SCIFINDER_ROUTE_DOCUMENT_PARSER_MODEL") or None,
             document_parser_fallback=parse_bool(os.getenv("SCIFINDER_ROUTE_DOCUMENT_PARSER_FALLBACK"), default=True),
             structure_recognition_provider_id=os.getenv("SCIFINDER_ROUTE_STRUCTURE_RECOGNITION_PROVIDER_ID") or None,
             structure_recognition_model=os.getenv("SCIFINDER_ROUTE_STRUCTURE_RECOGNITION_MODEL") or None,
             reranker_provider_id=os.getenv("SCIFINDER_ROUTE_RERANKER_PROVIDER_ID") or None,
             reranker_model=os.getenv("SCIFINDER_ROUTE_RERANKER_MODEL") or None,
+            ai_evidence_review_enabled=parse_bool(os.getenv("SCIFINDER_ROUTE_AI_EVIDENCE_REVIEW_ENABLED"), default=False),
+            ai_evidence_review_provider_id=os.getenv("SCIFINDER_ROUTE_AI_EVIDENCE_REVIEW_PROVIDER_ID") or None,
+            ai_evidence_review_model=os.getenv("SCIFINDER_ROUTE_AI_EVIDENCE_REVIEW_MODEL") or None,
+            ai_evidence_review_schema_version=os.getenv("SCIFINDER_ROUTE_AI_EVIDENCE_REVIEW_SCHEMA_VERSION", "reaction_evidence_review.v1"),
+            ai_evidence_review_prompt_profile=os.getenv("SCIFINDER_ROUTE_AI_EVIDENCE_REVIEW_PROMPT_PROFILE", "strict-evidence-review-json"),
 
             postgres_url=os.getenv("SCIFINDER_ROUTE_POSTGRES_URL") or None,
             zotero_linking_enabled=parse_bool(os.getenv("SCIFINDER_ROUTE_ZOTERO_LINKING_ENABLED"), default=False),
@@ -265,8 +309,10 @@ class AppConfig(BaseModel):
                 "embedding_provider_id": self.embedding_provider_id,
                 "embedding_model": self.embedding_model,
                 "ocr_provider_id": self.ocr_provider_id,
+                "ocr_provider_ids": list(self.ocr_provider_ids),
                 "ocr_model": self.ocr_model,
                 "document_parser_provider_id": self.document_parser_provider_id,
+                "document_parser_provider_ids": list(self.document_parser_provider_ids),
                 "document_parser_model": self.document_parser_model,
                 "document_parser_fallback": self.document_parser_fallback,
                 "structure_recognition_provider_id": self.structure_recognition_provider_id,
@@ -276,6 +322,18 @@ class AppConfig(BaseModel):
                 "postgres_url": postgres_url,
                 "zotero_linking_enabled": self.zotero_linking_enabled,
                 "zotero_linking_on_import": self.zotero_linking_on_import,
+                "pdf_evidence_enabled": self.pdf_evidence_enabled,
+                "pdf_evidence_render_pages": self.pdf_evidence_render_pages,
+                "pdf_evidence_max_pages_per_document": self.pdf_evidence_max_pages_per_document,
+                "structure_recognition_manual_enabled": self.structure_recognition_manual_enabled,
+                "pdf_only_candidates_enabled": self.pdf_only_candidates_enabled,
+                "pdf_only_low_confidence_enabled": self.pdf_only_low_confidence_enabled,
+                "structure_recognition_auto_on_pdf_evidence": self.structure_recognition_auto_on_pdf_evidence,
+                "ai_evidence_review_enabled": self.ai_evidence_review_enabled,
+                "ai_evidence_review_provider_id": self.ai_evidence_review_provider_id,
+                "ai_evidence_review_model": self.ai_evidence_review_model,
+                "ai_evidence_review_schema_version": self.ai_evidence_review_schema_version,
+                "ai_evidence_review_prompt_profile": self.ai_evidence_review_prompt_profile,
                 "zotero_extraction_strategy": self.zotero_extraction_strategy,
                 "zotero_llm_priority_terms": list(self.zotero_llm_priority_terms),
             },
@@ -334,6 +392,12 @@ class AppConfig(BaseModel):
             warnings.append("security.upload_av_scan_enabled=true requires security.upload_av_endpoint")
         if self.verification_confidence_threshold < 0 or self.verification_confidence_threshold > 1:
             warnings.append("thresholds.verification_confidence_threshold must be between 0 and 1")
+        if self.pdf_evidence_max_pages_per_document < 0:
+            warnings.append("integrations.pdf_evidence_max_pages_per_document must be >= 0")
+        if self.ai_evidence_review_enabled and not self.ai_evidence_review_prompt_profile.strip():
+            warnings.append("integrations.ai_evidence_review_prompt_profile must not be empty when AI evidence review is enabled")
+        if self.ai_evidence_review_enabled and not self.ai_evidence_review_schema_version.strip():
+            warnings.append("integrations.ai_evidence_review_schema_version must not be empty when AI evidence review is enabled")
         
 
         if self.zotero_extraction_strategy not in {"rules_first", "llm_first", "rules_only"}:
@@ -352,6 +416,19 @@ def parse_extensions(value: str | None, default: tuple[str, ...]) -> tuple[str, 
         return default
     extensions = tuple(normalize_extension(item) for item in value.split(",") if item.strip())
     return extensions or default
+
+
+def parse_id_list(value: Any, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        return default
+    cleaned = tuple(dict.fromkeys(str(item).strip() for item in items if str(item).strip()))
+    return cleaned
 
 
 def normalize_extension(value: str) -> str:
@@ -426,8 +503,10 @@ def apply_config_overrides(config: AppConfig, raw: dict[str, Any]) -> AppConfig:
         embedding_provider_id=none_if_empty(integrations.get("embedding_provider_id", config.embedding_provider_id)),
         embedding_model=none_if_empty(integrations.get("embedding_model", config.embedding_model)),
         ocr_provider_id=none_if_empty(integrations.get("ocr_provider_id", config.ocr_provider_id)),
+        ocr_provider_ids=parse_id_list(integrations.get("ocr_provider_ids"), config.ocr_provider_ids),
         ocr_model=none_if_empty(integrations.get("ocr_model", config.ocr_model)),
         document_parser_provider_id=none_if_empty(integrations.get("document_parser_provider_id", config.document_parser_provider_id)),
+        document_parser_provider_ids=parse_id_list(integrations.get("document_parser_provider_ids"), config.document_parser_provider_ids),
         document_parser_model=integrations.get("document_parser_model", config.document_parser_model) or None,
         document_parser_fallback=coerce_bool(integrations.get("document_parser_fallback"), config.document_parser_fallback),
         structure_recognition_provider_id=none_if_empty(integrations.get("structure_recognition_provider_id", config.structure_recognition_provider_id)),
@@ -437,6 +516,18 @@ def apply_config_overrides(config: AppConfig, raw: dict[str, Any]) -> AppConfig:
         postgres_url=none_if_empty(integrations.get("postgres_url", config.postgres_url)),
         zotero_linking_enabled=coerce_bool(integrations.get("zotero_linking_enabled"), config.zotero_linking_enabled),
         zotero_linking_on_import=coerce_bool(integrations.get("zotero_linking_on_import"), config.zotero_linking_on_import),
+        pdf_evidence_enabled=coerce_bool(integrations.get("pdf_evidence_enabled"), config.pdf_evidence_enabled),
+        pdf_evidence_render_pages=coerce_bool(integrations.get("pdf_evidence_render_pages"), config.pdf_evidence_render_pages),
+        pdf_evidence_max_pages_per_document=max(0, coerce_int(integrations.get("pdf_evidence_max_pages_per_document"), config.pdf_evidence_max_pages_per_document)),
+        structure_recognition_manual_enabled=coerce_bool(integrations.get("structure_recognition_manual_enabled"), config.structure_recognition_manual_enabled),
+        pdf_only_candidates_enabled=coerce_bool(integrations.get("pdf_only_candidates_enabled"), config.pdf_only_candidates_enabled),
+        pdf_only_low_confidence_enabled=coerce_bool(integrations.get("pdf_only_low_confidence_enabled"), config.pdf_only_low_confidence_enabled),
+        structure_recognition_auto_on_pdf_evidence=coerce_bool(integrations.get("structure_recognition_auto_on_pdf_evidence"), config.structure_recognition_auto_on_pdf_evidence),
+        ai_evidence_review_enabled=coerce_bool(integrations.get("ai_evidence_review_enabled"), config.ai_evidence_review_enabled),
+        ai_evidence_review_provider_id=none_if_empty(integrations.get("ai_evidence_review_provider_id", config.ai_evidence_review_provider_id)),
+        ai_evidence_review_model=none_if_empty(integrations.get("ai_evidence_review_model", config.ai_evidence_review_model)),
+        ai_evidence_review_schema_version=none_if_empty(integrations.get("ai_evidence_review_schema_version", config.ai_evidence_review_schema_version)) or config.ai_evidence_review_schema_version,
+        ai_evidence_review_prompt_profile=none_if_empty(integrations.get("ai_evidence_review_prompt_profile", config.ai_evidence_review_prompt_profile)) or config.ai_evidence_review_prompt_profile,
         zotero_extraction_strategy=str(integrations.get("zotero_extraction_strategy", config.zotero_extraction_strategy)).strip() or "rules_first",
         zotero_llm_priority_terms=priority_terms,
         llm_schema_version=str(extraction.get("llm_schema_version", config.llm_schema_version)),

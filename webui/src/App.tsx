@@ -21,6 +21,7 @@ import { IngestPage } from './pages/IngestPage';
 import { DocumentsListPage } from './pages/DocumentsListPage';
 import { DocumentDetailPage } from './pages/DocumentDetailPage';
 import { ConfigPage } from './pages/ConfigPage';
+import { ReactionLinksPage } from './pages/ReactionLinksPage';
 import { RdfPage } from './pages/RdfPage';
 import { RdfDetailPage } from './pages/RdfDetailPage';
 import { StructurePage } from './pages/StructurePage';
@@ -280,6 +281,7 @@ export function App() {
           <Route path="/documents" element={<DocumentsListPage token={token} guarded={guarded} />} />
           <Route path="/documents/:documentId" element={<DocumentDetailPage token={token} guarded={guarded} />} />
           <Route path="/config" element={<ConfigPage token={token} state={state} guarded={guarded} isBusy={isBusy} onConfigSaved={applyConfig} />} />
+          <Route path="/reaction_links" element={<ReactionLinksPage token={token} state={state} guarded={guarded} isBusy={isBusy} />} />
           <Route path="/rdf" element={<RdfPage token={token} guarded={guarded} />} />
           <Route path="/rdf/:reactionId" element={<RdfDetailPage token={token} guarded={guarded} />} />
           <Route path="/structures" element={<StructurePage token={token} state={state} guarded={guarded} isBusy={isBusy} />} />

@@ -180,8 +180,8 @@ unlink_document_from_batch
 | PostgreSQL backend | Runnable degraded integration | `SCIFINDER_ROUTE_BACKEND=postgres` tests connectivity and reports status; SQLite remains active fallback unless a Postgres adapter is added for a deployment. |
 | pgvector | Optional/degraded | SQLite stores embeddings as JSON and cosine-searches them; Postgres/pgvector reports endpoint/backend status. |
 | PDF/HTML/MHTML/text parsing | Implemented | Built-in parser remains fallback. |
-| External document parser | Implemented | `/parse` JSON adapter; failure falls back unless disabled. |
-| OCR worker | Implemented adapter | `/ocr` JSON adapter for image-only PDFs/low-text docs; errors are job errors, not service crashes. |
+| External document parser | Implemented | `/parse` JSON adapter plus built-in MinerU and PaddleOCR-VL adapters; provider chains fall back unless disabled. |
+| OCR worker | Implemented adapter | `/ocr` JSON adapter plus built-in MinerU and PaddleOCR-VL adapters for image-only PDFs/low-text docs; errors are job errors, not service crashes. |
 | Rule extraction | Implemented | Candidate blocks and structured fields. |
 | LLM JSON structuring | Implemented adapter | OpenAI-compatible `/chat/completions`; strict JSON; invalid responses fall back to rule fields with metadata error. |
 | Embedding/vector index | Implemented adapter | OpenAI-compatible `/embeddings`; rebuild/status/semantic search tools. |
@@ -232,6 +232,33 @@ Expected response:
 
 ```json
 {"file_type":"pdf","title":"...","doi":"10....","chunks":[{"text":"...","page_number":1,"parser_name":"external","parser_version":"1"}]}
+```
+
+Built-in document OCR/parser providers:
+
+- `paddleocr_vl`: submits the local file as multipart to an AI Studio PaddleOCR-VL job endpoint such as `https://paddleocr.aistudio-app.com/api/v2/ocr/jobs`, polls the job, and reads the provider result JSON.
+- `mineru`: submits the local file as multipart to `<endpoint>/file_parse` with `return_md=true`, then imports returned Markdown/text into parsed chunks.
+
+Provider fallback chains can be configured with single-provider compatibility fields or ordered lists:
+
+```yaml
+integrations:
+  ai_providers:
+    - id: paddleocr
+      name: PaddleOCR AI Studio
+      format: paddleocr_vl
+      endpoint: https://paddleocr.aistudio-app.com/api/v2/ocr/jobs
+      api_key: ${PADDLEOCR_TOKEN}
+      enabled_models: [PaddleOCR-VL-1.6]
+    - id: mineru
+      name: MinerU
+      format: mineru
+      endpoint: https://mineru.example/api
+      api_key: ${MINERU_TOKEN}
+      enabled_models: [mineru]
+  ocr_provider_ids: [paddleocr, mineru]
+  document_parser_provider_ids: [mineru, paddleocr]
+  document_parser_fallback: true
 ```
 
 Structure recognition endpoint: `POST <endpoint>/recognize`

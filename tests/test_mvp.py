@@ -615,7 +615,8 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
                 "ai_providers": [
                     {"id": "test-embed", "name": "Embed", "format": "openai_compatible", "endpoint": "http://embedding:8000/v1", "api_key": ""},
                     {"id": "test-ocr", "name": "OCR", "format": "paddleocr_vl", "endpoint": "http://ocr-worker:9000", "api_key": ""},
-                    {"id": "test-parser", "name": "Parser", "format": "doc2x", "endpoint": "http://parser:9100", "api_key": ""}
+                    {"id": "test-parser", "name": "Parser", "format": "doc2x", "endpoint": "http://parser:9100", "api_key": ""},
+                    {"id": "test-review", "name": "Evidence Review", "format": "openai_compatible", "endpoint": "http://review:9200/v1", "api_key": ""}
                 ],
                 "embedding_provider_id": "test-embed",
                 "embedding_model": "bge-m3",
@@ -623,6 +624,18 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
                 "document_parser_provider_id": "test-parser",
                 "document_parser_fallback": True,
                 "structure_recognition_model": "decimer",
+                "pdf_evidence_enabled": True,
+                "pdf_evidence_render_pages": False,
+                "pdf_evidence_max_pages_per_document": 88,
+                "structure_recognition_manual_enabled": False,
+                "structure_recognition_auto_on_pdf_evidence": True,
+                "pdf_only_candidates_enabled": True,
+                "pdf_only_low_confidence_enabled": False,
+                "ai_evidence_review_enabled": True,
+                "ai_evidence_review_provider_id": "test-review",
+                "ai_evidence_review_model": "gpt-review",
+                "ai_evidence_review_schema_version": "reaction_evidence_review.v2",
+                "ai_evidence_review_prompt_profile": "strict-evidence-review-json",
             },
             "extraction": {"llm_schema_version": "reaction_step.v2", "llm_prompt_profile": "strict", "llm_cost_limit_usd": 1.25},
             "thresholds": {"verification_confidence_threshold": 0.75},
@@ -639,8 +652,18 @@ def test_update_config_writes_and_reloads_hot_config(tmp_path: Path) -> None:
     assert updated["integrations"]["embedding_model"] == "bge-m3"
     assert updated["integrations"]["ai_providers"][1]["endpoint"] == "http://ocr-worker:9000"
     assert updated["integrations"]["ai_providers"][2]["endpoint"] == "http://parser:9100"
+    assert updated["integrations"]["ai_providers"][3]["endpoint"] == "http://review:9200/v1"
     assert updated["integrations"]["document_parser_fallback"] is True
     assert updated["integrations"]["structure_recognition_model"] == "decimer"
+    assert updated["integrations"]["pdf_evidence_render_pages"] is False
+    assert updated["integrations"]["pdf_evidence_max_pages_per_document"] == 88
+    assert updated["integrations"]["structure_recognition_manual_enabled"] is False
+    assert updated["integrations"]["structure_recognition_auto_on_pdf_evidence"] is True
+    assert updated["integrations"]["pdf_only_low_confidence_enabled"] is False
+    assert updated["integrations"]["ai_evidence_review_enabled"] is True
+    assert updated["integrations"]["ai_evidence_review_provider_id"] == "test-review"
+    assert updated["integrations"]["ai_evidence_review_model"] == "gpt-review"
+    assert updated["integrations"]["ai_evidence_review_schema_version"] == "reaction_evidence_review.v2"
     assert updated["extraction"]["llm_schema_version"] == "reaction_step.v2"
     assert updated["extraction"]["llm_cost_limit_usd"] == 1.25
     assert updated["thresholds"]["verification_confidence_threshold"] == 0.75
@@ -739,6 +762,46 @@ def test_paddleocr_endpoint_test_does_not_probe_health() -> None:
     assert "no lightweight health endpoint" in (result.detail or "")
 
 
+def test_mineru_endpoint_test_does_not_probe_health() -> None:
+    from scifinder_route_mcp.integrations import test_http_endpoint
+
+    result = test_http_endpoint(
+        "https://mineru.example/api",
+        provider="mineru",
+        kind="document_parser",
+        model="mineru",
+    )
+
+    assert result.status == "ok"
+    assert "file_parse" in (result.detail or "")
+
+
+def test_mineru_ocr_posts_file_parse_multipart(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scifinder_route_mcp.integrations import OCRAdapter
+
+    seen: dict[str, object] = {}
+
+    def fake_post_multipart(url: str, file_path: str, fields: dict[str, str], *, headers: dict[str, str] | None = None, timeout: float = 60.0) -> dict[str, object]:
+        seen.update({"url": url, "file_path": file_path, "fields": fields, "headers": headers, "timeout": timeout})
+        return {"data": {"md_content": "# Parsed\n\nProcedure text"}}
+
+    monkeypatch.setattr("scifinder_route_mcp.integrations.post_multipart", fake_post_multipart)
+
+    result = OCRAdapter("https://mineru.example/api/file_parse", "mineru", "secret", provider="mineru").ocr_document("sample.pdf")
+
+    assert result["text"] == "# Parsed\n\nProcedure text"
+    assert seen["url"] == "https://mineru.example/api/file_parse"
+    assert seen["fields"] == {
+        "return_md": "true",
+        "return_content_list": "false",
+        "return_layout": "false",
+        "parse_method": "auto",
+        "model": "mineru",
+    }
+    assert seen["headers"] == {"Authorization": "Bearer secret"}
+    assert seen["timeout"] == 300
+
+
 def test_structure_recognition_paddleocr_endpoint_test_does_not_probe_health() -> None:
     from scifinder_route_mcp.integrations import test_http_endpoint
 
@@ -750,6 +813,84 @@ def test_structure_recognition_paddleocr_endpoint_test_does_not_probe_health() -
 
     assert result.status == "ok"
     assert "does not expose /health" in (result.detail or "")
+
+
+def test_ocr_provider_chain_falls_back_to_next_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scifinder_route_mcp.config import AiProvider
+    from scifinder_route_mcp.integrations import OCRAdapter
+    from scifinder_route_mcp.parsers import ParsedDocument
+
+    service = make_service(tmp_path)
+    service.storage.upsert_ai_provider(AiProvider(id="paddle", name="Paddle", format="paddleocr_vl", endpoint="https://paddle.example/jobs", api_key="", enabled_models=("PaddleOCR-VL-1.6",)))
+    service.storage.upsert_ai_provider(AiProvider(id="mineru", name="MinerU", format="mineru", endpoint="https://mineru.example/api", api_key="", enabled_models=("mineru",)))
+    service.config = service.config.model_copy(update={"ocr_provider_ids": ("paddle", "mineru")})
+    attempts: list[tuple[str, str]] = []
+
+    def fake_ocr(self: OCRAdapter, file_path: str) -> dict[str, object]:
+        attempts.append((self.provider, self.model))
+        if self.provider == "paddleocr_vl":
+            raise RuntimeError("quota exhausted")
+        return {"text": "MinerU OCR text"}
+
+    monkeypatch.setattr("scifinder_route_mcp.integrations.OCRAdapter.ocr_document", fake_ocr)
+
+    parsed = ParsedDocument(file_type="pdf", title=None, doi=None, chunks=[])
+    augmented = service._augment_with_ocr("sample.pdf", parsed)
+
+    assert attempts == [("paddleocr_vl", "PaddleOCR-VL-1.6"), ("mineru", "mineru")]
+    assert augmented.chunks[-1].text == "MinerU OCR text"
+    assert augmented.chunks[-1].parser_name == "ocr-mineru"
+
+
+def test_document_parser_provider_chain_falls_back_to_next_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scifinder_route_mcp.config import AiProvider
+    from scifinder_route_mcp.integrations import ExternalParserAdapter
+    from scifinder_route_mcp.parsers import ParsedDocument, TextChunk
+
+    service = make_service(tmp_path)
+    service.storage.upsert_ai_provider(AiProvider(id="mineru", name="MinerU", format="mineru", endpoint="https://mineru.example/api", api_key="", enabled_models=("mineru",)))
+    service.storage.upsert_ai_provider(AiProvider(id="paddle", name="Paddle", format="paddleocr_vl", endpoint="https://paddle.example/jobs", api_key="", enabled_models=("PaddleOCR-VL-1.6",)))
+    service.config = service.config.model_copy(update={"document_parser_provider_ids": ("mineru", "paddle")})
+    attempts: list[tuple[str, str]] = []
+
+    def fake_parse(self: ExternalParserAdapter, file_path: str) -> ParsedDocument:
+        attempts.append((self.provider, self.model))
+        if self.provider == "mineru":
+            raise RuntimeError("temporary MinerU failure")
+        return ParsedDocument(file_type="pdf", title=None, doi=None, chunks=[TextChunk(text="Paddle parsed text", page_number=None, parser_name="paddleocr_vl")])
+
+    monkeypatch.setattr("scifinder_route_mcp.integrations.ExternalParserAdapter.parse", fake_parse)
+
+    parsed = service._parse_with_optional_external(Path("sample.pdf"))
+
+    assert attempts == [("mineru", "mineru"), ("paddleocr_vl", "PaddleOCR-VL-1.6")]
+    assert parsed.full_text == "Paddle parsed text"
+
+
+def test_llm_structuring_uses_extraction_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scifinder_route_mcp.config import AiProvider
+
+    service = make_service(tmp_path)
+    service.storage.upsert_ai_provider(AiProvider(id="llm", name="LLM", format="openai_compatible", endpoint="https://llm.example/v1", api_key="secret"))
+    service.config = service.config.model_copy(update={"extraction_provider_id": "llm", "extraction_model": "gpt-test"})
+    seen: dict[str, object] = {}
+
+    class FakeLLMStructuringAdapter:
+        configured = True
+
+        def __init__(self, endpoint: str | None, model: str | None, *, enabled: bool, schema_version: str, prompt_profile: str, provider: str = "openai_compatible", api_key: str | None = None):
+            seen.update({"endpoint": endpoint, "model": model, "enabled": enabled, "provider": provider, "api_key": api_key})
+
+        def structure(self, candidate_text: str, rule_fields: dict[str, object]) -> dict[str, object]:
+            return {"yield_text": "90%", "confidence": 0.9}
+
+    monkeypatch.setattr("scifinder_route_mcp.service.LLMStructuringAdapter", FakeLLMStructuringAdapter)
+
+    step = service._structure_with_llm({"original_text": "procedure", "confidence": 0.1})
+
+    assert seen == {"endpoint": "https://llm.example/v1", "model": "gpt-test", "enabled": True, "provider": "openai_compatible", "api_key": "secret"}
+    assert step["yield_text"] == "90%"
+    assert step["extraction_method"] == "rules+llm"
 
 
 def test_embedding_endpoint_test_posts_to_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -712,3 +712,128 @@ class RdfStructureModel(Base):
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+
+class ReactionSourceLinkModel(Base):
+    __tablename__ = "reaction_source_link"
+    id = Column(String, primary_key=True)
+    cas_reaction_number = Column(String, index=True)
+    source_mode = Column(String, nullable=False) # rdf_pdf_linked, rdf_only, pdf_only, pdf_only_low_confidence, pdf_only_verified
+    rdf_reaction_id = Column(String, index=True, nullable=True)
+    rdf_document_id = Column(String, nullable=True)
+    pdf_document_id = Column(String, index=True, nullable=True)
+    primary_pdf_page = Column(Integer, nullable=True)
+    pdf_pages_json = Column(String, nullable=False, default="[]") # JSON list of pages
+    link_confidence = Column(Float, nullable=False, default=0.0)
+    link_method = Column(String, nullable=False)
+    needs_review = Column(Integer, nullable=False, default=0) # SQLite boolean/int
+    conflict_flags_json = Column(String, nullable=False, default="{}")
+    created_at = Column(String)
+    updated_at = Column(String)
+    deleted_at = Column(String, nullable=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "cas_reaction_number": self.cas_reaction_number,
+            "source_mode": self.source_mode,
+            "rdf_reaction_id": self.rdf_reaction_id,
+            "rdf_document_id": self.rdf_document_id,
+            "pdf_document_id": self.pdf_document_id,
+            "primary_pdf_page": self.primary_pdf_page,
+            "pdf_pages_json": self.pdf_pages_json,
+            "link_confidence": self.link_confidence,
+            "link_method": self.link_method,
+            "needs_review": self.needs_review,
+            "conflict_flags_json": self.conflict_flags_json,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "deleted_at": self.deleted_at,
+        }
+
+class PdfReactionEvidenceModel(Base):
+    __tablename__ = "pdf_reaction_evidence"
+    id = Column(String, primary_key=True)
+    source_document_id = Column(String, nullable=False)
+    reaction_source_link_id = Column(String, index=True, nullable=True)
+    cas_reaction_number = Column(String, index=True, nullable=True)
+    page_number = Column(Integer, nullable=False)
+    is_primary = Column(Integer, nullable=False, default=0)
+    page_text = Column(String, nullable=False)
+    procedure_text = Column(String, nullable=True)
+    products_text = Column(String, nullable=True)
+    reactants_text = Column(String, nullable=True)
+    conditions_text = Column(String, nullable=True)
+    yield_text = Column(String, nullable=True)
+    reference_text = Column(String, nullable=True)
+    doi = Column(String, nullable=True)
+    rendered_page_image_path = Column(String, nullable=True)
+    block_start_hint = Column(String, nullable=True)
+    block_end_hint = Column(String, nullable=True)
+    match_confidence = Column(Float, nullable=False, default=0.0)
+    extraction_method = Column(String, nullable=False)
+    needs_review = Column(Integer, nullable=False, default=0)
+    created_at = Column(String)
+    updated_at = Column(String)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "source_document_id": self.source_document_id,
+            "reaction_source_link_id": self.reaction_source_link_id,
+            "cas_reaction_number": self.cas_reaction_number,
+            "page_number": self.page_number,
+            "is_primary": self.is_primary,
+            "page_text": self.page_text,
+            "procedure_text": self.procedure_text,
+            "products_text": self.products_text,
+            "reactants_text": self.reactants_text,
+            "conditions_text": self.conditions_text,
+            "yield_text": self.yield_text,
+            "reference_text": self.reference_text,
+            "doi": self.doi,
+            "rendered_page_image_path": self.rendered_page_image_path,
+            "block_start_hint": self.block_start_hint,
+            "block_end_hint": self.block_end_hint,
+            "match_confidence": self.match_confidence,
+            "extraction_method": self.extraction_method,
+            "needs_review": self.needs_review,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+class StructureEvidenceCandidateModel(Base):
+    __tablename__ = "structure_evidence_candidate"
+    id = Column(String, primary_key=True)
+    pdf_evidence_id = Column(String, nullable=False)
+    source_document_id = Column(String, nullable=False)
+    page_number = Column(Integer, nullable=False)
+    image_path = Column(String, nullable=True)
+    candidate_smiles = Column(String, nullable=True)
+    candidate_inchikey = Column(String, nullable=True)
+    candidate_formula = Column(String, nullable=True)
+    role_hint = Column(String, nullable=True)
+    model_name = Column(String, nullable=True)
+    confidence = Column(Float, nullable=False, default=0.0)
+    validation_status = Column(String, nullable=False, default='candidate')
+    validation_signals_json = Column(String, nullable=False, default='{}')
+    created_at = Column(String)
+    updated_at = Column(String)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "pdf_evidence_id": self.pdf_evidence_id,
+            "source_document_id": self.source_document_id,
+            "page_number": self.page_number,
+            "image_path": self.image_path,
+            "candidate_smiles": self.candidate_smiles,
+            "candidate_inchikey": self.candidate_inchikey,
+            "candidate_formula": self.candidate_formula,
+            "role_hint": self.role_hint,
+            "model_name": self.model_name,
+            "confidence": self.confidence,
+            "validation_status": self.validation_status,
+            "validation_signals_json": self.validation_signals_json,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }

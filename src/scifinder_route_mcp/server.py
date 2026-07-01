@@ -490,6 +490,31 @@ def create_mcp(service: RouteService | None = None) -> Any:
         require_role(token, "operator")
         return get_service().storage.unlink_document_from_batch(document_id=document_id, batch_id=batch_id, reason=reason)
 
+    @mcp.tool()
+    def list_reaction_links(document_id: str = "", limit: int = 100, token: str | None = None) -> list[dict[str, Any]]:
+        """List CAS reaction-level evidence links between RDF records and PDF pages."""
+        require_role(token, "viewer")
+        return read_list(lambda: get_service().storage.list_reaction_source_links(document_id=document_id, limit=limit))
+
+    @mcp.tool()
+    def confirm_reaction_link(link_id: str, token: str | None = None) -> dict[str, Any]:
+        """Confirm a candidate reaction link from PDF evidence block rules."""
+        require_role(token, "operator")
+        get_service().storage.update_reaction_source_link(link_id, {"needs_review": 0})
+        return {"status": "success", "id": link_id}
+
+    @mcp.tool()
+    def unlink_reaction_link(link_id: str, token: str | None = None) -> dict[str, Any]:
+        """Remove an incorrect reaction-level link."""
+        require_role(token, "operator")
+        return get_service().unlink_reaction_source_link(link_id)
+
+    @mcp.tool()
+    def force_reaction_link(document_id: str, rdf_reaction_id: str, pdf_page: int, token: str | None = None) -> dict[str, Any]:
+        """Manually force link a PDF page to an RDF reaction, overriding confidence rules."""
+        require_role(token, "operator")
+        return get_service().force_link_reaction(document_id, rdf_reaction_id, pdf_page)
+
     register_guidance_interfaces(mcp)
 
     return mcp

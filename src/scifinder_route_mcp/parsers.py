@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Any
 
 from .rdfile import split_rdfile_records
 
@@ -339,3 +340,117 @@ def _extract_html_title(html: str) -> str | None:
     if not match:
         return None
     return normalize_text(re.sub(r"<[^>]+>", "", unescape(match.group(1))))
+
+
+def _extract_pdf_page_blocks(page_text: str) -> dict[str, str | None]:
+    blocks: dict[str, str | None] = {
+        "procedure": None,
+        "products": None,
+        "reactants": None,
+        "conditions": None,
+        "yield": None
+    }
+    
+    proc_match = re.search(r"(?:Procedure|Experimental Protocols?):?\s*(.*?)(?:Characterization Data|State|CAS Method Number|Alternative Steps|Reference|CAS Reaction Number|\Z)", page_text, re.IGNORECASE | re.DOTALL)
+    if proc_match:
+        blocks["procedure"] = proc_match.group(1).strip()
+        
+    products_match = re.search(r"(?:Products?):?\s*(.*?)(?:Reactants?|Reagents?|Catalysts?|Solvents?|Conditions?|Stage|Procedure|Experimental|\Z)", page_text, re.IGNORECASE | re.DOTALL)
+    if products_match:
+        blocks["products"] = products_match.group(1).strip()
+        
+    reactants_match = re.search(r"(?:Reactants?):?\s*(.*?)(?:Products?|Reagents?|Catalysts?|Solvents?|Conditions?|Stage|Procedure|Experimental|\Z)", page_text, re.IGNORECASE | re.DOTALL)
+    if reactants_match:
+        blocks["reactants"] = reactants_match.group(1).strip()
+        
+    cond_match = re.search(r"(?:Stage Reagents Catalysts Solvents Conditions):?\s*(.*?)(?:Procedure|Experimental|\Z)", page_text, re.IGNORECASE | re.DOTALL)
+    if cond_match:
+        blocks["conditions"] = cond_match.group(1).strip()
+        
+    yield_match = re.search(r"(?:Yield:?\s*)(\d+(?:\.\d+)?%)", page_text, re.IGNORECASE)
+    if yield_match:
+        blocks["yield"] = yield_match.group(1)
+        
+    return blocks
+
+def _extract_pdf_reaction_evidence(file_path: Path, document_id: str, *, max_pages: int | None = None) -> list[dict[str, Any]]:
+    try:
+        import fitz  # type: ignore[import-not-found]
+    except ImportError:
+        return []
+
+    evidence_rows: list[dict[str, Any]] = []
+    cas_pattern = re.compile(r"(?:CAS Reaction Number:\s*)?(31-\d{3}-CAS-\d+)", re.IGNORECASE)
+    page_limit = None if max_pages is None else max(0, int(max_pages))
+    
+    with fitz.open(file_path) as document:
+        for index, page in enumerate(document, start=1):
+            if page_limit is not None and index > page_limit:
+                break
+            text = normalize_text(page.get_text("text"))
+            if not text:
+                continue
+                
+            cas_matches = list(set(cas_pattern.findall(text)))
+            blocks = _extract_pdf_page_blocks(text)
+            
+            if cas_matches:
+                for cas in cas_matches:
+                    row = {
+                        "source_document_id": document_id,
+                        "cas_reaction_number": cas,
+                        "page_number": index,
+                        "page_text": text,
+                        "procedure_text": blocks.get("procedure"),
+                        "products_text": blocks.get("products"),
+                        "reactants_text": blocks.get("reactants"),
+                        "conditions_text": blocks.get("conditions"),
+                        "yield_text": blocks.get("yield"),
+                        "extraction_method": "cas_anchor",
+                        "match_confidence": 0.8
+                    }
+                    evidence_rows.append(row)
+            else:
+                row = {
+                    "source_document_id": document_id,
+                    "cas_reaction_number": None,
+                    "page_number": index,
+                    "page_text": text,
+                    "procedure_text": blocks.get("procedure"),
+                    "products_text": blocks.get("products"),
+                    "reactants_text": blocks.get("reactants"),
+                    "conditions_text": blocks.get("conditions"),
+                    "yield_text": blocks.get("yield"),
+                    "extraction_method": "pdf_block_rules",
+                    "match_confidence": 0.3
+                }
+                evidence_rows.append(row)
+
+    return evidence_rows
+
+def _select_primary_pdf_page(evidence_rows: list[dict[str, Any]]) -> int | None:
+    if not evidence_rows:
+        return None
+    
+    def score_row(row: dict[str, Any]) -> float:
+        score = 0.0
+        text = row.get("page_text", "")
+        if "procedure" in text.lower():
+            score += 100
+        if "experimental protocol" in text.lower():
+            score += 80
+        if "products" in text.lower() and "reactants" in text.lower():
+            score += 50
+        if "stage reagents catalysts solvents conditions" in text.lower():
+            score += 40
+        if row.get("yield_text"):
+            score += 20
+        if "time" in text.lower() or "temperature" in text.lower():
+            score += 15
+        if "solvents" in text.lower() or "reagents" in text.lower():
+            score += 10
+        score -= row.get("page_number", 0) * 0.001
+        return score
+    
+    best_row = max(evidence_rows, key=score_row)
+    return best_row.get("page_number")

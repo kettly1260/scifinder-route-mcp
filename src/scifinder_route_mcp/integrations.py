@@ -89,6 +89,10 @@ def _integration_resource_url(endpoint: str, resource: str) -> str:
     return _resource_url(endpoint, resource, ("/health", "/ocr", "/parse", "/recognize", "/rerank"))
 
 
+def _mineru_resource_url(endpoint: str, resource: str) -> str:
+    return _resource_url(endpoint, resource, ("/file_parse", "/tasks", "/task", "/health"))
+
+
 def _gemini_base_url(endpoint: str) -> str:
     base = endpoint.rstrip("/")
     if base.endswith("/models"):
@@ -99,6 +103,49 @@ def _gemini_base_url(endpoint: str) -> str:
 def _looks_like_paddleocr_job_endpoint(endpoint: str | None, model: str | None = None) -> bool:
     value = (endpoint or "").rstrip("/").lower()
     return value.endswith("/ocr/jobs") or "paddleocr" in value or (model or "").lower().startswith("paddleocr")
+
+
+def _extract_mineru_text(payload: dict[str, Any]) -> str:
+    candidates: list[Any] = []
+    if isinstance(payload, dict):
+        candidates.extend(
+            [
+                payload.get("text"),
+                payload.get("markdown"),
+                payload.get("md"),
+                payload.get("md_content"),
+                payload.get("content"),
+            ]
+        )
+        data = payload.get("data")
+        if isinstance(data, dict):
+            candidates.extend(
+                [
+                    data.get("text"),
+                    data.get("markdown"),
+                    data.get("md"),
+                    data.get("md_content"),
+                    data.get("content"),
+                ]
+            )
+            if isinstance(data.get("pages"), list):
+                for page in data["pages"]:
+                    if isinstance(page, dict):
+                        candidates.extend(
+                            [
+                                page.get("text"),
+                                page.get("markdown"),
+                                page.get("md"),
+                                page.get("content"),
+                            ]
+                        )
+        pages = payload.get("pages")
+        if isinstance(pages, list):
+            for page in pages:
+                if isinstance(page, dict):
+                    candidates.extend([page.get("text"), page.get("markdown"), page.get("md"), page.get("content")])
+    texts = [normalize_text(str(item)) for item in candidates if isinstance(item, str) and item.strip()]
+    return "\n\n".join(text for text in texts if text)
 
 
 def _test_llm_endpoint(endpoint: str, *, model: str | None, provider: str, api_key: str | None) -> EndpointResult:
@@ -128,6 +175,8 @@ def test_http_endpoint(endpoint: str | None, *, model: str | None = None, provid
         return EndpointResult(configured=False, status="unknown", detail="Endpoint is not configured")
     if kind == "ocr" and provider == "paddleocr_vl":
         return EndpointResult(configured=True, status="ok", detail="PaddleOCR-VL job endpoint configured. This provider has no lightweight health endpoint; submit a document to verify job execution.")
+    if kind in {"ocr", "document_parser"} and provider == "mineru":
+        return EndpointResult(configured=True, status="ok", detail="MinerU document parser endpoint configured. This provider may not expose /health; submit a document to verify file_parse execution.")
     if kind in {"document_parser", "structure_recognition"} and _looks_like_paddleocr_job_endpoint(endpoint, model):
         return EndpointResult(configured=True, status="ok", detail="PaddleOCR-VL job endpoint configured. It does not expose /health or /models; runtime calls will submit OCR jobs and use configured fallbacks where available.")
     if kind == "extraction":
@@ -170,7 +219,7 @@ def model_list_url(endpoint: str, provider: str, api_key: str | None = None) -> 
 def list_http_models(endpoint: str | None, *, provider: str = "openai_compatible", api_key: str | None = None, kind: str = "generic", model: str | None = None, models_endpoint: str | None = None) -> EndpointResult:
     if not endpoint:
         return EndpointResult(configured=False, status="unknown", detail="Endpoint is not configured", payload={"models": []})
-    if provider == "paddleocr_vl" or (kind in {"ocr", "document_parser"} and _looks_like_paddleocr_job_endpoint(endpoint, model)):
+    if provider in {"paddleocr_vl", "mineru"} or (kind in {"ocr", "document_parser"} and _looks_like_paddleocr_job_endpoint(endpoint, model)):
         models = [model] if model else []
         return EndpointResult(configured=True, status="ok", detail="Provider does not expose a model-list endpoint; using the configured model value.", payload={"models": models})
     if kind in {"document_parser", "structure_recognition"}:
@@ -259,6 +308,40 @@ class LLMStructuringAdapter:
             raise RuntimeError("LLM endpoint returned no message content")
         return parse_strict_json(content)
 
+    def review_reaction_evidence(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.configured:
+            return None
+        system = (
+            "Return only strict JSON for evidence review of one chemical reaction. "
+            "Use only the supplied RDF/PDF evidence. Do not invent missing chemistry. "
+            "Treat RDF as structured SciFinder evidence, paper SI as stronger procedure evidence, "
+            "and patent text as patent reaction-process evidence. "
+            "If evidence is incomplete or conflicting, recommend needs_review."
+        )
+        allowed_keys = [
+            "recommendation",
+            "confidence",
+            "extracted_fields",
+            "agreement",
+            "conflict_flags",
+            "rationale",
+            "cited_evidence",
+        ]
+        user = json.dumps(
+            {
+                "schema_version": "reaction_evidence_review.v1",
+                "prompt_profile": self.prompt_profile,
+                "allowed_keys": allowed_keys,
+                "recommendations": ["confirm", "needs_review", "reject"],
+                "payload": payload,
+            },
+            ensure_ascii=False,
+        )
+        content = self._complete(system, user)
+        if not isinstance(content, str):
+            raise RuntimeError("LLM endpoint returned no message content")
+        return parse_strict_json(content)
+
     def _complete(self, system: str, user: str) -> str | None:
         base = self.endpoint.rstrip("/") if self.endpoint else ""
         if self.provider == "openai_responses":
@@ -303,7 +386,26 @@ class OCRAdapter:
             raise RuntimeError("OCR endpoint is not configured")
         if self.provider == "paddleocr_vl":
             return self._ocr_paddleocr_vl(file_path)
+        if self.provider == "mineru":
+            return self._ocr_mineru(file_path)
         return post_json(_integration_resource_url(self.endpoint, "ocr"), {"model": self.model, "file_path": file_path}, headers=auth_headers("openai_compatible", self.api_key))
+
+    def _ocr_mineru(self, file_path: str) -> dict[str, Any]:
+        endpoint = _mineru_resource_url(self.endpoint or "", "file_parse")
+        fields = {
+            "return_md": "true",
+            "return_content_list": "false",
+            "return_layout": "false",
+            "parse_method": "auto",
+        }
+        if self.model and self.model != "default":
+            fields["model"] = self.model
+        payload = post_multipart(endpoint, file_path, fields, headers=auth_headers("openai_compatible", self.api_key), timeout=300)
+        text = _extract_mineru_text(payload)
+        if not text:
+            detail = payload.get("msg") or payload.get("message") or payload.get("error") or "MinerU endpoint returned no markdown/text"
+            raise RuntimeError(str(detail))
+        return {"text": text, "confidence": None, "provider": "mineru", "payload": payload}
 
     def _ocr_paddleocr_vl(self, file_path: str) -> dict[str, Any]:
         endpoint = self.endpoint.rstrip("/")
@@ -358,10 +460,11 @@ def post_multipart(url: str, file_path: str, fields: dict[str, str], *, headers:
 
 
 class ExternalParserAdapter:
-    def __init__(self, endpoint: str | None, model: str | None, api_key: str | None = None):
+    def __init__(self, endpoint: str | None, model: str | None, api_key: str | None = None, provider: str = "generic"):
         self.endpoint = endpoint
         self.model = model or "default"
         self.api_key = api_key
+        self.provider = provider
 
     @property
     def configured(self) -> bool:
@@ -370,7 +473,21 @@ class ExternalParserAdapter:
     def parse(self, file_path: str) -> ParsedDocument:
         if not self.endpoint:
             raise RuntimeError("Document parser endpoint is not configured")
-        payload = post_json(_integration_resource_url(self.endpoint, "parse"), {"model": self.model, "file_path": file_path}, headers=auth_headers("openai_compatible", self.api_key))
+        if self.provider == "mineru":
+            return self._parse_mineru(file_path)
+        if self.provider == "paddleocr_vl":
+            payload = OCRAdapter(self.endpoint, self.model, self.api_key, provider=self.provider).ocr_document(file_path)
+            text = normalize_text(str(payload.get("text") or ""))
+            if not text:
+                raise RuntimeError("PaddleOCR parser endpoint returned no text")
+            path = Path(file_path)
+            return ParsedDocument(
+                file_type=detect_file_type(path),
+                title=extract_title(text),
+                doi=extract_doi(text),
+                chunks=[TextChunk(text=text, page_number=None, parser_name="paddleocr_vl", parser_version=str(self.model or "external"))],
+            )
+        payload = post_json(_integration_resource_url(self.endpoint, "parse"), {"model": self.model, "file_path": file_path}, headers=auth_headers(self.provider, self.api_key))
         chunks: list[TextChunk] = []
         for item in payload.get("chunks", []):
             if not isinstance(item, dict):
@@ -392,6 +509,29 @@ class ExternalParserAdapter:
             title=payload.get("title") or extract_title(full_text),
             doi=payload.get("doi") or extract_doi(full_text),
             chunks=chunks,
+        )
+
+    def _parse_mineru(self, file_path: str) -> ParsedDocument:
+        endpoint = _mineru_resource_url(self.endpoint or "", "file_parse")
+        fields = {
+            "return_md": "true",
+            "return_content_list": "false",
+            "return_layout": "false",
+            "parse_method": "auto",
+        }
+        if self.model and self.model != "default":
+            fields["model"] = self.model
+        payload = post_multipart(endpoint, file_path, fields, headers=auth_headers("openai_compatible", self.api_key), timeout=300)
+        text = _extract_mineru_text(payload)
+        if not text:
+            detail = payload.get("msg") or payload.get("message") or payload.get("error") or "MinerU endpoint returned no markdown/text"
+            raise RuntimeError(str(detail))
+        path = Path(file_path)
+        return ParsedDocument(
+            file_type=str(payload.get("file_type") or detect_file_type(path)),
+            title=payload.get("title") or extract_title(text),
+            doi=payload.get("doi") or extract_doi(text),
+            chunks=[TextChunk(text=text, page_number=None, parser_name="mineru", parser_version=str(self.model or "external"))],
         )
 
 

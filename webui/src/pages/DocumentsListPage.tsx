@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { JsonObject } from '../types';
-import type { PageProps } from '../constants';
+import { asObject, type PageProps } from '../constants';
 import { getJson } from '../api';
 import { Button, Card, DataTable, Input } from '../components';
 import { useTranslation } from '../i18n';
@@ -12,6 +12,7 @@ export function DocumentsListPage({ token, guarded }: DocumentsListPageProps) {
   const { t } = useTranslation();
   const [query, setQuery] = useState('');
   const [fileType, setFileType] = useState('');
+  const [evidenceKind, setEvidenceKind] = useState('');
   const [documents, setDocuments] = useState<JsonObject[]>([]);
   const navigate = useNavigate();
 
@@ -26,6 +27,10 @@ export function DocumentsListPage({ token, guarded }: DocumentsListPageProps) {
   useEffect(() => {
     loadDocuments().catch(() => undefined);
   }, []);
+
+  const visibleDocuments = evidenceKind
+    ? documents.filter((document) => String(asObject(document.scifinder_metadata).evidence_kind || '') === evidenceKind)
+    : documents;
 
   return (
     <div className="page-stack">
@@ -46,12 +51,27 @@ export function DocumentsListPage({ token, guarded }: DocumentsListPageProps) {
               <option value="rdf">RDF</option>
             </select>
           </label>
+          <label className="form-group">
+            {t('证据类型')}
+            <select value={evidenceKind} onChange={(event) => setEvidenceKind(event.target.value)}>
+              <option value="">{t('全部')}</option>
+              <option value="scifinder_rdf">SciFinder RDF</option>
+              <option value="paper_si">{t('论文 SI')}</option>
+              <option value="scifinder_pdf">SciFinder PDF</option>
+              <option value="scifinder_readable">SciFinder Readable</option>
+              <option value="patent">{t('专利反应过程')}</option>
+              <option value="user_note">{t('用户笔记')}</option>
+              <option value="invalid_pdf">{t('无效 PDF')}</option>
+            </select>
+          </label>
         </div>
         <DataTable
-          rows={documents}
+          rows={visibleDocuments}
           columns={[
             { key: 'file_name', label: t('文件') },
             { key: 'file_type', label: t('类型') },
+            { key: 'evidence_kind', label: t('证据类型'), render: (row) => String(asObject(row.scifinder_metadata).evidence_kind || '') },
+            { key: 'evidence_priority', label: t('优先级'), render: (row) => String(asObject(row.scifinder_metadata).evidence_priority ?? '') },
             { key: 'ingest_status', label: t('状态') },
             { key: 'title', label: t('标题') },
             { key: 'parsed_chunk_count', label: t('文本块') },

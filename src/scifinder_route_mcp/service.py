@@ -8,8 +8,10 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,50 @@ from .storage import RouteStorage, is_sqlite_locked_error
 
 RDF_PROVENANCE_WARNING = "RDF/RDfile records are structured SciFinder evidence but may not include complete experimental procedures; verify RDF-derived chemical claims against linked PDF/RTF/HTML readable or visual provenance before final use."
 LOGGER = logging.getLogger(__name__)
+CAS_REACTION_NUMBER_RE = re.compile(r"\b31-\d{3,}-CAS-\d+\b", re.IGNORECASE)
+
+EVIDENCE_KIND_PROFILES: dict[str, dict[str, Any]] = {
+    "scifinder_rdf": {
+        "evidence_priority": 100,
+        "label": "SciFinder RDF structured evidence",
+        "provenance_warning": RDF_PROVENANCE_WARNING,
+    },
+    "paper_si": {
+        "evidence_priority": 90,
+        "label": "Paper supporting information experimental procedure",
+        "provenance_warning": "Paper SI procedures are high-value experimental evidence; verify structures/yields against the cited paper and page evidence.",
+    },
+    "scifinder_readable": {
+        "evidence_priority": 75,
+        "label": "SciFinder readable export evidence",
+        "provenance_warning": "Readable SciFinder exports can provide experimental procedure text but should be verified against RDF or paper SI when structure-sensitive.",
+    },
+    "scifinder_pdf": {
+        "evidence_priority": 70,
+        "label": "SciFinder PDF evidence",
+        "provenance_warning": "SciFinder PDF-only evidence lacks RDF structure records; keep it under review until corroborated.",
+    },
+    "patent": {
+        "evidence_priority": 55,
+        "label": "Patent reaction process evidence",
+        "provenance_warning": "Patent reaction process evidence may describe examples or claims; verify language, example scope, and exact procedure before final use.",
+    },
+    "unsupported_non_source": {
+        "evidence_priority": 0,
+        "label": "Unsupported non-source document",
+        "provenance_warning": "This document is not treated as a primary reaction evidence source.",
+    },
+    "user_note": {
+        "evidence_priority": 0,
+        "label": "User note or derived analysis",
+        "provenance_warning": "User notes are excluded from primary evidence import to avoid circular provenance.",
+    },
+    "invalid_pdf": {
+        "evidence_priority": 0,
+        "label": "Invalid or unreadable PDF",
+        "provenance_warning": "Invalid PDFs are excluded; re-download or repair the source before import.",
+    },
+}
 
 RDF_ROLE_LABELS_ZH = {
     "reactant": "反应物",
@@ -45,6 +91,44 @@ RDF_ROLE_LABELS_EN = {
     "solvent": "Solvent",
     "unknown": "Unknown",
 }
+
+
+def normalize_for_source_classification(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def is_paper_si_text(text: str) -> bool:
+    return bool(
+        "supporting information" in text
+        or "supplementary material" in text
+        or "electronic supplementary material" in text
+        or ("experimental section" in text and "typical procedure" in text)
+    )
+
+
+def is_patent_text(text: str) -> bool:
+    patent_markers = (
+        "patent",
+        "发明专利",
+        "专利申请",
+        "中华人民共和国国家知识产权局",
+        "российская федерация",
+        "описание изобретения",
+        "【特許請求の範囲】",
+        "特許",
+    )
+    if any(marker in text for marker in patent_markers):
+        return True
+    return bool(re.search(r"\b(?:cn|jp|ru|us|wo|ep)\s*\d{4,}[a-z0-9 -]*(?:a|b|c1|a1)\b", text, re.IGNORECASE))
+
+
+def is_scifinder_pdf_text(text: str) -> bool:
+    return bool(
+        re.search(r"31-\d{3}-cas-\d+", text, re.IGNORECASE)
+        or "cas reaction number" in text
+        or ("task history" in text and ("products" in text or "reactants" in text))
+        or ("experimental protocols" in text and ("products" in text or "reactants" in text))
+    )
 
 
 class RouteService:
@@ -69,6 +153,550 @@ class RouteService:
         self._rdkit_install_lock = threading.Lock()
         if self.config.async_jobs:
             self._start_workers()
+
+    def _evidence_profile(self, evidence_kind: str, **extra: Any) -> dict[str, Any]:
+        profile = dict(EVIDENCE_KIND_PROFILES.get(evidence_kind, EVIDENCE_KIND_PROFILES["unsupported_non_source"]))
+        profile["evidence_kind"] = evidence_kind
+        profile["import_action"] = "exclude" if profile["evidence_priority"] <= 0 else "include"
+        profile.update(extra)
+        return profile
+
+    def _classify_document_evidence(self, path: Path) -> dict[str, Any]:
+        suffix = path.suffix.lower()
+        if suffix == ".rdf":
+            return self._evidence_profile("scifinder_rdf", classifier="extension")
+        if suffix in {".rtf", ".html", ".htm", ".mhtml", ".mht", ".md", ".markdown", ".txt"}:
+            return self._evidence_profile("scifinder_readable", classifier="extension")
+        if suffix == ".pdf":
+            return self._classify_pdf_evidence(path)
+        return self._evidence_profile(
+            "unsupported_non_source",
+            classifier="extension",
+            exclude_reason=f"Unsupported evidence extension: {suffix or '<none>'}",
+        )
+
+    def _classify_pdf_evidence(self, path: Path) -> dict[str, Any]:
+        try:
+            import fitz  # type: ignore[import-not-found]
+        except ImportError:
+            return self._evidence_profile("scifinder_pdf", classifier="pdf_no_fitz")
+
+        try:
+            with fitz.open(path) as document:
+                page_count = len(document)
+                metadata = document.metadata or {}
+                if page_count <= 0:
+                    return self._evidence_profile(
+                        "invalid_pdf",
+                        classifier="pdf_metadata",
+                        page_count=page_count,
+                        exclude_reason="PDF has no readable pages",
+                    )
+                sample_pages = []
+                for index in range(min(page_count, 3)):
+                    sample_pages.append(document[index].get_text("text") or "")
+        except Exception as exc:
+            return self._evidence_profile(
+                "invalid_pdf",
+                classifier="pdf_open",
+                exclude_reason=f"PDF could not be opened: {exc}",
+            )
+
+        sample_text = normalize_for_source_classification("\n".join(sample_pages))
+        metadata_text = normalize_for_source_classification(
+            " ".join(str(metadata.get(key) or "") for key in ("title", "author", "creator", "producer"))
+        )
+        combined = f"{metadata_text}\n{sample_text}"
+
+        if "obsidian" in metadata_text:
+            return self._evidence_profile(
+                "user_note",
+                classifier="pdf_metadata",
+                page_count=page_count,
+                exclude_reason="PDF appears to be an Obsidian/user note export",
+            )
+
+        if is_paper_si_text(combined):
+            return self._evidence_profile("paper_si", classifier="pdf_text", page_count=page_count)
+
+        if is_patent_text(combined):
+            return self._evidence_profile("patent", classifier="pdf_text", page_count=page_count)
+
+        if is_scifinder_pdf_text(combined):
+            return self._evidence_profile("scifinder_pdf", classifier="pdf_text", page_count=page_count)
+
+        return self._evidence_profile(
+            "unsupported_non_source",
+            classifier="pdf_text",
+            page_count=page_count,
+            exclude_reason="PDF does not look like SciFinder, paper SI, or patent reaction evidence",
+        )
+
+    def _document_evidence_profile(self, document_id: str) -> dict[str, Any]:
+        document = self.storage.get_document(document_id)
+        metadata = document.scifinder_metadata if document else {}
+        return metadata if isinstance(metadata, dict) else {}
+
+    def _pdf_only_link_confidence(self, document_id: str, fallback: float = 0.8) -> float:
+        kind = self._document_evidence_profile(document_id).get("evidence_kind")
+        if kind == "paper_si":
+            return 0.9
+        if kind == "patent":
+            return 0.65
+        if kind == "scifinder_pdf":
+            return fallback
+        return min(fallback, 0.5)
+
+    def _pdf_only_provenance_warning(self, profile: dict[str, Any]) -> str:
+        warning = str(profile.get("provenance_warning") or "")
+        return warning or "PDF-only evidence needs review before final chemical use."
+
+    def _document_manifest_text_summary(self, path: Path) -> dict[str, Any]:
+        suffix = path.suffix.lower()
+        text = ""
+        summary: dict[str, Any] = {
+            "page_count": None,
+            "text_status": "not_sampled",
+            "cas_reaction_numbers": [],
+            "cas_count": 0,
+        }
+        if suffix == ".pdf":
+            try:
+                import fitz  # type: ignore[import-not-found]
+
+                with fitz.open(path) as document:
+                    summary["page_count"] = len(document)
+                    sample_pages = []
+                    for index in range(min(len(document), 8)):
+                        sample_pages.append(document[index].get_text("text") or "")
+                    text = "\n".join(sample_pages)
+                    summary["text_status"] = "text_sampled" if text.strip() else "no_text_in_sample"
+            except Exception as exc:
+                summary["text_status"] = f"pdf_unreadable: {exc}"
+        else:
+            try:
+                text = path.read_bytes()[: 512 * 1024].decode("utf-8", errors="replace")
+                summary["text_status"] = "text_sampled" if text.strip() else "no_text"
+            except Exception as exc:
+                summary["text_status"] = f"text_unreadable: {exc}"
+
+        cas_numbers = sorted({match.group(0).upper() for match in CAS_REACTION_NUMBER_RE.finditer(text)})
+        summary["cas_reaction_numbers"] = cas_numbers[:50]
+        summary["cas_count"] = len(cas_numbers)
+        return summary
+
+    def _preview_document_path(self, path: Path, *, reparse: bool = False) -> dict[str, Any]:
+        resolved = path.resolve()
+        base_row: dict[str, Any] = {
+            "file_name": resolved.name,
+            "file_path": str(resolved),
+            "extension": resolved.suffix.lower(),
+            "include": False,
+            "import_action": "exclude",
+            "source_path_exists": resolved.exists(),
+            "has_exact_rdf_pair": False,
+            "paired_rdf_name": "",
+            "paired_pdf_name": "",
+        }
+        if not resolved.exists():
+            return {
+                **base_row,
+                "reason": "file_not_found",
+                "exclude_reason": "File does not exist",
+                "text_status": "missing",
+                "cas_count": 0,
+                "cas_reaction_numbers": [],
+            }
+        if not resolved.is_file():
+            return {
+                **base_row,
+                "reason": "not_a_file",
+                "exclude_reason": "Path is not a file",
+                "text_status": "not_a_file",
+                "cas_count": 0,
+                "cas_reaction_numbers": [],
+            }
+
+        stat = resolved.stat()
+        try:
+            self._assert_allowed_path(resolved)
+            file_hash = hash_file(resolved)
+            existing_by_path = self.storage.get_document_by_hash_path(file_hash=file_hash, file_path=str(resolved))
+            existing_by_hash = self.storage.get_document_by_hash(file_hash)
+            existing = existing_by_path or existing_by_hash
+            profile = self._classify_document_evidence(resolved)
+            text_summary = self._document_manifest_text_summary(resolved)
+        except Exception as exc:
+            return {
+                **base_row,
+                "size_bytes": stat.st_size,
+                "reason": str(exc),
+                "exclude_reason": str(exc),
+                "text_status": "classification_failed",
+                "cas_count": 0,
+                "cas_reaction_numbers": [],
+            }
+
+        include = profile.get("import_action") == "include"
+        if existing and not reparse:
+            reason = "already_registered"
+        elif include:
+            reason = str(profile.get("label") or profile.get("evidence_kind") or "included")
+        else:
+            reason = str(profile.get("exclude_reason") or profile.get("label") or "excluded")
+        return {
+            **base_row,
+            "size_bytes": stat.st_size,
+            "sha256": file_hash,
+            "include": include,
+            "import_action": profile.get("import_action"),
+            "evidence_kind": profile.get("evidence_kind"),
+            "evidence_priority": profile.get("evidence_priority", 0),
+            "label": profile.get("label"),
+            "provenance_warning": profile.get("provenance_warning"),
+            "exclude_reason": profile.get("exclude_reason", ""),
+            "classifier": profile.get("classifier"),
+            "page_count": profile.get("page_count", text_summary.get("page_count")),
+            "cas_count": text_summary.get("cas_count", 0),
+            "cas_reaction_numbers": text_summary.get("cas_reaction_numbers", []),
+            "text_status": text_summary.get("text_status"),
+            "already_registered": bool(existing),
+            "existing_document_id": existing.id if existing else "",
+            "duplicate_scope": "same_path" if existing_by_path else "same_hash" if existing_by_hash else "",
+            "reason": reason,
+        }
+
+    def _add_exact_pair_signals(self, rows: list[dict[str, Any]]) -> None:
+        selected_paths = {
+            str(Path(str(row.get("file_path") or "")).resolve()).lower()
+            for row in rows
+            if row.get("source_path_exists") and row.get("file_path")
+        }
+        for row in rows:
+            if not row.get("source_path_exists") or not row.get("file_path"):
+                continue
+            path = Path(str(row["file_path"])).resolve()
+            suffix = path.suffix.lower()
+            if suffix == ".pdf":
+                pair = path.with_suffix(".rdf")
+                has_pair = str(pair.resolve()).lower() in selected_paths or pair.exists()
+                row["has_exact_rdf_pair"] = has_pair
+                row["paired_rdf_name"] = pair.name if has_pair else ""
+            elif suffix == ".rdf":
+                pair = path.with_suffix(".pdf")
+                has_pair = str(pair.resolve()).lower() in selected_paths or pair.exists()
+                row["has_exact_pdf_pair"] = has_pair
+                row["paired_pdf_name"] = pair.name if has_pair else ""
+
+    def preview_document_paths(self, paths: list[str], *, reparse: bool = False, limit: int = 500) -> dict[str, Any]:
+        rows = [self._preview_document_path(Path(raw), reparse=reparse) for raw in paths[:limit]]
+        self._add_exact_pair_signals(rows)
+        included = sum(1 for row in rows if row.get("include"))
+        excluded = len(rows) - included
+        return {
+            "items": rows,
+            "total": len(rows),
+            "included_count": included,
+            "excluded_count": excluded,
+            "truncated": len(paths) > limit,
+        }
+
+    def preview_inbox(self, *, reparse: bool = False, limit: int = 500) -> dict[str, Any]:
+        supported = set(self.config.scan_extensions)
+        paths = [
+            str(path)
+            for path in sorted(self.config.inbox_dir.rglob("*"))
+            if path.is_file() and path.suffix.lower() in supported
+        ]
+        return self.preview_document_paths(paths, reparse=reparse, limit=limit)
+
+    def preview_upload_document_bytes(self, content: bytes, filename: str, *, reparse: bool = False) -> dict[str, Any]:
+        self._validate_upload_content(content, filename)
+        safe_name = safe_filename(filename)
+        preflight_dir = self.config.upload_dir / ".preflight"
+        preflight_dir.mkdir(parents=True, exist_ok=True)
+        suffix = Path(safe_name).suffix.lower()
+        with tempfile.NamedTemporaryFile(prefix="preview-", suffix=suffix, dir=preflight_dir, delete=False) as handle:
+            handle.write(content)
+            temp_path = Path(handle.name)
+        try:
+            row = self._preview_document_path(temp_path, reparse=reparse)
+            row.update(
+                {
+                    "file_name": safe_name,
+                    "original_file_name": filename,
+                    "file_path": safe_name,
+                    "preview_only": True,
+                }
+            )
+            return {"items": [row], "total": 1, "included_count": 1 if row.get("include") else 0, "excluded_count": 0 if row.get("include") else 1}
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("Failed to remove upload preview temp file: %s", temp_path)
+
+    def _json_dict(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _reaction_link_has_conflicts(self, link: dict[str, Any]) -> bool:
+        return bool(self._json_dict(link.get("conflict_flags_json")))
+
+    def _document_link_summary(self, document_id: str | None) -> dict[str, Any]:
+        if not document_id:
+            return {}
+        document = self.storage.get_document(document_id)
+        if not document:
+            return {"id": document_id}
+        data = document.to_dict()
+        metadata = data.get("scifinder_metadata") if isinstance(data.get("scifinder_metadata"), dict) else {}
+        return {
+            "id": data.get("id"),
+            "file_name": Path(str(data.get("file_path") or "")).name,
+            "file_path": data.get("file_path"),
+            "file_type": data.get("file_type"),
+            "title": data.get("title"),
+            "ingest_status": data.get("ingest_status"),
+            "evidence_kind": metadata.get("evidence_kind"),
+            "evidence_priority": metadata.get("evidence_priority"),
+            "evidence_label": metadata.get("label"),
+            "provenance_warning": metadata.get("provenance_warning"),
+        }
+
+    def _enrich_reaction_link(self, link: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(link)
+        pdf_document = self._document_link_summary(link.get("pdf_document_id"))
+        rdf_document = self._document_link_summary(link.get("rdf_document_id"))
+        evidence = self.storage.list_pdf_reaction_evidence(reaction_source_link_id=str(link.get("id") or ""), limit=1000)
+        enriched["pdf_document"] = pdf_document
+        enriched["rdf_document"] = rdf_document
+        enriched["pdf_file_name"] = pdf_document.get("file_name", "")
+        enriched["rdf_file_name"] = rdf_document.get("file_name", "")
+        enriched["evidence_kind"] = pdf_document.get("evidence_kind") or rdf_document.get("evidence_kind")
+        enriched["evidence_priority"] = pdf_document.get("evidence_priority") or rdf_document.get("evidence_priority")
+        enriched["evidence_label"] = pdf_document.get("evidence_label") or rdf_document.get("evidence_label")
+        enriched["provenance_warning"] = pdf_document.get("provenance_warning") or rdf_document.get("provenance_warning")
+        enriched["pdf_evidence_count"] = len(evidence)
+        enriched["pdf_evidence_pages"] = sorted({item.get("page_number") for item in evidence if item.get("page_number") is not None})
+        enriched["has_conflicts"] = self._reaction_link_has_conflicts(link)
+        enriched["conflict_flags"] = self._json_dict(link.get("conflict_flags_json"))
+        return enriched
+
+    def list_reaction_links(
+        self,
+        *,
+        document_id: str = "",
+        source_mode: str = "",
+        needs_review: bool | None = None,
+        evidence_kind: str = "",
+        has_conflicts: bool | None = None,
+        cas_reaction_number: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        raw_links = self.storage.list_reaction_source_links(
+            document_id=document_id,
+            source_mode=source_mode,
+            needs_review=needs_review,
+            cas_reaction_number=cas_reaction_number,
+            limit=10000,
+            offset=0,
+        )
+        enriched = [self._enrich_reaction_link(link) for link in raw_links]
+        if evidence_kind:
+            enriched = [link for link in enriched if str(link.get("evidence_kind") or "") == evidence_kind]
+        if has_conflicts is not None:
+            enriched = [link for link in enriched if bool(link.get("has_conflicts")) == has_conflicts]
+        total = len(enriched)
+        return {"items": enriched[offset : offset + limit], "total": total, "limit": limit, "offset": offset}
+
+    def _trim_ai_evidence_text(self, value: Any, limit: int = 1800) -> str:
+        text = str(value or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + "..."
+
+    def _compact_pdf_evidence_for_ai(self, evidence: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": evidence.get("id"),
+            "page_number": evidence.get("page_number"),
+            "is_primary": bool(evidence.get("is_primary")),
+            "cas_reaction_number": evidence.get("cas_reaction_number"),
+            "products_text": self._trim_ai_evidence_text(evidence.get("products_text"), 900),
+            "reactants_text": self._trim_ai_evidence_text(evidence.get("reactants_text"), 900),
+            "conditions_text": self._trim_ai_evidence_text(evidence.get("conditions_text"), 900),
+            "procedure_text": self._trim_ai_evidence_text(evidence.get("procedure_text"), 1800),
+            "yield_text": evidence.get("yield_text"),
+            "reference_text": self._trim_ai_evidence_text(evidence.get("reference_text"), 700),
+            "page_text_excerpt": self._trim_ai_evidence_text(evidence.get("page_text"), 1800),
+            "extraction_method": evidence.get("extraction_method"),
+            "match_confidence": evidence.get("match_confidence"),
+        }
+
+    def _compact_rdf_reaction_for_ai(self, rdf_reaction: dict[str, Any] | None) -> dict[str, Any]:
+        if not rdf_reaction:
+            return {}
+        keys = [
+            "id",
+            "cas_reaction_number",
+            "record_index",
+            "scheme_id",
+            "step_id",
+            "yield_text",
+            "reference_text",
+            "doi",
+            "raw_fields",
+        ]
+        compact = {key: rdf_reaction.get(key) for key in keys if key in rdf_reaction}
+        if isinstance(compact.get("raw_fields"), dict):
+            raw_fields = compact["raw_fields"]
+            compact["raw_fields"] = {
+                key: self._trim_ai_evidence_text(value, 700)
+                for key, value in raw_fields.items()
+                if any(marker in key for marker in ("CAS_Reaction_Number", "YIELD", "TXT", "REF", "SOL", "RGT", "CAT", "RCT", "PRO"))
+            }
+        return compact
+
+    def _reaction_link_ai_review_payload(self, link: dict[str, Any]) -> dict[str, Any]:
+        pdf_evidence = self.storage.list_pdf_reaction_evidence(reaction_source_link_id=str(link.get("id") or ""), limit=50)
+        if not pdf_evidence and link.get("pdf_document_id") and link.get("cas_reaction_number"):
+            pdf_evidence = self.storage.list_pdf_reaction_evidence(
+                document_id=str(link["pdf_document_id"]),
+                cas_reaction_number=str(link["cas_reaction_number"]),
+                limit=50,
+            )
+        rdf_reaction = self.storage.get_rdf_reaction(str(link.get("rdf_reaction_id") or "")) if link.get("rdf_reaction_id") else None
+        enriched = self._enrich_reaction_link(link)
+        return {
+            "link": {
+                "id": link.get("id"),
+                "cas_reaction_number": link.get("cas_reaction_number"),
+                "source_mode": link.get("source_mode"),
+                "primary_pdf_page": link.get("primary_pdf_page"),
+                "link_confidence": link.get("link_confidence"),
+                "link_method": link.get("link_method"),
+                "needs_review": bool(link.get("needs_review")),
+                "existing_conflict_flags": self._json_dict(link.get("conflict_flags_json")),
+            },
+            "evidence_policy": {
+                "rdf_priority": "RDF is preferred for structured CAS, roles, yield, molecules, and references.",
+                "paper_si_priority": "Paper SI procedures should outrank SciFinder PDF text for experimental procedure details.",
+                "patent_scope": "Patent evidence must be labeled as patent reaction process evidence.",
+                "ai_boundary": "AI review is advisory and cannot confirm or overwrite records automatically.",
+            },
+            "pdf_document": enriched.get("pdf_document", {}),
+            "rdf_document": enriched.get("rdf_document", {}),
+            "rdf_reaction": self._compact_rdf_reaction_for_ai(rdf_reaction),
+            "pdf_evidence": [self._compact_pdf_evidence_for_ai(item) for item in pdf_evidence],
+        }
+
+    def analyze_reaction_link_with_ai(self, link_id: str) -> dict[str, Any]:
+        if not getattr(self.config, "ai_evidence_review_enabled", False):
+            raise RuntimeError("AI evidence review is disabled")
+        link = self.storage.get_reaction_source_link(link_id)
+        if not link:
+            raise KeyError(f"Reaction source link not found: {link_id}")
+        endpoint, model, provider, api_key, route_kind = self._ai_evidence_review_endpoint_settings()
+        schema_version = getattr(self.config, "ai_evidence_review_schema_version", "reaction_evidence_review.v1")
+        adapter = LLMStructuringAdapter(
+            endpoint,
+            model,
+            enabled=bool(endpoint),
+            schema_version=schema_version,
+            prompt_profile=getattr(self.config, "ai_evidence_review_prompt_profile", "strict-evidence-review-json"),
+            provider=provider,
+            api_key=api_key,
+        )
+        if not adapter.configured:
+            raise RuntimeError("AI evidence review provider is not configured")
+
+        payload = self._reaction_link_ai_review_payload(link)
+        review = adapter.review_reaction_evidence(payload)
+        if not isinstance(review, dict):
+            raise RuntimeError("AI endpoint returned no review JSON")
+
+        recommendation = str(review.get("recommendation") or "needs_review").strip().lower()
+        if recommendation not in {"confirm", "needs_review", "reject"}:
+            recommendation = "needs_review"
+        conflict_flags = review.get("conflict_flags") if isinstance(review.get("conflict_flags"), dict) else {}
+        ai_review = {
+            "schema_version": schema_version,
+            "provider": provider,
+            "model": model,
+            "route_kind": route_kind,
+            "analyzed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "recommendation": recommendation,
+            "confidence": review.get("confidence"),
+            "extracted_fields": review.get("extracted_fields") if isinstance(review.get("extracted_fields"), dict) else {},
+            "agreement": review.get("agreement") if isinstance(review.get("agreement"), dict) else {},
+            "conflict_flags": conflict_flags,
+            "rationale": self._trim_ai_evidence_text(review.get("rationale"), 1200),
+            "cited_evidence": review.get("cited_evidence") if isinstance(review.get("cited_evidence"), list) else [],
+        }
+        flags = self._json_dict(link.get("conflict_flags_json"))
+        flags["ai_review"] = ai_review
+        if conflict_flags:
+            flags["ai_conflict_flags"] = conflict_flags
+
+        update: dict[str, Any] = {"conflict_flags_json": flags}
+        if recommendation != "confirm" or conflict_flags:
+            update["needs_review"] = 1
+        updated = self.storage.update_reaction_source_link(link_id, update)
+        return {"ai_review": ai_review, "link": self._enrich_reaction_link(updated or link), "payload_summary": {"pdf_evidence_count": len(payload.get("pdf_evidence", [])), "has_rdf": bool(payload.get("rdf_reaction"))}}
+
+    def bulk_update_reaction_links(self, link_ids: list[str], action: str) -> dict[str, Any]:
+        normalized = action.strip().lower()
+        results: list[dict[str, Any]] = []
+        for link_id in [str(item) for item in link_ids if str(item)]:
+            try:
+                if normalized == "confirm":
+                    updated = self.storage.update_reaction_source_link(link_id, {"needs_review": 0})
+                    results.append({"id": link_id, "status": "confirmed" if updated else "missing"})
+                elif normalized in {"unlink", "reject"}:
+                    results.append({"id": link_id, "status": "unlinked", "result": self.unlink_reaction_source_link(link_id)})
+                else:
+                    raise ValueError(f"Unsupported bulk reaction-link action: {action}")
+            except Exception as exc:
+                results.append({"id": link_id, "status": "error", "error": str(exc)})
+        return {
+            "action": normalized,
+            "items": results,
+            "count": len(results),
+            "error_count": sum(1 for item in results if item.get("status") == "error"),
+        }
+
+    def backfill_reaction_link_review(self, *, dry_run: bool = True, limit: int = 10000) -> dict[str, Any]:
+        links = self.storage.list_reaction_source_links(limit=limit, offset=0)
+        candidates: list[dict[str, Any]] = []
+        for link in links:
+            if int(link.get("needs_review") or 0):
+                continue
+            reasons = []
+            if link.get("source_mode") in {"pdf_only", "pdf_only_low_confidence"}:
+                reasons.append("pdf_only_evidence_requires_review")
+            if link.get("source_mode") == "rdf_pdf_linked" and self._reaction_link_has_conflicts(link):
+                reasons.append("linked_evidence_has_conflicts")
+            if reasons:
+                candidates.append({"link": self._enrich_reaction_link(link), "reasons": reasons, "target_update": {"needs_review": 1}})
+
+        if not dry_run:
+            for item in candidates:
+                self.storage.update_reaction_source_link(str(item["link"]["id"]), {"needs_review": 1})
+
+        return {
+            "dry_run": dry_run,
+            "candidate_count": len(candidates),
+            "updated_count": 0 if dry_run else len(candidates),
+            "items": candidates,
+        }
 
     def _migrate_legacy_providers(self) -> None:
         from .config import read_config_yaml, write_config_yaml, AiProvider
@@ -212,6 +840,12 @@ class RouteService:
 
     def validate_config(self) -> dict[str, Any]:
         warnings = self.config.validate()
+        if getattr(self.config, "ai_evidence_review_enabled", False):
+            endpoint, _model, _provider, _api_key, route_kind = self._ai_evidence_review_endpoint_settings()
+            if not endpoint:
+                warnings.append("integrations.ai_evidence_review_enabled=true requires integrations.ai_evidence_review_provider_id or integrations.extraction_provider_id")
+            elif route_kind == "extraction" and not getattr(self.config, "ai_evidence_review_provider_id", None):
+                warnings.append("integrations.ai_evidence_review_provider_id is not set; AI evidence review will use the extraction provider fallback")
         return {
             "valid": not warnings,
             "warnings": warnings,
@@ -234,6 +868,10 @@ class RouteService:
         if not path.exists():
             raise FileNotFoundError(f"Document does not exist: {path}")
         self._assert_allowed_path(path)
+        evidence_profile = self._classify_document_evidence(path)
+        if evidence_profile.get("import_action") == "exclude":
+            reason = evidence_profile.get("exclude_reason") or evidence_profile.get("label") or evidence_profile.get("evidence_kind")
+            raise ValueError(f"Document excluded by evidence classifier: {reason}")
         file_hash = hash_file(path)
         existing = self.storage.get_document_by_hash_path(file_hash=file_hash, file_path=str(path))
         if existing and not reparse:
@@ -246,6 +884,7 @@ class RouteService:
             title=parsed.title if parsed else None,
             doi=parsed.doi if parsed else None,
         )
+        self.storage.update_document_scifinder_metadata(document.id, evidence_profile)
         self._start_or_run_job(document.id, job.id, parsed=parsed, reparse=reparse)
         completed_job = self.storage.get_job(job.id)
         return {"document": self.storage.get_document(document.id).to_dict(), "job": completed_job.to_dict() if completed_job else job.to_dict()}
@@ -405,11 +1044,74 @@ class RouteService:
             batch_links = self.storage.list_batches_for_document(step.source_document_id)
             data["batch_links"] = batch_links
             metadata = step.metadata or {}
+            
+            # Retrieve reaction link information
+            if metadata.get("structured_source") == "rdf" and metadata.get("rdf_reaction_id"):
+                link = self.storage.get_reaction_source_link_by_rdf(metadata.get("rdf_reaction_id"))
+                if link:
+                    data["reaction_source_link_id"] = link["id"]
+                    data["source_mode"] = link["source_mode"]
+                    data["needs_review"] = link["needs_review"]
+                    data["link_confidence"] = link["link_confidence"]
+
             if metadata.get("structured_source") == "rdf" and not batch_links:
                 data["provenance_warning"] = "RDF structured reaction has no linked readable/visual export batch; verify against PDF/RTF/HTML before final chemical judgment."
             elif metadata.get("has_visual_evidence"):
                 data["provenance_warning"] = "This result has linked visual chemical evidence; inspect provenance images when making structure-sensitive judgments."
             results.append(data)
+
+        # Append PDF-only items at the end up to the total limit
+        if len(results) < limit:
+            pdf_links_data = self.storage.search_pdf_only_reaction_links(document_id=document_id, limit=10000)
+            for link, evidences in pdf_links_data:
+                if not evidences:
+                    continue
+                evidence_profile = self._document_evidence_profile(str(link.get("pdf_document_id") or ""))
+                evidence_kind = str(evidence_profile.get("evidence_kind") or "pdf_only")
+                # Filter by min_confidence
+                if min_confidence and link.get("link_confidence", 0.0) < min_confidence:
+                    continue
+                primary_evidence = evidences[0]
+                # Filter by query/reagent/solvent against evidence text
+                searchable_text = " ".join(filter(None, [
+                    primary_evidence.get("page_text", ""),
+                    primary_evidence.get("reactants_text", ""),
+                    primary_evidence.get("products_text", ""),
+                    primary_evidence.get("conditions_text", ""),
+                    primary_evidence.get("procedure_text", ""),
+                    link.get("cas_reaction_number", ""),
+                ])).lower()
+                if query and query.lower() not in searchable_text:
+                    continue
+                if reagent and reagent.lower() not in searchable_text:
+                    continue
+                if solvent and solvent.lower() not in searchable_text:
+                    continue
+                pseudo_step = {
+                    "id": f"pdf_pseudo_{link['id']}",
+                    "record_type": "pdf_only",
+                    "source_mode": link["source_mode"],
+                    "reaction_source_link_id": link["id"],
+                    "pdf_evidence_ids": [e["id"] for e in evidences],
+                    "source_document_id": link["pdf_document_id"],
+                    "primary_pdf_page": link["primary_pdf_page"],
+                    "evidence_kind": evidence_kind,
+                    "evidence_priority": evidence_profile.get("evidence_priority"),
+                    "provenance_warning": self._pdf_only_provenance_warning(evidence_profile),
+                    "verification_status": "needs_review" if link.get("needs_review") else "pdf_only_unverified",
+                    "reaction_name": "Patent Reaction Process" if evidence_kind == "patent" else "PDF Evidence (Unstructured)",
+                    "reagent_text": primary_evidence.get("reactants_text"),
+                    "product_text": primary_evidence.get("products_text"),
+                    "solvent_text": primary_evidence.get("conditions_text"),
+                    "original_text": primary_evidence.get("page_text"),
+                    "confidence": link.get("link_confidence", 0.0),
+                    "step_index": 0,
+                    "metadata": {"evidence_profile": evidence_profile}
+                }
+                results.append(pseudo_step)
+                if len(results) >= limit:
+                    break
+
         return results
 
     def get_reaction_step(self, reaction_step_id: str) -> dict[str, Any]:
@@ -431,6 +1133,64 @@ class RouteService:
         self._start_or_run_job(document.id, job.id, reparse=True)
         completed_job = self.storage.get_job(job.id)
         return {"document": self.storage.get_document(document.id).to_dict(), "job": completed_job.to_dict() if completed_job else job.to_dict()}
+
+    def run_manual_structure_recognition(self, document_id: str) -> dict[str, Any]:
+        if not getattr(self.config, 'structure_recognition_manual_enabled', False):
+            raise ValueError("Manual structure recognition is disabled in config.")
+            
+        document = self.storage.get_document(document_id)
+        if not document:
+            raise KeyError(f"Document not found: {document_id}")
+        job = self.storage.create_job(document.id)
+        
+        def _task():
+            try:
+                self.storage.update_job(job.id, status="running", stage="vision_structure_extraction")
+                visual_metadata = self._extract_visual_evidence(Path(document.file_path), document_id)
+                struct_endpoint, _, _, _ = self._integration_endpoint_settings("structure_recognition")
+                if not struct_endpoint:
+                    self.storage.update_job(job.id, status="failed", error="structure_recognition integration not configured")
+                    return
+                if not visual_metadata or not visual_metadata.get("rendered_paths"):
+                    self.storage.update_job(job.id, status="failed", error="No rendered images found for document")
+                    return
+                vision_smiles = []
+                for img_path in visual_metadata["rendered_paths"]:
+                    try:
+                        structs = self.recognize_structure_image(img_path)
+                        if structs.get("status") == "success":
+                            for c in structs.get("compounds", []):
+                                if c.get("smiles"):
+                                    vision_smiles.append(c["smiles"])
+                    except Exception as e:
+                        print(f"Error in recognize_structure_image: {e}")
+                if vision_smiles:
+                    vision_text = "Extracted molecular structures from document images (manual):\n" + "\n".join(vision_smiles)
+                    import dataclasses
+                    from .parsers import TextChunk
+                    new_chunk = TextChunk(text=vision_text, page_number=None, parser_name="vision_llm")
+                    
+                    existing = self.storage.list_parsed_chunks(document_id, limit=10000).get("chunks", [])
+                    class DummyChunk:
+                        def __init__(self, d):
+                            self.page_number = d.get("page_number")
+                            self.text = d.get("text") or ""
+                            self.parser_name = d.get("parser_name") or ""
+                            self.parser_version = d.get("parser_version") or "unknown"
+                    merged_chunks = [DummyChunk(c) for c in existing] + [new_chunk]
+                    self.storage.replace_parsed_chunks(document_id, merged_chunks)
+                self.storage.update_job(job.id, status="completed", stage="done")
+            except Exception as e:
+                self.storage.update_job(job.id, status="failed", error=str(e))
+                
+        if getattr(self.config, "async_jobs", True):
+            import threading
+            threading.Thread(target=_task, daemon=True).start()
+        else:
+            _task()
+            
+        completed_job = self.storage.get_job(job.id)
+        return completed_job.to_dict() if completed_job else {}
 
     def record_doi_verification(self, reaction_step_id: str, doi: str, verified_fields: dict[str, Any], paper_title: str | None = None, original_paper_excerpt: str | None = None, verification_confidence: float = 0.0, verifier_agent: str | None = None) -> dict[str, Any]:
         if not self.storage.get_reaction_step(reaction_step_id):
@@ -544,13 +1304,29 @@ class RouteService:
             ok = [item for item in results if item.get("status") == "ok"]
             detail = json.dumps(results, ensure_ascii=False)
             return self.storage.record_integration_status("zotero_mcp", configured=True, status="ok" if ok else "error", detail=detail[:1000])
-        endpoint, model, provider, api_key = self._integration_endpoint_settings(kind, overrides)
-        result = test_http_endpoint(endpoint, model=model, provider=provider, api_key=api_key, kind=kind)
+        test_kind = kind
+        if kind == "ai_evidence_review":
+            enabled = self._override_bool(
+                overrides,
+                "integrations",
+                "ai_evidence_review_enabled",
+                getattr(self.config, "ai_evidence_review_enabled", False),
+            )
+            if not enabled:
+                return self.storage.record_integration_status(kind, configured=False, status="disabled", detail="AI evidence review is disabled")
+            endpoint, model, provider, api_key, route_kind = self._ai_evidence_review_endpoint_settings(overrides)
+            test_kind = route_kind
+        else:
+            endpoint, model, provider, api_key = self._integration_endpoint_settings(kind, overrides)
+        result = test_http_endpoint(endpoint, model=model, provider=provider, api_key=api_key, kind=test_kind)
+        detail = result.detail
+        if kind == "ai_evidence_review" and test_kind == "extraction" and result.configured:
+            detail = f"{detail} (using extraction provider fallback)"
         if result.status != "ok":
             LOGGER.warning("Integration endpoint test failed kind=%s provider=%s configured=%s detail=%s", kind, provider, result.configured, result.detail)
         else:
             LOGGER.info("Integration endpoint test succeeded kind=%s provider=%s", kind, provider)
-        return self.storage.record_integration_status(kind, configured=result.configured, status=result.status, detail=result.detail)
+        return self.storage.record_integration_status(kind, configured=result.configured, status=result.status, detail=detail)
 
     def list_integration_models(self, kind: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         endpoint, model, provider_format, api_key = self._integration_endpoint_settings(kind, overrides)
@@ -641,27 +1417,67 @@ class RouteService:
         return self.storage.get_ai_provider(provider_id)
 
     def _integration_endpoint_settings(self, kind: str, overrides: dict[str, Any] | None = None) -> tuple[str | None, str | None, str, str | None]:
+        settings = self._integration_provider_settings(kind, overrides)
+        if settings:
+            first = settings[0]
+            return first["endpoint"], first["model"], first["provider_format"], first["api_key"]
+        model_key = {
+            "extraction": "extraction_model",
+            "embedding": "embedding_model",
+            "ocr": "ocr_model",
+            "document_parser": "document_parser_model",
+            "structure_recognition": "structure_recognition_model",
+            "reranker": "reranker_model",
+            "ai_evidence_review": "ai_evidence_review_model",
+        }.get(kind)
+        model = self._override_value(overrides, "integrations", model_key, getattr(self.config, model_key, None)) if model_key else None
+        return None, model, "openai_compatible", None
+
+    def _ai_evidence_review_endpoint_settings(self, overrides: dict[str, Any] | None = None) -> tuple[str | None, str | None, str, str | None, str]:
+        endpoint, model, provider, api_key = self._integration_endpoint_settings("ai_evidence_review", overrides)
+        if endpoint:
+            return endpoint, model, provider, api_key, "ai_evidence_review"
+        endpoint, model, provider, api_key = self._integration_endpoint_settings("extraction", overrides)
+        return endpoint, model, provider, api_key, "extraction"
+
+    def _integration_provider_settings(self, kind: str, overrides: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         feature_map = {
-            "extraction": ("extraction_provider_id", "extraction_model"),
-            "embedding": ("embedding_provider_id", "embedding_model"),
-            "ocr": ("ocr_provider_id", "ocr_model"),
-            "document_parser": ("document_parser_provider_id", "document_parser_model"),
-            "structure_recognition": ("structure_recognition_provider_id", "structure_recognition_model"),
-            "reranker": ("reranker_provider_id", "reranker_model")
+            "extraction": ("extraction_provider_id", None, "extraction_model"),
+            "embedding": ("embedding_provider_id", None, "embedding_model"),
+            "ocr": ("ocr_provider_id", "ocr_provider_ids", "ocr_model"),
+            "document_parser": ("document_parser_provider_id", "document_parser_provider_ids", "document_parser_model"),
+            "structure_recognition": ("structure_recognition_provider_id", None, "structure_recognition_model"),
+            "reranker": ("reranker_provider_id", None, "reranker_model"),
+            "ai_evidence_review": ("ai_evidence_review_provider_id", None, "ai_evidence_review_model"),
         }
         
         if kind not in feature_map:
-            return None, None, "openai_compatible", None
+            return []
             
-        provider_key, model_key = feature_map[kind]
+        provider_key, provider_ids_key, model_key = feature_map[kind]
         provider_id = self._override_value(overrides, "integrations", provider_key, getattr(self.config, provider_key, None))
-        model = self._override_value(overrides, "integrations", model_key, getattr(self.config, model_key, None))
-        
-        provider = self._resolve_provider(provider_id, overrides)
-        if not provider:
-            return None, model, "openai_compatible", None
-            
-        return provider.endpoint, model, provider.format, provider.api_key
+        explicit_model = self._override_value(overrides, "integrations", model_key, getattr(self.config, model_key, None))
+        provider_ids = self._override_id_list(overrides, "integrations", provider_ids_key, getattr(self.config, provider_ids_key, ())) if provider_ids_key else ()
+        ordered_ids = list(provider_ids)
+        if provider_id and provider_id not in ordered_ids:
+            ordered_ids.insert(0, provider_id)
+
+        settings: list[dict[str, Any]] = []
+        for item_provider_id in ordered_ids:
+            provider = self._resolve_provider(item_provider_id, overrides)
+            if not provider:
+                continue
+            model = explicit_model or (provider.enabled_models[0] if getattr(provider, "enabled_models", ()) else None)
+            settings.append(
+                {
+                    "provider_id": item_provider_id,
+                    "endpoint": provider.endpoint,
+                    "model": model,
+                    "provider_format": provider.format,
+                    "api_key": provider.api_key,
+                }
+            )
+        return settings
 
     @staticmethod
     def _override_value(overrides: dict[str, Any] | None, section: str, key: str, default: str | None) -> str | None:
@@ -673,6 +1489,36 @@ class RouteService:
             return default
         text = str(value).strip()
         return text or default
+
+    @staticmethod
+    def _override_bool(overrides: dict[str, Any] | None, section: str, key: str, default: bool) -> bool:
+        section_values = overrides.get(section, {}) if isinstance(overrides, dict) else {}
+        if not isinstance(section_values, dict) or key not in section_values:
+            return default
+        value = section_values.get(key)
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _override_id_list(overrides: dict[str, Any] | None, section: str, key: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+        if not key:
+            return default
+        section_values = overrides.get(section, {}) if isinstance(overrides, dict) else {}
+        if not isinstance(section_values, dict) or key not in section_values:
+            return default
+        value = section_values.get(key)
+        if value is None:
+            return default
+        if isinstance(value, str):
+            items = value.split(",")
+        elif isinstance(value, (list, tuple)):
+            items = value
+        else:
+            return default
+        return tuple(dict.fromkeys(str(item).strip() for item in items if str(item).strip()))
 
     def search_compounds(self, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
         return [compound.to_dict() for compound in self.storage.search_compounds(query=query, limit=limit)]
@@ -1296,12 +2142,363 @@ class RouteService:
         if "OK" not in response and self.config.upload_av_fail_closed:
             raise ValueError(f"Unexpected ClamAV response for {filename}: {response.strip()}")
 
+    def _create_pdf_only_candidates(self, document_id: str, evidence_rows: list[dict[str, Any]]) -> None:
+        from .parsers import _select_primary_pdf_page
+        
+        cas_groups: dict[str, list[dict[str, Any]]] = {}
+        link_confidence = self._pdf_only_link_confidence(document_id)
+        for row in evidence_rows:
+            cas = row.get("cas_reaction_number")
+            if cas:
+                cas_groups.setdefault(cas, []).append(row)
+            else:
+                if row.get("products_text") and row.get("reactants_text") and (row.get("procedure_text") or row.get("conditions_text")):
+                    if getattr(self.config, 'pdf_only_low_confidence_enabled', True):
+                        link = self.storage.create_reaction_source_link({
+                            "source_mode": "pdf_only_low_confidence",
+                            "pdf_document_id": document_id,
+                            "primary_pdf_page": row.get("page_number"),
+                            "pdf_pages_json": [row.get("page_number")],
+                            "link_confidence": min(row.get("match_confidence", 0.3), link_confidence),
+                            "link_method": "pdf_block_candidate",
+                            "needs_review": 1
+                        })
+                        row["reaction_source_link_id"] = link["id"]
+                        row["is_primary"] = 1
+
+        if getattr(self.config, 'pdf_only_candidates_enabled', True):
+            for cas, rows in cas_groups.items():
+                primary_page = _select_primary_pdf_page(rows)
+                link = self.storage.create_reaction_source_link({
+                    "cas_reaction_number": cas,
+                    "source_mode": "pdf_only",
+                    "pdf_document_id": document_id,
+                    "primary_pdf_page": primary_page,
+                    "pdf_pages_json": [r["page_number"] for r in rows],
+                    "link_confidence": link_confidence,
+                    "link_method": "pdf_cas_only",
+                    "needs_review": 1
+                })
+                for row in rows:
+                    row["reaction_source_link_id"] = link["id"]
+                    if row.get("page_number") == primary_page:
+                        row["is_primary"] = 1
+
+    def _reaction_link_batch_ids(self, document_id: str | None) -> set[str]:
+        if not document_id:
+            return set()
+        return {str(batch["id"]) for batch in self.storage.list_batches_for_document(document_id)}
+
+    def _reaction_link_document_similarity(self, rdf_doc_id: str | None, pdf_doc_id: str | None) -> float:
+        if not rdf_doc_id or not pdf_doc_id:
+            return 0.0
+        rdf_doc = self.storage.get_document(rdf_doc_id)
+        pdf_doc = self.storage.get_document(pdf_doc_id)
+        if not rdf_doc or not pdf_doc:
+            return 0.0
+        rdf_text = f"{Path(rdf_doc.file_path).stem} {rdf_doc.title or ''}".strip().lower()
+        pdf_text = f"{Path(pdf_doc.file_path).stem} {pdf_doc.title or ''}".strip().lower()
+        return SequenceMatcher(None, rdf_text, pdf_text).ratio() if rdf_text and pdf_text else 0.0
+
+    def _score_rdf_pdf_link_candidate(self, cas: str, rdf_link: dict[str, Any], pdf_link: dict[str, Any]) -> dict[str, Any]:
+        rdf_doc_id = rdf_link.get("rdf_document_id")
+        pdf_doc_id = pdf_link.get("pdf_document_id")
+        rdf_batches = self._reaction_link_batch_ids(str(rdf_doc_id) if rdf_doc_id else None)
+        pdf_batches = self._reaction_link_batch_ids(str(pdf_doc_id) if pdf_doc_id else None)
+        shared_batches = sorted(rdf_batches.intersection(pdf_batches))
+        rdf_reaction = self.storage.get_rdf_reaction(str(rdf_link.get("rdf_reaction_id") or ""))
+        pdf_evidences = self.storage.list_pdf_reaction_evidence(document_id=str(pdf_doc_id or ""), cas_reaction_number=cas)
+        conflicts = self._compute_reaction_conflicts(rdf_reaction, pdf_evidences)
+        document_similarity = self._reaction_link_document_similarity(str(rdf_doc_id or ""), str(pdf_doc_id or ""))
+        evidence_profile = self._document_evidence_profile(str(pdf_doc_id or ""))
+        evidence_priority = float(evidence_profile.get("evidence_priority") or 0.0)
+
+        evidence_score = 0.0
+        if any(item.get("procedure_text") for item in pdf_evidences):
+            evidence_score += 10.0
+        if any(item.get("yield_text") for item in pdf_evidences):
+            evidence_score += 5.0
+        if any(item.get("products_text") and item.get("reactants_text") for item in pdf_evidences):
+            evidence_score += 5.0
+        if pdf_link.get("primary_pdf_page"):
+            evidence_score += 3.0
+
+        score = 10.0
+        if shared_batches:
+            score += 100.0
+        score += document_similarity * 25.0
+        score += evidence_priority / 10.0
+        score += evidence_score
+        score += 30.0 if not conflicts else -30.0
+
+        return {
+            "cas": cas,
+            "rdf_link": rdf_link,
+            "pdf_link": pdf_link,
+            "score": score,
+            "shared_batches": shared_batches,
+            "has_shared_batch": bool(shared_batches),
+            "conflicts": conflicts,
+            "document_similarity": round(document_similarity, 3),
+            "evidence_score": evidence_score,
+        }
+
+    def _mark_ambiguous_cas_links(self, cas: str, rdf_links: list[dict[str, Any]], pdf_links: list[dict[str, Any]]) -> None:
+        rdf_ids = [str(link["id"]) for link in rdf_links]
+        pdf_ids = [str(link["id"]) for link in pdf_links]
+        for link in rdf_links:
+            flags = self._json_dict(link.get("conflict_flags_json"))
+            flags.update({"ambiguous_cas_link": True, "cas_reaction_number": cas, "candidate_pdf_link_ids": pdf_ids})
+            self.storage.update_reaction_source_link(str(link["id"]), {"needs_review": 1, "conflict_flags_json": flags})
+        for link in pdf_links:
+            flags = self._json_dict(link.get("conflict_flags_json"))
+            flags.update({"ambiguous_cas_link": True, "cas_reaction_number": cas, "candidate_rdf_link_ids": rdf_ids})
+            self.storage.update_reaction_source_link(str(link["id"]), {"needs_review": 1, "conflict_flags_json": flags})
+
+    def _apply_rdf_pdf_link_candidate(self, candidate: dict[str, Any]) -> None:
+        rdf_link = candidate["rdf_link"]
+        pdf_link = candidate["pdf_link"]
+        has_shared_batch = bool(candidate.get("has_shared_batch"))
+        conflicts = candidate.get("conflicts") if isinstance(candidate.get("conflicts"), dict) else {}
+        link_confidence = 1.0 if has_shared_batch and not conflicts else 0.85 if not conflicts else 0.65
+        self.storage.update_reaction_source_link(
+            str(rdf_link["id"]),
+            {
+                "source_mode": "rdf_pdf_linked",
+                "pdf_document_id": pdf_link.get("pdf_document_id"),
+                "primary_pdf_page": pdf_link.get("primary_pdf_page"),
+                "pdf_pages_json": pdf_link.get("pdf_pages_json"),
+                "link_confidence": link_confidence,
+                "link_method": "cas_reaction_number" if has_shared_batch else "cas_cross_batch",
+                "needs_review": 0 if has_shared_batch and not conflicts else 1,
+                "conflict_flags_json": conflicts,
+            },
+        )
+        self.storage.reassign_evidence_link(str(pdf_link["id"]), str(rdf_link["id"]))
+        self.storage.delete_reaction_source_link(str(pdf_link["id"]))
+
+    def _link_rdf_pdf_by_cas(self, batch_id: str | None = None, document_ids: list[str] | None = None) -> None:
+        target_doc_ids = set(document_ids or [])
+        if batch_id:
+            batch = self.storage.get_export_batch(batch_id)
+            if batch and "documents" in batch:
+                for document in batch["documents"]:
+                    target_doc_ids.add(document["id"])
+
+        links: list[dict[str, Any]] = []
+        if target_doc_ids:
+            seen: set[str] = set()
+            for doc_id in target_doc_ids:
+                for link in self.storage.list_reaction_source_links(document_id=doc_id, limit=10000):
+                    if str(link["id"]) not in seen:
+                        links.append(link)
+                        seen.add(str(link["id"]))
+        else:
+            links = self.storage.list_reaction_source_links(limit=10000)
+
+        rdf_links_by_cas: dict[str, list[dict[str, Any]]] = {}
+        pdf_links_by_cas: dict[str, list[dict[str, Any]]] = {}
+        for link in links:
+            cas = link.get("cas_reaction_number")
+            if not cas:
+                continue
+            if link.get("source_mode") == "rdf_only":
+                rdf_links_by_cas.setdefault(str(cas), []).append(link)
+            elif link.get("source_mode") == "pdf_only":
+                pdf_links_by_cas.setdefault(str(cas), []).append(link)
+
+        for cas in sorted(set(rdf_links_by_cas).intersection(pdf_links_by_cas)):
+            remaining_rdf = {str(link["id"]): link for link in rdf_links_by_cas[cas]}
+            remaining_pdf = {str(link["id"]): link for link in pdf_links_by_cas[cas]}
+            while remaining_rdf and remaining_pdf:
+                candidates = [
+                    self._score_rdf_pdf_link_candidate(cas, rdf_link, pdf_link)
+                    for rdf_link in remaining_rdf.values()
+                    for pdf_link in remaining_pdf.values()
+                ]
+                if not candidates:
+                    break
+                candidates.sort(key=lambda item: (-float(item["score"]), str(item["rdf_link"]["id"]), str(item["pdf_link"]["id"])))
+                top = candidates[0]
+                competing = [
+                    candidate
+                    for candidate in candidates[1:]
+                    if abs(float(candidate["score"]) - float(top["score"])) < 0.01
+                    and (
+                        candidate["rdf_link"]["id"] == top["rdf_link"]["id"]
+                        or candidate["pdf_link"]["id"] == top["pdf_link"]["id"]
+                    )
+                ]
+                if competing:
+                    self._mark_ambiguous_cas_links(cas, list(remaining_rdf.values()), list(remaining_pdf.values()))
+                    break
+
+                self._apply_rdf_pdf_link_candidate(top)
+                remaining_rdf.pop(str(top["rdf_link"]["id"]), None)
+                remaining_pdf.pop(str(top["pdf_link"]["id"]), None)
+
+    def _compute_reaction_conflicts(self, rdf_record: dict[str, Any] | None, pdf_evidences: list[dict[str, Any]]) -> dict[str, Any]:
+        conflicts: dict[str, Any] = {}
+        if not rdf_record or not pdf_evidences:
+            return conflicts
+        
+        pdf_yields = [e["yield_text"] for e in pdf_evidences if e.get("yield_text")]
+        rdf_yield = rdf_record.get("yield_text")
+        
+        if rdf_yield and pdf_yields:
+            pdf_y = pdf_yields[0]
+            if str(rdf_yield) not in str(pdf_y) and str(pdf_y) not in str(rdf_yield):
+                conflicts["yield"] = True
+                
+        return conflicts
+
+    def set_primary_page(self, link_id: str, pdf_page: int) -> dict[str, Any]:
+        """Update the primary page of a reaction link and sync evidence."""
+        link = self.storage.get_reaction_source_link(link_id)
+        if not link:
+            raise ValueError(f"Link {link_id} not found")
+            
+        import json
+        pdf_pages = link.get("pdf_pages_json")
+        if isinstance(pdf_pages, str):
+            try:
+                pdf_pages = json.loads(pdf_pages)
+            except Exception:
+                pdf_pages = []
+        if pdf_page not in pdf_pages:
+            raise ValueError(f"Page {pdf_page} is not in the link's valid pages: {pdf_pages}")
+            
+        self.storage.update_reaction_source_link(link_id, {"primary_pdf_page": pdf_page})
+        evidences = self.storage.list_pdf_reaction_evidence(reaction_source_link_id=link_id)
+        for ev in evidences:
+            is_primary = 1 if ev["page_number"] == pdf_page else 0
+            self.storage.update_pdf_reaction_evidence(ev["id"], {"is_primary": is_primary})
+            
+        return {"status": "success", "id": link_id}
+
+    def unlink_reaction_source_link(self, link_id: str) -> dict[str, Any]:
+        """Unlink an rdf_pdf_linked record into separate rdf_only and pdf_only records."""
+        link = self.storage.get_reaction_source_link(link_id)
+        if not link or link["source_mode"] != "rdf_pdf_linked":
+            raise ValueError(f"Link {link_id} is not an rdf_pdf_linked record")
+
+        import json
+        pdf_pages = link.get("pdf_pages_json")
+        if isinstance(pdf_pages, str):
+            try:
+                pdf_pages = json.loads(pdf_pages)
+            except Exception:
+                pdf_pages = []
+                
+        # Create new pdf_only link
+        pdf_link = self.storage.create_reaction_source_link({
+            "cas_reaction_number": link.get("cas_reaction_number"),
+            "source_mode": "pdf_only",
+            "pdf_document_id": link.get("pdf_document_id"),
+            "primary_pdf_page": link.get("primary_pdf_page"),
+            "pdf_pages_json": pdf_pages,
+            "link_confidence": link.get("link_confidence", 0.8),
+            "link_method": "unlinked_from_rdf",
+            "needs_review": 1
+        })
+
+        # Reassign evidence to the new pdf_only link
+        self.storage.reassign_evidence_link(link_id, pdf_link["id"])
+
+        # Convert the original link back to rdf_only
+        self.storage.update_reaction_source_link(link_id, {
+            "source_mode": "rdf_only",
+            "pdf_document_id": None,
+            "primary_pdf_page": None,
+            "pdf_pages_json": None,
+            "link_confidence": 1.0,
+            "link_method": "unlinked_from_pdf",
+            "needs_review": 0,
+            "conflict_flags_json": None
+        })
+        
+        return {"status": "split", "rdf_link_id": link_id, "pdf_link_id": pdf_link["id"]}
+
+    def force_link_reaction(self, document_id: str, rdf_reaction_id: str, pdf_page: int) -> dict[str, Any]:
+        """Manually force link a PDF page to an RDF reaction, resolving existing pdf_only/rdf_only links."""
+        rdf_reaction = self.storage.get_rdf_reaction(rdf_reaction_id)
+        if not rdf_reaction:
+            raise ValueError(f"RDF reaction not found: {rdf_reaction_id}")
+            
+        cas_rn = rdf_reaction.get("cas_reaction_number")
+        
+        # Find if there is an existing rdf_only link for this reaction
+        links = self.storage.list_reaction_source_links(document_id=rdf_reaction.get("source_document_id"), limit=1000)
+        rdf_link = next((l for l in links if l.get("rdf_reaction_id") == rdf_reaction_id), None)
+        
+        # Find if there is an existing pdf_only link for this document and cas
+        pdf_links = self.storage.list_reaction_source_links(document_id=document_id, limit=1000)
+        pdf_link = next((l for l in pdf_links if l.get("cas_reaction_number") == cas_rn and l["source_mode"] == "pdf_only"), None)
+        
+        # Determine the target link ID
+        pdf_pages_to_set = pdf_link.get("pdf_pages_json") if pdf_link else [pdf_page]
+        if rdf_link:
+            target_link_id = rdf_link["id"]
+            self.storage.update_reaction_source_link(target_link_id, {
+                "source_mode": "rdf_pdf_linked",
+                "pdf_document_id": document_id,
+                "primary_pdf_page": pdf_page,
+                "pdf_pages_json": pdf_pages_to_set,
+                "link_confidence": 1.0,
+                "link_method": "manual_force",
+                "needs_review": 0
+            })
+        else:
+            new_link = self.storage.create_reaction_source_link({
+                "cas_reaction_number": cas_rn,
+                "source_mode": "rdf_pdf_linked",
+                "rdf_reaction_id": rdf_reaction_id,
+                "rdf_document_id": rdf_reaction.get("source_document_id"),
+                "pdf_document_id": document_id,
+                "primary_pdf_page": pdf_page,
+                "pdf_pages_json": pdf_pages_to_set,
+                "link_confidence": 1.0,
+                "link_method": "manual_force",
+                "needs_review": 0
+            })
+            target_link_id = new_link["id"]
+            
+        if pdf_link:
+            self.storage.reassign_evidence_link(pdf_link["id"], target_link_id)
+            self.storage.delete_reaction_source_link(pdf_link["id"])
+            
+        return {"status": "success", "id": target_link_id}
+
+    def _render_pdf_evidence_page(self, path: Path, document_id: str, page_number: int) -> str | None:
+        try:
+            import fitz # type: ignore[import-not-found]
+        except ImportError:
+            return None
+        evidence_dir = self.config.evidence_dir / document_id
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        out_path = evidence_dir / f"page_{page_number}.png"
+        if out_path.exists():
+            return str(out_path)
+            
+        with fitz.open(path) as doc:
+            if 1 <= page_number <= len(doc):
+                page = doc[page_number - 1]
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                pix.save(str(out_path))
+                return str(out_path)
+        return None
+
     def _process_document(self, document_id: str, job_id: str, *, parsed: ParsedDocument | None = None, reparse: bool = False) -> None:
         document = self.storage.get_document(document_id)
         if not document:
             raise KeyError(f"Document not found: {document_id}")
         try:
             self.storage.update_job(job_id, status="running", stage="document_parse")
+            evidence_profile = self._classify_document_evidence(Path(document.file_path))
+            if evidence_profile.get("import_action") == "exclude":
+                reason = evidence_profile.get("exclude_reason") or evidence_profile.get("label") or evidence_profile.get("evidence_kind")
+                raise ValueError(f"Document excluded by evidence classifier: {reason}")
+            self.storage.update_document_scifinder_metadata(document_id, evidence_profile)
             parsed_document = parsed or self._parse_with_optional_external(Path(document.file_path))
             visual_metadata = self._extract_visual_evidence(Path(document.file_path), document_id)
             
@@ -1311,7 +2508,8 @@ class RouteService:
                 parsed_document = self._augment_with_ocr(document.file_path, parsed_document)
             
             struct_endpoint, _, _, _ = self._integration_endpoint_settings("structure_recognition")
-            if visual_metadata and visual_metadata.get("rendered_paths") and struct_endpoint:
+            auto_struct = getattr(self.config, 'structure_recognition_auto_on_pdf_evidence', False)
+            if auto_struct and visual_metadata and visual_metadata.get("rendered_paths") and struct_endpoint:
                 self.storage.update_job(job_id, status="running", stage="vision_structure_extraction")
                 vision_smiles = []
                 for img_path in visual_metadata["rendered_paths"]:
@@ -1333,9 +2531,38 @@ class RouteService:
             self.storage.replace_parsed_chunks(document_id, parsed_document.chunks)
             if reparse:
                 self.storage.clear_document_reactions(document_id)
+                
             if parsed_document.file_type == "rdf":
                 self.storage.update_job(job_id, status="running", stage="rdf_structure_index")
                 self._index_rdf_structures(Path(document.file_path), document_id)
+                for rxn in self.storage.list_rdf_reactions(document_id=document_id):
+                    self.storage.create_reaction_source_link({
+                        "cas_reaction_number": rxn.get("cas_reaction_number"),
+                        "source_mode": "rdf_only",
+                        "rdf_reaction_id": rxn.get("id"),
+                        "rdf_document_id": document_id
+                    })
+                    
+            if parsed_document.file_type == "pdf" and getattr(self.config, 'pdf_evidence_enabled', True):
+                from .parsers import _extract_pdf_reaction_evidence
+                evidence_rows = _extract_pdf_reaction_evidence(
+                    Path(document.file_path),
+                    document_id,
+                    max_pages=getattr(self.config, "pdf_evidence_max_pages_per_document", 200),
+                )
+                if evidence_rows:
+                    for row in evidence_rows:
+                        if getattr(self.config, 'pdf_evidence_render_pages', True) and row.get("cas_reaction_number"):
+                            row["rendered_page_image_path"] = self._render_pdf_evidence_page(Path(document.file_path), document_id, row["page_number"])
+                    # Create candidates which updates rows with link IDs
+                    self._create_pdf_only_candidates(document_id, evidence_rows)
+                    # Insert evidence rows after link IDs are set
+                    for row in evidence_rows:
+                        self.storage.create_pdf_reaction_evidence(row)
+                    
+            # Always attempt to link existing documents by CAS after parsing any new doc
+            self._link_rdf_pdf_by_cas()
+            
             self.storage.update_job(job_id, status="running", stage="reaction_extraction")
             extracted = extract_reaction_steps(parsed_document, document_id)
             inserted = []
@@ -1380,14 +2607,28 @@ class RouteService:
         return self.storage.upsert_rdf_reaction_records(document_id, records)
 
     def _parse_with_optional_external(self, path: Path) -> ParsedDocument:
-        endpoint, model, _, api_key = self._integration_endpoint_settings("document_parser")
-        adapter = ExternalParserAdapter(endpoint, model, api_key)
-        if adapter.configured:
+        errors: list[str] = []
+        for settings in self._integration_provider_settings("document_parser"):
+            adapter = ExternalParserAdapter(
+                settings["endpoint"],
+                settings["model"],
+                settings["api_key"],
+                provider=settings["provider_format"],
+            )
+            if not adapter.configured:
+                continue
             try:
-                return adapter.parse(str(path))
-            except Exception:
+                parsed = adapter.parse(str(path))
+                if parsed.full_text.strip():
+                    return parsed
+                raise RuntimeError("document parser returned no text")
+            except Exception as exc:
+                errors.append(f"{settings['provider_id']}({settings['provider_format']}): {exc}")
+                LOGGER.warning("Document parser provider failed provider_id=%s format=%s detail=%s", settings["provider_id"], settings["provider_format"], exc)
                 if not self.config.document_parser_fallback:
                     raise
+        if errors:
+            LOGGER.warning("All external document parser providers failed; falling back to built-in parser: %s", "; ".join(errors))
         return parse_document(path)
 
     def _extract_visual_evidence(self, path: Path, document_id: str) -> dict[str, Any]:
@@ -1435,19 +2676,28 @@ class RouteService:
         return parsed.file_type == "pdf" and len(parsed.full_text.strip()) < 80
 
     def _augment_with_ocr(self, file_path: str, parsed: ParsedDocument) -> ParsedDocument:
-        endpoint, model, provider, api_key = self._integration_endpoint_settings("ocr")
-        adapter = OCRAdapter(endpoint, model, api_key, provider=provider)
-        payload = adapter.ocr_document(file_path)
-        text = str(payload.get("text") or "")
-        confidence = payload.get("confidence")
-        if not text.strip():
-            raise RuntimeError("OCR endpoint returned no text for image-only document")
-        chunk = TextChunk(text=text, page_number=None, parser_name="ocr-external", parser_version=str(self.config.ocr_model or "external"))
-        return ParsedDocument(file_type=parsed.file_type, title=parsed.title, doi=parsed.doi, chunks=[*parsed.chunks, chunk])
+        errors: list[str] = []
+        for settings in self._integration_provider_settings("ocr"):
+            adapter = OCRAdapter(settings["endpoint"], settings["model"], settings["api_key"], provider=settings["provider_format"])
+            if not adapter.configured:
+                continue
+            try:
+                payload = adapter.ocr_document(file_path)
+                text = str(payload.get("text") or "")
+                if not text.strip():
+                    raise RuntimeError("OCR endpoint returned no text")
+                parser_name = f"ocr-{settings['provider_format']}"
+                chunk = TextChunk(text=text, page_number=None, parser_name=parser_name, parser_version=str(settings["model"] or "external"))
+                return ParsedDocument(file_type=parsed.file_type, title=parsed.title, doi=parsed.doi, chunks=[*parsed.chunks, chunk])
+            except Exception as exc:
+                errors.append(f"{settings['provider_id']}({settings['provider_format']}): {exc}")
+                LOGGER.warning("OCR provider failed provider_id=%s format=%s detail=%s", settings["provider_id"], settings["provider_format"], exc)
+        detail = "; ".join(errors) if errors else "OCR endpoint is not configured"
+        raise RuntimeError(f"All OCR providers failed: {detail}")
 
     def _structure_with_llm(self, step: dict[str, Any]) -> dict[str, Any]:
         llm_enabled = bool(self.config.extraction_provider_id)
-        endpoint, model, provider, api_key = self._integration_endpoint_settings("llm")
+        endpoint, model, provider, api_key = self._integration_endpoint_settings("extraction")
         adapter = LLMStructuringAdapter(
             endpoint,
             model,

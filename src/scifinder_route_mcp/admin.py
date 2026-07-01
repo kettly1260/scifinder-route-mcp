@@ -72,6 +72,21 @@ class AdminHandler(BaseHTTPRequestHandler):
                 if not self._send_lock_error(exc):
                     raise
             return
+        if parsed.path == "/api/inbox/preview":
+            try:
+                self._require_role("operator")
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    self.server.service.preview_inbox(
+                        reparse=first_bool(query, "reparse", False),
+                        limit=first_int(query, "limit", 500, max_value=1000),
+                    )
+                )
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_error_json(exc)
+            return
         if parsed.path == "/api/documents":
             try:
                 self._require_role("viewer")
@@ -102,6 +117,15 @@ class AdminHandler(BaseHTTPRequestHandler):
                             limit=first_int(query, "limit", 50, max_value=500),
                             offset=first_int(query, "offset", 0, max_value=100000),
                         )
+                    )
+                elif parsed.path.endswith("/reaction_links"):
+                    document_id = parsed.path.removeprefix("/api/documents/").removesuffix("/reaction_links")
+                    self._send_json(
+                        self.server.service.list_reaction_links(
+                            document_id=document_id,
+                            needs_review=first_bool(query, "needs_review", None),
+                            limit=first_int(query, "limit", 100, max_value=500),
+                        )["items"]
                     )
                 else:
                     document_id = parsed.path.rsplit("/", 1)[-1]
@@ -219,6 +243,55 @@ class AdminHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_error_json(exc)
             return
+        if parsed.path == "/api/reaction_links":
+            try:
+                self._require_role("viewer")
+                query = parse_qs(parsed.query)
+                links = self.server.service.list_reaction_links(
+                    document_id=first_query(query, "document_id"),
+                    source_mode=first_query(query, "source_mode"),
+                    needs_review=first_bool(query, "needs_review", None),
+                    evidence_kind=first_query(query, "evidence_kind"),
+                    has_conflicts=first_bool(query, "has_conflicts", None),
+                    cas_reaction_number=first_query(query, "cas_reaction_number"),
+                    limit=first_int(query, "limit", 100, max_value=500),
+                    offset=first_int(query, "offset", 0, max_value=100000)
+                )
+                self._send_json(links)
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_error_json(exc)
+            return
+        if parsed.path.startswith("/api/reaction_links/") and not parsed.path.endswith("/confirm") and not parsed.path.endswith("/unlink") and not parsed.path.endswith("/relink") and not parsed.path.endswith("/set_primary_page") and not parsed.path.endswith("/ai_review"):
+            # This is a specific reaction link detail GET
+            try:
+                self._require_role("viewer")
+                link_id = parsed.path.rsplit("/", 1)[-1]
+                self._send_json(self.server.service.storage.get_reaction_source_link(link_id))
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_error_json(exc)
+            return
+        if parsed.path == "/api/pdf_evidence":
+            try:
+                self._require_role("viewer")
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    self.server.service.storage.list_pdf_reaction_evidence(
+                        document_id=first_query(query, "document_id"),
+                        cas_reaction_number=first_query(query, "cas_reaction_number"),
+                        reaction_source_link_id=first_query(query, "reaction_source_link_id"),
+                        limit=first_int(query, "limit", 100, max_value=500),
+                        offset=first_int(query, "offset", 0, max_value=100000)
+                    )
+                )
+            except PermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_error_json(exc)
+            return
         if not parsed.path.startswith("/api/"):
             if self._send_static_asset("index.html"):
                 return
@@ -242,9 +315,34 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._require_role("operator")
                 self._send_json(self.server.service.scan_inbox())
                 return
+            if parsed.path == "/api/import/preview":
+                self._require_role("operator")
+                payload = self._read_json()
+                if payload.get("inbox"):
+                    self._send_json(
+                        self.server.service.preview_inbox(
+                            reparse=bool(payload.get("reparse", False)),
+                            limit=payload_int(payload, "limit", 500, max_value=1000),
+                        )
+                    )
+                else:
+                    paths = payload.get("paths") if isinstance(payload.get("paths"), list) else []
+                    self._send_json(
+                        self.server.service.preview_document_paths(
+                            [str(path) for path in paths],
+                            reparse=bool(payload.get("reparse", False)),
+                            limit=payload_int(payload, "limit", 500, max_value=1000),
+                        )
+                    )
+                return
             if parsed.path == "/api/reload":
                 self._require_role("admin")
                 self._send_json(self.server.service.reload_config())
+                return
+            if parsed.path == "/api/upload/preview":
+                self._require_role("operator")
+                filename, content = self._read_upload()
+                self._send_json(self.server.service.preview_upload_document_bytes(content, filename))
                 return
             if parsed.path == "/api/upload":
                 self._require_role("operator")
@@ -259,6 +357,64 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._require_role("operator")
                 payload = self._read_json()
                 self._send_json(self.server.service.reparse_document(str(payload.get("document_id") or "")))
+                return
+            if parsed.path.startswith("/api/documents/") and parsed.path.endswith("/recognize_structure"):
+                self._require_role("operator")
+                document_id = parsed.path.removeprefix("/api/documents/").removesuffix("/recognize_structure")
+                self._send_json(self.server.service.run_manual_structure_recognition(document_id))
+                return
+            if parsed.path == "/api/reaction_links/bulk":
+                self._require_role("operator")
+                payload = self._read_json()
+                link_ids = payload.get("link_ids") if isinstance(payload.get("link_ids"), list) else []
+                self._send_json(self.server.service.bulk_update_reaction_links([str(item) for item in link_ids], str(payload.get("action") or "")))
+                return
+            if parsed.path == "/api/reaction_links/backfill_review":
+                self._require_role("operator")
+                payload = self._read_json()
+                self._send_json(
+                    self.server.service.backfill_reaction_link_review(
+                        dry_run=bool(payload.get("dry_run", True)),
+                        limit=payload_int(payload, "limit", 10000, max_value=100000),
+                    )
+                )
+                return
+            if parsed.path.startswith("/api/reaction_links/") and parsed.path.endswith("/ai_review"):
+                self._require_role("operator")
+                link_id = parsed.path.removeprefix("/api/reaction_links/").removesuffix("/ai_review")
+                self._send_json(self.server.service.analyze_reaction_link_with_ai(link_id))
+                return
+            if parsed.path.startswith("/api/reaction_links/") and parsed.path.endswith("/confirm"):
+                self._require_role("operator")
+                link_id = parsed.path.removeprefix("/api/reaction_links/").removesuffix("/confirm")
+                self.server.service.storage.update_reaction_source_link(link_id, {"needs_review": 0})
+                self._send_json({"status": "success", "id": link_id})
+                return
+            if parsed.path.startswith("/api/reaction_links/") and parsed.path.endswith("/unlink"):
+                self._require_role("operator")
+                link_id = parsed.path.removeprefix("/api/reaction_links/").removesuffix("/unlink")
+                res = self.server.service.unlink_reaction_source_link(link_id)
+                self._send_json(res)
+                return
+            if parsed.path.startswith("/api/reaction_links/") and parsed.path.endswith("/set_primary_page"):
+                self._require_role("operator")
+                link_id = parsed.path.removeprefix("/api/reaction_links/").removesuffix("/set_primary_page")
+                payload = self._read_json()
+                self.server.service.set_primary_page(link_id, payload.get("pdf_page"))
+                self._send_json({"status": "success", "id": link_id})
+                return
+            if parsed.path.startswith("/api/documents/") and parsed.path.endswith("/force_link"):
+                self._require_role("operator")
+                document_id = parsed.path.removeprefix("/api/documents/").removesuffix("/force_link")
+                payload = self._read_json()
+                res = self.server.service.force_link_reaction(document_id, payload.get("rdf_reaction_id"), payload.get("pdf_page"))
+                self._send_json(res)
+                return
+            if parsed.path == "/api/structure_evidence/verify":
+                self._require_role("operator")
+                payload = self._read_json()
+                res = self.server.service.storage.update_structure_evidence_candidate(str(payload.get("candidate_id")), {"validation_status": "verified"})
+                self._send_json(res)
                 return
             if parsed.path == "/api/vector/rebuild":
                 self._require_role("operator")
@@ -549,6 +705,21 @@ def safe_upload_name(value: str) -> str:
 def first_query(query: dict[str, list[str]], key: str, default: str = "") -> str:
     values = query.get(key)
     return values[0] if values else default
+
+
+def parse_optional_bool(value: Any, default: bool | None = None) -> bool | None:
+    if value is None or value == "":
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def first_bool(query: dict[str, list[str]], key: str, default: bool | None = None) -> bool | None:
+    return parse_optional_bool(first_query(query, key, ""), default)
 
 
 def bounded_int(value: Any, default: int, *, min_value: int = 0, max_value: int = 500) -> int:

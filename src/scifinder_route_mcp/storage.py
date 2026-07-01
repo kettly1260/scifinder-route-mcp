@@ -14,7 +14,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session
 from .orm import (
     Base, AiProviderModel, SourceDocumentModel, ParseJobModel,
-    ReactionStepModel, ProvenanceModel, ParsedChunkModel
+    ReactionStepModel, ProvenanceModel, ParsedChunkModel,
+    ReactionSourceLinkModel, PdfReactionEvidenceModel, StructureEvidenceCandidateModel
 )
 
 from .models import Compound, ParseJob, Provenance, ReactionStep, SourceDocument, AiProvider
@@ -305,6 +306,14 @@ class RouteStorage:
                 doc.doi = doi
                 doc.updated_at = utc_now()
 
+    def update_document_scifinder_metadata(self, document_id: str, metadata: dict[str, Any]) -> None:
+        with self.session() as s:
+            doc = s.get(SourceDocumentModel, document_id)
+            if doc:
+                existing = doc.scifinder_metadata if isinstance(doc.scifinder_metadata, dict) else {}
+                doc.scifinder_metadata = {**existing, **metadata}
+                doc.updated_at = utc_now()
+
     def create_job(self, document_id: str, *, status: str = "queued", stage: str = "queued") -> ParseJobModel:
         job_id = new_id("job")
         now = utc_now()
@@ -496,15 +505,45 @@ class RouteStorage:
             return s.scalar(stmt) or 0
 
     def clear_document_reactions(self, document_id: str) -> None:
-        from sqlalchemy import delete, select, text
+        from sqlalchemy import delete, select, text, or_
         with self.session() as s:
             step_ids = s.scalars(select(ReactionStepModel.id).where(ReactionStepModel.source_document_id == document_id)).all()
             if s.bind.dialect.name == "sqlite":
                 for step_id in step_ids:
                     s.execute(text("DELETE FROM reaction_step_fts WHERE reaction_step_id = :step_id"), {"step_id": step_id})
             s.execute(delete(ReactionStepModel).where(ReactionStepModel.source_document_id == document_id))
-            from .orm import RdfReactionRecordModel
+            from .orm import RdfReactionRecordModel, ReactionSourceLinkModel, PdfReactionEvidenceModel
             s.execute(delete(RdfReactionRecordModel).where(RdfReactionRecordModel.source_document_id == document_id))
+            
+            # Clean up reaction source links and pdf evidence on reparse
+            s.execute(delete(PdfReactionEvidenceModel).where(PdfReactionEvidenceModel.source_document_id == document_id))
+            
+            links_to_check = s.query(ReactionSourceLinkModel).where(or_(
+                ReactionSourceLinkModel.rdf_document_id == document_id,
+                ReactionSourceLinkModel.pdf_document_id == document_id
+            )).all()
+            
+            for link in links_to_check:
+                if link.rdf_document_id == document_id and link.pdf_document_id == document_id:
+                    s.delete(link)
+                elif link.rdf_document_id == document_id and link.pdf_document_id:
+                    # Downgrade to pdf_only
+                    link.source_mode = "pdf_only"
+                    link.rdf_document_id = None
+                    link.rdf_reaction_id = None
+                    link.link_method = "unlinked_from_rdf"
+                    link.link_confidence = 0.8
+                    link.needs_review = 1
+                elif link.pdf_document_id == document_id and link.rdf_document_id:
+                    # Downgrade to rdf_only
+                    link.source_mode = "rdf_only"
+                    link.pdf_document_id = None
+                    link.primary_pdf_page = None
+                    link.pdf_pages_json = "[]"
+                    link.link_method = "unlinked_from_pdf"
+                    link.link_confidence = 1.0
+                else:
+                    s.delete(link)
 
     def replace_parsed_chunks(self, document_id: str, chunks: Iterable[Any]) -> int:
         from sqlalchemy import delete
@@ -1965,6 +2004,220 @@ class RouteStorage:
         terms = [term.strip().replace('"', "") for term in query.split() if term.strip()]
         return " OR ".join(f'"{term}"' for term in terms) if terms else '""'
 
+    def create_reaction_source_link(self, data: dict[str, Any]) -> dict[str, Any]:
+        with self.session() as session:
+            model = ReactionSourceLinkModel(
+                id=data.get("id", new_id("rsl")),
+                cas_reaction_number=data.get("cas_reaction_number"),
+                source_mode=data["source_mode"],
+                rdf_reaction_id=data.get("rdf_reaction_id"),
+                rdf_document_id=data.get("rdf_document_id"),
+                pdf_document_id=data.get("pdf_document_id"),
+                primary_pdf_page=data.get("primary_pdf_page"),
+                pdf_pages_json=json.dumps(data.get("pdf_pages_json") if data.get("pdf_pages_json") is not None else []),
+                link_confidence=data.get("link_confidence", 0.0),
+                link_method=data.get("link_method", "manual"),
+                needs_review=data.get("needs_review", 0),
+                conflict_flags_json=json.dumps(data.get("conflict_flags_json") if data.get("conflict_flags_json") is not None else {}),
+                created_at=utc_now(),
+                updated_at=utc_now()
+            )
+            session.add(model)
+            session.commit()
+            return model.to_dict()
+
+    def update_reaction_source_link(self, link_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        with self.session() as session:
+            model = session.query(ReactionSourceLinkModel).filter_by(id=link_id, deleted_at=None).first()
+            if not model:
+                return None
+            for key, value in data.items():
+                if hasattr(model, key):
+                    if key in ("pdf_pages_json", "conflict_flags_json"):
+                        if value is None:
+                            val_str = "[]" if key == "pdf_pages_json" else "{}"
+                            setattr(model, key, val_str)
+                        else:
+                            setattr(model, key, json.dumps(value) if not isinstance(value, str) else value)
+                    else:
+                        setattr(model, key, value)
+            model.updated_at = utc_now()
+            session.commit()
+            return model.to_dict()
+
+    def get_reaction_source_link(self, link_id: str) -> dict[str, Any] | None:
+        with self.session() as session:
+            model = session.query(ReactionSourceLinkModel).filter_by(id=link_id, deleted_at=None).first()
+            return model.to_dict() if model else None
+
+    def get_reaction_source_link_by_rdf(self, rdf_reaction_id: str) -> dict[str, Any] | None:
+        with self.session() as session:
+            model = session.query(ReactionSourceLinkModel).filter_by(rdf_reaction_id=rdf_reaction_id, deleted_at=None).first()
+            return model.to_dict() if model else None
+
+    def list_reaction_source_links(
+        self,
+        document_id: str = "",
+        source_mode: str = "",
+        needs_review: bool | None = None,
+        cas_reaction_number: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with self.session() as session:
+            query = session.query(ReactionSourceLinkModel).filter_by(deleted_at=None)
+            if document_id:
+                from sqlalchemy import or_
+                query = query.filter(or_(
+                    ReactionSourceLinkModel.pdf_document_id == document_id,
+                    ReactionSourceLinkModel.rdf_document_id == document_id
+                ))
+            if source_mode:
+                modes = [item.strip() for item in source_mode.split(",") if item.strip()]
+                if len(modes) > 1:
+                    query = query.filter(ReactionSourceLinkModel.source_mode.in_(modes))
+                else:
+                    query = query.filter(ReactionSourceLinkModel.source_mode == source_mode)
+            if needs_review is not None:
+                val = 1 if needs_review else 0
+                query = query.filter(ReactionSourceLinkModel.needs_review == val)
+            if cas_reaction_number:
+                query = query.filter(ReactionSourceLinkModel.cas_reaction_number == cas_reaction_number)
+            models = query.order_by(ReactionSourceLinkModel.created_at.desc()).limit(limit).offset(offset).all()
+            return [m.to_dict() for m in models]
+
+    def delete_reaction_source_link(self, link_id: str) -> None:
+        with self.session() as session:
+            model = session.query(ReactionSourceLinkModel).filter_by(id=link_id, deleted_at=None).first()
+            if model:
+                model.deleted_at = utc_now()
+                session.commit()
+
+    def search_pdf_only_reaction_links(
+        self,
+        document_id: str = "",
+        limit: int = 20,
+    ) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+        # Returns list of (link_dict, list of evidence_dicts)
+        with self.session() as session:
+            query = session.query(ReactionSourceLinkModel).filter_by(deleted_at=None).filter(
+                ReactionSourceLinkModel.source_mode.in_(["pdf_only", "pdf_only_low_confidence"])
+            )
+            if document_id:
+                query = query.filter(ReactionSourceLinkModel.pdf_document_id == document_id)
+            
+            models = query.order_by(ReactionSourceLinkModel.created_at.desc()).limit(limit).all()
+            
+            results = []
+            for m in models:
+                # fetch evidence (PdfReactionEvidenceModel has no deleted_at)
+                evidences = session.query(PdfReactionEvidenceModel).filter_by(
+                    reaction_source_link_id=m.id
+                ).all()
+                results.append((m.to_dict(), [e.to_dict() for e in evidences]))
+            return results
+
+    def reassign_evidence_link(self, old_link_id: str, new_link_id: str) -> int:
+        """Re-point all PdfReactionEvidence rows from old_link_id to new_link_id."""
+        with self.session() as session:
+            count = session.query(PdfReactionEvidenceModel).filter_by(
+                reaction_source_link_id=old_link_id
+            ).update({"reaction_source_link_id": new_link_id})
+            session.commit()
+            return count
+
+    def create_pdf_reaction_evidence(self, data: dict[str, Any]) -> dict[str, Any]:
+        with self.session() as session:
+            model = PdfReactionEvidenceModel(
+                id=data.get("id", new_id("pre")),
+                source_document_id=data["source_document_id"],
+                reaction_source_link_id=data.get("reaction_source_link_id"),
+                cas_reaction_number=data.get("cas_reaction_number"),
+                page_number=data["page_number"],
+                is_primary=data.get("is_primary", 0),
+                page_text=data["page_text"],
+                procedure_text=data.get("procedure_text"),
+                products_text=data.get("products_text"),
+                reactants_text=data.get("reactants_text"),
+                conditions_text=data.get("conditions_text"),
+                yield_text=data.get("yield_text"),
+                reference_text=data.get("reference_text"),
+                doi=data.get("doi"),
+                rendered_page_image_path=data.get("rendered_page_image_path"),
+                block_start_hint=data.get("block_start_hint"),
+                block_end_hint=data.get("block_end_hint"),
+                match_confidence=data.get("match_confidence", 0.0),
+                extraction_method=data.get("extraction_method", "manual"),
+                needs_review=data.get("needs_review", 0),
+                created_at=utc_now(),
+                updated_at=utc_now()
+            )
+            session.add(model)
+            session.commit()
+            return model.to_dict()
+
+    def update_pdf_reaction_evidence(self, evidence_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        with self.session() as session:
+            model = session.get(PdfReactionEvidenceModel, evidence_id)
+            if not model:
+                raise KeyError(f"PdfReactionEvidenceModel {evidence_id} not found")
+            for k, v in data.items():
+                if hasattr(model, k):
+                    setattr(model, k, v)
+            model.updated_at = utc_now()
+            session.commit()
+            return model.to_dict()
+
+    def list_pdf_reaction_evidence(self, document_id: str = "", cas_reaction_number: str = "", reaction_source_link_id: str = "", limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        with self.session() as session:
+            query = session.query(PdfReactionEvidenceModel)
+            if document_id:
+                query = query.filter(PdfReactionEvidenceModel.source_document_id == document_id)
+            if cas_reaction_number:
+                query = query.filter(PdfReactionEvidenceModel.cas_reaction_number == cas_reaction_number)
+            if reaction_source_link_id:
+                query = query.filter(PdfReactionEvidenceModel.reaction_source_link_id == reaction_source_link_id)
+            models = query.order_by(PdfReactionEvidenceModel.page_number.asc()).limit(limit).offset(offset).all()
+            return [m.to_dict() for m in models]
+
+    def create_structure_evidence_candidate(self, data: dict[str, Any]) -> dict[str, Any]:
+        with self.session() as session:
+            model = StructureEvidenceCandidateModel(
+                id=data.get("id", new_id("sec")),
+                pdf_evidence_id=data["pdf_evidence_id"],
+                source_document_id=data["source_document_id"],
+                page_number=data["page_number"],
+                image_path=data.get("image_path"),
+                candidate_smiles=data.get("candidate_smiles"),
+                candidate_inchikey=data.get("candidate_inchikey"),
+                candidate_formula=data.get("candidate_formula"),
+                role_hint=data.get("role_hint"),
+                model_name=data.get("model_name"),
+                confidence=data.get("confidence", 0.0),
+                validation_status=data.get("validation_status", "candidate"),
+                validation_signals_json=json.dumps(data.get("validation_signals_json", {})),
+                created_at=utc_now(),
+                updated_at=utc_now()
+            )
+            session.add(model)
+            session.commit()
+            return model.to_dict()
+
+    def update_structure_evidence_candidate(self, candidate_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        with self.session() as session:
+            model = session.query(StructureEvidenceCandidateModel).filter_by(id=candidate_id).first()
+            if not model:
+                return None
+            for key, value in data.items():
+                if hasattr(model, key):
+                    if key == "validation_signals_json":
+                        setattr(model, key, json.dumps(value) if not isinstance(value, str) else value)
+                    else:
+                        setattr(model, key, value)
+            model.updated_at = utc_now()
+            session.commit()
+            return model.to_dict()
+
 
 def document_role(file_type: str) -> str:
     mapping = {
@@ -2039,4 +2292,3 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
-
