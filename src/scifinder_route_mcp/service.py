@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -450,45 +451,13 @@ class RouteService:
     def _reaction_link_has_conflicts(self, link: dict[str, Any]) -> bool:
         return bool(self._json_dict(link.get("conflict_flags_json")))
 
-    def _document_link_summary(self, document_id: str | None) -> dict[str, Any]:
-        if not document_id:
-            return {}
-        document = self.storage.get_document(document_id)
-        if not document:
-            return {"id": document_id}
-        data = document.to_dict()
-        metadata = data.get("scifinder_metadata") if isinstance(data.get("scifinder_metadata"), dict) else {}
-        return {
-            "id": data.get("id"),
-            "file_name": Path(str(data.get("file_path") or "")).name,
-            "file_path": data.get("file_path"),
-            "file_type": data.get("file_type"),
-            "title": data.get("title"),
-            "ingest_status": data.get("ingest_status"),
-            "evidence_kind": metadata.get("evidence_kind"),
-            "evidence_priority": metadata.get("evidence_priority"),
-            "evidence_label": metadata.get("label"),
-            "provenance_warning": metadata.get("provenance_warning"),
-        }
-
     def _enrich_reaction_link(self, link: dict[str, Any]) -> dict[str, Any]:
-        enriched = dict(link)
-        pdf_document = self._document_link_summary(link.get("pdf_document_id"))
-        rdf_document = self._document_link_summary(link.get("rdf_document_id"))
-        evidence = self.storage.list_pdf_reaction_evidence(reaction_source_link_id=str(link.get("id") or ""), limit=1000)
-        enriched["pdf_document"] = pdf_document
-        enriched["rdf_document"] = rdf_document
-        enriched["pdf_file_name"] = pdf_document.get("file_name", "")
-        enriched["rdf_file_name"] = rdf_document.get("file_name", "")
-        enriched["evidence_kind"] = pdf_document.get("evidence_kind") or rdf_document.get("evidence_kind")
-        enriched["evidence_priority"] = pdf_document.get("evidence_priority") or rdf_document.get("evidence_priority")
-        enriched["evidence_label"] = pdf_document.get("evidence_label") or rdf_document.get("evidence_label")
-        enriched["provenance_warning"] = pdf_document.get("provenance_warning") or rdf_document.get("provenance_warning")
-        enriched["pdf_evidence_count"] = len(evidence)
-        enriched["pdf_evidence_pages"] = sorted({item.get("page_number") for item in evidence if item.get("page_number") is not None})
-        enriched["has_conflicts"] = self._reaction_link_has_conflicts(link)
-        enriched["conflict_flags"] = self._json_dict(link.get("conflict_flags_json"))
-        return enriched
+        link_id = str(link.get("id") or "")
+        if link_id:
+            enriched = self.storage.get_enriched_reaction_source_link(link_id)
+            if enriched:
+                return enriched
+        return dict(link)
 
     def list_reaction_links(
         self,
@@ -502,21 +471,16 @@ class RouteService:
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
-        raw_links = self.storage.list_reaction_source_links(
+        return self.storage.list_enriched_reaction_source_links(
             document_id=document_id,
             source_mode=source_mode,
             needs_review=needs_review,
+            evidence_kind=evidence_kind,
+            has_conflicts=has_conflicts,
             cas_reaction_number=cas_reaction_number,
-            limit=10000,
-            offset=0,
+            limit=limit,
+            offset=offset,
         )
-        enriched = [self._enrich_reaction_link(link) for link in raw_links]
-        if evidence_kind:
-            enriched = [link for link in enriched if str(link.get("evidence_kind") or "") == evidence_kind]
-        if has_conflicts is not None:
-            enriched = [link for link in enriched if bool(link.get("has_conflicts")) == has_conflicts]
-        total = len(enriched)
-        return {"items": enriched[offset : offset + limit], "total": total, "limit": limit, "offset": offset}
 
     def _trim_ai_evidence_text(self, value: Any, limit: int = 1800) -> str:
         text = str(value or "").strip()
@@ -2492,94 +2456,27 @@ class RouteService:
         document = self.storage.get_document(document_id)
         if not document:
             raise KeyError(f"Document not found: {document_id}")
+        document_path = Path(document.file_path)
         try:
             self.storage.update_job(job_id, status="running", stage="document_parse")
-            evidence_profile = self._classify_document_evidence(Path(document.file_path))
+            evidence_profile = self._classify_document_evidence(document_path)
             if evidence_profile.get("import_action") == "exclude":
                 reason = evidence_profile.get("exclude_reason") or evidence_profile.get("label") or evidence_profile.get("evidence_kind")
                 raise ValueError(f"Document excluded by evidence classifier: {reason}")
             self.storage.update_document_scifinder_metadata(document_id, evidence_profile)
-            parsed_document = parsed or self._parse_with_optional_external(Path(document.file_path))
-            visual_metadata = self._extract_visual_evidence(Path(document.file_path), document_id)
-            
-            ocr_endpoint, _, _, _ = self._integration_endpoint_settings("ocr")
-            if self._should_run_ocr(parsed_document) and ocr_endpoint:
-                self.storage.update_job(job_id, status="running", stage="ocr")
-                parsed_document = self._augment_with_ocr(document.file_path, parsed_document)
-            
-            struct_endpoint, _, _, _ = self._integration_endpoint_settings("structure_recognition")
-            auto_struct = getattr(self.config, 'structure_recognition_auto_on_pdf_evidence', False)
-            if auto_struct and visual_metadata and visual_metadata.get("rendered_paths") and struct_endpoint:
-                self.storage.update_job(job_id, status="running", stage="vision_structure_extraction")
-                vision_smiles = []
-                for img_path in visual_metadata["rendered_paths"]:
-                    try:
-                        structs = self.recognize_structure_image(img_path)
-                        if structs.get("status") == "success":
-                            for c in structs.get("compounds", []):
-                                if c.get("smiles"):
-                                    vision_smiles.append(c["smiles"])
-                    except Exception:
-                        pass
-                if vision_smiles:
-                    vision_text = "Extracted molecular structures from document images:\n" + "\n".join(vision_smiles)
-                    import dataclasses
-                    from .parsers import TextChunk
-                    new_chunk = TextChunk(text=vision_text, page_number=None, parser_name="vision_llm")
-                    parsed_document = dataclasses.replace(parsed_document, chunks=parsed_document.chunks + [new_chunk])
-            self.storage.update_document_metadata(document_id, file_type=parsed_document.file_type or detect_file_type(document.file_path), title=parsed_document.title, doi=parsed_document.doi)
-            self.storage.replace_parsed_chunks(document_id, parsed_document.chunks)
-            if reparse:
-                self.storage.clear_document_reactions(document_id)
-                
-            if parsed_document.file_type == "rdf":
-                self.storage.update_job(job_id, status="running", stage="rdf_structure_index")
-                self._index_rdf_structures(Path(document.file_path), document_id)
-                for rxn in self.storage.list_rdf_reactions(document_id=document_id):
-                    self.storage.create_reaction_source_link({
-                        "cas_reaction_number": rxn.get("cas_reaction_number"),
-                        "source_mode": "rdf_only",
-                        "rdf_reaction_id": rxn.get("id"),
-                        "rdf_document_id": document_id
-                    })
-                    
-            if parsed_document.file_type == "pdf" and getattr(self.config, 'pdf_evidence_enabled', True):
-                from .parsers import _extract_pdf_reaction_evidence
-                evidence_rows = _extract_pdf_reaction_evidence(
-                    Path(document.file_path),
-                    document_id,
-                    max_pages=getattr(self.config, "pdf_evidence_max_pages_per_document", 200),
-                )
-                if evidence_rows:
-                    for row in evidence_rows:
-                        if getattr(self.config, 'pdf_evidence_render_pages', True) and row.get("cas_reaction_number"):
-                            row["rendered_page_image_path"] = self._render_pdf_evidence_page(Path(document.file_path), document_id, row["page_number"])
-                    # Create candidates which updates rows with link IDs
-                    self._create_pdf_only_candidates(document_id, evidence_rows)
-                    # Insert evidence rows after link IDs are set
-                    for row in evidence_rows:
-                        self.storage.create_pdf_reaction_evidence(row)
-                    
+            parsed_document = parsed or self._parse_with_optional_external(document_path)
+            visual_metadata = self._extract_visual_evidence(document_path, document_id)
+            parsed_document = self._maybe_augment_with_ocr(job_id, document.file_path, parsed_document)
+            parsed_document = self._maybe_append_vision_structures(job_id, parsed_document, visual_metadata)
+            self._persist_parsed_document(document_id, document_path, parsed_document, reparse=reparse)
+            self._index_rdf_source(job_id, document_id, document_path, parsed_document)
+            self._index_pdf_evidence_source(document_id, document_path, parsed_document)
+
             # Always attempt to link existing documents by CAS after parsing any new doc
             self._link_rdf_pdf_by_cas()
-            
+
             self.storage.update_job(job_id, status="running", stage="reaction_extraction")
-            extracted = extract_reaction_steps(parsed_document, document_id)
-            inserted = []
-            for step, provenance in extracted:
-                metadata = dict(step.get("metadata") or {})
-                if parsed_document.file_type == "rdf":
-                    metadata["structured_source"] = "rdf"
-                if visual_metadata:
-                    metadata.update(visual_metadata)
-                    if visual_metadata.get("has_visual_evidence"):
-                        provenance = {**provenance, "image_region_path": visual_metadata.get("first_visual_evidence_path")}
-                if metadata:
-                    step["metadata"] = metadata
-                step = self._structure_with_llm(step)
-                inserted_step = self.storage.insert_reaction_step(step, provenance)
-                inserted.append(inserted_step)
-                index_reaction_compounds(self.storage, inserted_step.id, inserted_step.original_text)
+            inserted = self._insert_extracted_reaction_steps(document_id, parsed_document, visual_metadata)
             status = "parsed" if inserted else "parsed_no_reactions"
             self.storage.set_document_status(document_id, status)
             self.storage.auto_batch_document(document_id)
@@ -2590,6 +2487,104 @@ class RouteService:
             self.storage.set_document_status(document_id, "failed")
             self.storage.update_job(job_id, status="failed", stage="failed", error=str(exc))
             raise
+
+    def _maybe_augment_with_ocr(self, job_id: str, file_path: str, parsed_document: ParsedDocument) -> ParsedDocument:
+        ocr_endpoint, _, _, _ = self._integration_endpoint_settings("ocr")
+        if not (self._should_run_ocr(parsed_document) and ocr_endpoint):
+            return parsed_document
+        self.storage.update_job(job_id, status="running", stage="ocr")
+        return self._augment_with_ocr(file_path, parsed_document)
+
+    def _maybe_append_vision_structures(self, job_id: str, parsed_document: ParsedDocument, visual_metadata: dict[str, Any]) -> ParsedDocument:
+        struct_endpoint, _, _, _ = self._integration_endpoint_settings("structure_recognition")
+        auto_struct = getattr(self.config, "structure_recognition_auto_on_pdf_evidence", False)
+        if not (auto_struct and visual_metadata and visual_metadata.get("rendered_paths") and struct_endpoint):
+            return parsed_document
+
+        self.storage.update_job(job_id, status="running", stage="vision_structure_extraction")
+        vision_smiles: list[str] = []
+        for img_path in visual_metadata["rendered_paths"]:
+            try:
+                structs = self.recognize_structure_image(img_path)
+                if structs.get("status") == "success":
+                    for compound in structs.get("compounds", []):
+                        if compound.get("smiles"):
+                            vision_smiles.append(compound["smiles"])
+            except Exception:
+                pass
+        if not vision_smiles:
+            return parsed_document
+
+        vision_text = "Extracted molecular structures from document images:\n" + "\n".join(vision_smiles)
+        new_chunk = TextChunk(text=vision_text, page_number=None, parser_name="vision_llm")
+        return replace(parsed_document, chunks=parsed_document.chunks + [new_chunk])
+
+    def _persist_parsed_document(self, document_id: str, document_path: Path, parsed_document: ParsedDocument, *, reparse: bool) -> None:
+        self.storage.update_document_metadata(
+            document_id,
+            file_type=parsed_document.file_type or detect_file_type(document_path),
+            title=parsed_document.title,
+            doi=parsed_document.doi,
+        )
+        self.storage.replace_parsed_chunks(document_id, parsed_document.chunks)
+        if reparse:
+            self.storage.clear_document_reactions(document_id)
+
+    def _index_rdf_source(self, job_id: str, document_id: str, document_path: Path, parsed_document: ParsedDocument) -> None:
+        if parsed_document.file_type != "rdf":
+            return
+        self.storage.update_job(job_id, status="running", stage="rdf_structure_index")
+        self._index_rdf_structures(document_path, document_id)
+        for rxn in self.storage.list_rdf_reactions(document_id=document_id):
+            self.storage.create_reaction_source_link({
+                "cas_reaction_number": rxn.get("cas_reaction_number"),
+                "source_mode": "rdf_only",
+                "rdf_reaction_id": rxn.get("id"),
+                "rdf_document_id": document_id
+            })
+
+    def _index_pdf_evidence_source(self, document_id: str, document_path: Path, parsed_document: ParsedDocument) -> None:
+        if parsed_document.file_type != "pdf" or not getattr(self.config, "pdf_evidence_enabled", True):
+            return
+
+        from .parsers import _extract_pdf_reaction_evidence
+
+        evidence_rows = _extract_pdf_reaction_evidence(
+            document_path,
+            document_id,
+            max_pages=getattr(self.config, "pdf_evidence_max_pages_per_document", 200),
+        )
+        if not evidence_rows:
+            return
+        for row in evidence_rows:
+            if getattr(self.config, "pdf_evidence_render_pages", True) and row.get("cas_reaction_number"):
+                row["rendered_page_image_path"] = self._render_pdf_evidence_page(document_path, document_id, row["page_number"])
+        self._create_pdf_only_candidates(document_id, evidence_rows)
+        for row in evidence_rows:
+            self.storage.create_pdf_reaction_evidence(row)
+
+    def _insert_extracted_reaction_steps(
+        self,
+        document_id: str,
+        parsed_document: ParsedDocument,
+        visual_metadata: dict[str, Any],
+    ) -> list[Any]:
+        inserted: list[Any] = []
+        for step, provenance in extract_reaction_steps(parsed_document, document_id):
+            metadata = dict(step.get("metadata") or {})
+            if parsed_document.file_type == "rdf":
+                metadata["structured_source"] = "rdf"
+            if visual_metadata:
+                metadata.update(visual_metadata)
+                if visual_metadata.get("has_visual_evidence"):
+                    provenance = {**provenance, "image_region_path": visual_metadata.get("first_visual_evidence_path")}
+            if metadata:
+                step["metadata"] = metadata
+            step = self._structure_with_llm(step)
+            inserted_step = self.storage.insert_reaction_step(step, provenance)
+            inserted.append(inserted_step)
+            index_reaction_compounds(self.storage, inserted_step.id, inserted_step.original_text)
+        return inserted
 
     def _index_rdf_structures(self, path: Path, document_id: str) -> dict[str, int]:
         from .chem import normalize_molfile

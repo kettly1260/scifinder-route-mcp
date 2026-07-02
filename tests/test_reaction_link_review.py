@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import http.client
+import json
 from pathlib import Path
 
 import pytest
 
+from scifinder_route_mcp.admin import AdminRunConfig, start_admin_server
 from scifinder_route_mcp.config import AppConfig
 from scifinder_route_mcp.service import RouteService
 from scifinder_route_mcp.storage import RouteStorage
@@ -207,6 +210,34 @@ def test_same_cas_multiple_rdf_pdf_links_pair_without_overwriting(tmp_path: Path
     assert service.storage.get_reaction_source_link(first_pdf) is None
     assert service.storage.get_reaction_source_link(second_pdf) is None
     assert len(service.storage.list_reaction_source_links(source_mode="rdf_pdf_linked")) == 2
+
+
+def test_admin_reaction_links_endpoint_uses_enriched_read_model(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    _, pdf_link_id = seed_rdf_pdf_links(service)
+    pdf_link = service.storage.get_reaction_source_link(pdf_link_id)
+    assert pdf_link is not None
+
+    server = start_admin_server(service, AdminRunConfig(host="127.0.0.1", port=0))
+    assert server is not None
+    port = server.server_address[1]
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/api/reaction_links?source_mode=pdf_only&limit=5")
+        response = conn.getresponse()
+        body = response.read().decode("utf-8")
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert response.status == 200
+    payload = json.loads(body)
+    assert payload["total"] == 1
+    assert payload["items"][0]["id"] == pdf_link_id
+    assert payload["items"][0]["pdf_file_name"] == "example.pdf"
+    assert payload["items"][0]["pdf_evidence_count"] == 1
+    assert payload["items"][0]["pdf_evidence_pages"] == [2]
 
 
 def test_ambiguous_same_cas_links_remain_for_review(tmp_path: Path) -> None:

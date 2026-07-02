@@ -2055,6 +2055,215 @@ class RouteStorage:
             model = session.query(ReactionSourceLinkModel).filter_by(rdf_reaction_id=rdf_reaction_id, deleted_at=None).first()
             return model.to_dict() if model else None
 
+    def _json_dict(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _reaction_source_link_query(
+        self,
+        session: Session,
+        *,
+        document_id: str = "",
+        source_mode: str = "",
+        needs_review: bool | None = None,
+        has_conflicts: bool | None = None,
+        cas_reaction_number: str = "",
+    ):
+        from sqlalchemy import or_
+
+        query = session.query(ReactionSourceLinkModel).filter_by(deleted_at=None)
+        if document_id:
+            query = query.filter(
+                or_(
+                    ReactionSourceLinkModel.pdf_document_id == document_id,
+                    ReactionSourceLinkModel.rdf_document_id == document_id,
+                )
+            )
+        if source_mode:
+            modes = [item.strip() for item in source_mode.split(",") if item.strip()]
+            if len(modes) > 1:
+                query = query.filter(ReactionSourceLinkModel.source_mode.in_(modes))
+            elif modes:
+                query = query.filter(ReactionSourceLinkModel.source_mode == modes[0])
+        if needs_review is not None:
+            query = query.filter(ReactionSourceLinkModel.needs_review == (1 if needs_review else 0))
+        if has_conflicts is not None:
+            empty_conflicts = or_(
+                ReactionSourceLinkModel.conflict_flags_json.is_(None),
+                ReactionSourceLinkModel.conflict_flags_json == "",
+                ReactionSourceLinkModel.conflict_flags_json == "{}",
+                ReactionSourceLinkModel.conflict_flags_json == "null",
+            )
+            query = query.filter(~empty_conflicts if has_conflicts else empty_conflicts)
+        if cas_reaction_number:
+            query = query.filter(ReactionSourceLinkModel.cas_reaction_number == cas_reaction_number)
+        return query
+
+    def _document_link_summary(
+        self,
+        document_by_id: dict[str, SourceDocumentModel],
+        document_id: str | None,
+    ) -> dict[str, Any]:
+        if not document_id:
+            return {}
+        document = document_by_id.get(document_id)
+        if not document:
+            return {"id": document_id}
+        data = document.to_dict()
+        metadata = data.get("scifinder_metadata") if isinstance(data.get("scifinder_metadata"), dict) else {}
+        return {
+            "id": data.get("id"),
+            "file_name": Path(str(data.get("file_path") or "")).name,
+            "file_path": data.get("file_path"),
+            "file_type": data.get("file_type"),
+            "title": data.get("title"),
+            "ingest_status": data.get("ingest_status"),
+            "evidence_kind": metadata.get("evidence_kind"),
+            "evidence_priority": metadata.get("evidence_priority"),
+            "evidence_label": metadata.get("label"),
+            "provenance_warning": metadata.get("provenance_warning"),
+        }
+
+    def _document_ids_with_evidence_kind(self, session: Session, evidence_kind: str) -> set[str]:
+        models = session.query(SourceDocumentModel).filter(SourceDocumentModel.deleted_at.is_(None)).all()
+        matching: set[str] = set()
+        for model in models:
+            metadata = model.scifinder_metadata if isinstance(model.scifinder_metadata, dict) else self._json_dict(model.scifinder_metadata)
+            if str(metadata.get("evidence_kind") or "") == evidence_kind:
+                matching.add(model.id)
+        return matching
+
+    def _enrich_reaction_source_link_rows(
+        self,
+        session: Session,
+        models: list[ReactionSourceLinkModel],
+    ) -> list[dict[str, Any]]:
+        if not models:
+            return []
+
+        links = [model.to_dict() for model in models]
+        document_ids = {
+            str(document_id)
+            for link in links
+            for document_id in (link.get("pdf_document_id"), link.get("rdf_document_id"))
+            if document_id
+        }
+        document_by_id: dict[str, SourceDocumentModel] = {}
+        if document_ids:
+            documents = session.query(SourceDocumentModel).filter(SourceDocumentModel.id.in_(sorted(document_ids))).all()
+            document_by_id = {document.id: document for document in documents}
+
+        link_ids = [str(link["id"]) for link in links if link.get("id")]
+        evidence_by_link: dict[str, dict[str, Any]] = {
+            link_id: {"count": 0, "pages": set()} for link_id in link_ids
+        }
+        if link_ids:
+            rows = (
+                session.query(PdfReactionEvidenceModel.reaction_source_link_id, PdfReactionEvidenceModel.page_number)
+                .filter(PdfReactionEvidenceModel.reaction_source_link_id.in_(link_ids))
+                .all()
+            )
+            for link_id, page_number in rows:
+                if not link_id:
+                    continue
+                stats = evidence_by_link.setdefault(str(link_id), {"count": 0, "pages": set()})
+                stats["count"] += 1
+                if page_number is not None:
+                    stats["pages"].add(page_number)
+
+        enriched: list[dict[str, Any]] = []
+        for link in links:
+            pdf_document = self._document_link_summary(document_by_id, link.get("pdf_document_id"))
+            rdf_document = self._document_link_summary(document_by_id, link.get("rdf_document_id"))
+            evidence_stats = evidence_by_link.get(str(link.get("id") or ""), {"count": 0, "pages": set()})
+            conflict_flags = self._json_dict(link.get("conflict_flags_json"))
+            enriched.append(
+                {
+                    **link,
+                    "pdf_document": pdf_document,
+                    "rdf_document": rdf_document,
+                    "pdf_file_name": pdf_document.get("file_name", ""),
+                    "rdf_file_name": rdf_document.get("file_name", ""),
+                    "evidence_kind": pdf_document.get("evidence_kind") or rdf_document.get("evidence_kind"),
+                    "evidence_priority": pdf_document.get("evidence_priority") or rdf_document.get("evidence_priority"),
+                    "evidence_label": pdf_document.get("evidence_label") or rdf_document.get("evidence_label"),
+                    "provenance_warning": pdf_document.get("provenance_warning") or rdf_document.get("provenance_warning"),
+                    "pdf_evidence_count": evidence_stats["count"],
+                    "pdf_evidence_pages": sorted(evidence_stats["pages"]),
+                    "has_conflicts": bool(conflict_flags),
+                    "conflict_flags": conflict_flags,
+                }
+            )
+        return enriched
+
+    def get_enriched_reaction_source_link(self, link_id: str) -> dict[str, Any] | None:
+        with self.session() as session:
+            model = session.query(ReactionSourceLinkModel).filter_by(id=link_id, deleted_at=None).first()
+            if not model:
+                return None
+            enriched = self._enrich_reaction_source_link_rows(session, [model])
+            return enriched[0] if enriched else None
+
+    def list_enriched_reaction_source_links(
+        self,
+        *,
+        document_id: str = "",
+        source_mode: str = "",
+        needs_review: bool | None = None,
+        evidence_kind: str = "",
+        has_conflicts: bool | None = None,
+        cas_reaction_number: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        limit = max(0, limit)
+        offset = max(0, offset)
+        with self.session() as session:
+            query = self._reaction_source_link_query(
+                session,
+                document_id=document_id,
+                source_mode=source_mode,
+                needs_review=needs_review,
+                has_conflicts=has_conflicts,
+                cas_reaction_number=cas_reaction_number,
+            )
+            if evidence_kind:
+                from sqlalchemy import or_
+
+                matching_document_ids = self._document_ids_with_evidence_kind(session, evidence_kind)
+                if not matching_document_ids:
+                    return {"items": [], "total": 0, "limit": limit, "offset": offset}
+                query = query.filter(
+                    or_(
+                        ReactionSourceLinkModel.pdf_document_id.in_(matching_document_ids),
+                        ReactionSourceLinkModel.rdf_document_id.in_(matching_document_ids),
+                    )
+                )
+                models = query.order_by(ReactionSourceLinkModel.created_at.desc()).all()
+                enriched = [
+                    link
+                    for link in self._enrich_reaction_source_link_rows(session, models)
+                    if str(link.get("evidence_kind") or "") == evidence_kind
+                ]
+                total = len(enriched)
+                return {"items": enriched[offset : offset + limit], "total": total, "limit": limit, "offset": offset}
+
+            total = query.count()
+            models = query.order_by(ReactionSourceLinkModel.created_at.desc()).limit(limit).offset(offset).all()
+            return {
+                "items": self._enrich_reaction_source_link_rows(session, models),
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            }
+
     def list_reaction_source_links(
         self,
         document_id: str = "",

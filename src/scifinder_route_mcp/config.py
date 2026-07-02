@@ -260,95 +260,119 @@ class AppConfig(BaseModel):
                 return config
         return config
 
-    def effective_config(self, *, include_secrets: bool = False) -> dict[str, Any]:
-        token = self.auth_token if include_secrets else mask_secret(self.auth_token)
-        postgres_url = self.postgres_url if include_secrets else mask_secret(self.postgres_url)
-        redis_url = self.redis_url if include_secrets else mask_secret(self.redis_url)
+    def _paths_config(self) -> dict[str, Any]:
         return {
-            "paths": {
-                "data_dir": str(self.data_dir),
-                "inbox_dir": str(self.inbox_dir),
-                "upload_dir": str(self.upload_dir),
-                "evidence_dir": str(self.evidence_dir),
-                "database_path": str(self.database_path),
-                "config_path": str(self.config_path),
-                "webui_config_path": str(self.webui_config_path or self.data_dir / "webui-config.yaml"),
-            },
-            "server": {
-                "async_jobs": self.async_jobs,
-                "max_workers": self.max_workers,
-                "storage_backend": self.storage_backend,
-            },
-            "security": {
-                "allow_external_paths": self.allow_external_paths,
-                "token": token,
-                "users": [user.__dict__ if include_secrets else user.masked() for user in self.users],
-                "upload_av_scan_enabled": self.upload_av_scan_enabled,
-                "upload_av_engine": self.upload_av_engine,
-                "upload_av_endpoint": self.upload_av_endpoint if include_secrets else mask_secret(self.upload_av_endpoint),
-                "upload_av_fail_closed": self.upload_av_fail_closed,
-            },
-            "ingest": {
-                "scan_extensions": list(self.scan_extensions),
-                "upload_extensions": list(self.upload_extensions),
-                "upload_max_bytes": self.upload_max_bytes,
-                "reject_file_type_mismatch": self.reject_file_type_mismatch,
-                "extract_visual_evidence": self.extract_visual_evidence,
-                "render_visual_pages": self.render_visual_pages,
-                "visual_page_dpi": self.visual_page_dpi,
-                "max_visual_pages_per_document": self.max_visual_pages_per_document,
-                "max_embedded_images_per_document": self.max_embedded_images_per_document,
-            },
-            "queue": {
-                "backend": self.queue_backend,
-                "redis_url": redis_url,
-            },
-            "integrations": {
-                "extraction_provider_id": self.extraction_provider_id,
-                "extraction_model": self.extraction_model,
-                "embedding_provider_id": self.embedding_provider_id,
-                "embedding_model": self.embedding_model,
-                "ocr_provider_id": self.ocr_provider_id,
-                "ocr_provider_ids": list(self.ocr_provider_ids),
-                "ocr_model": self.ocr_model,
-                "document_parser_provider_id": self.document_parser_provider_id,
-                "document_parser_provider_ids": list(self.document_parser_provider_ids),
-                "document_parser_model": self.document_parser_model,
-                "document_parser_fallback": self.document_parser_fallback,
-                "structure_recognition_provider_id": self.structure_recognition_provider_id,
-                "structure_recognition_model": self.structure_recognition_model,
-                "reranker_provider_id": self.reranker_provider_id,
-                "reranker_model": self.reranker_model,
-                "postgres_url": postgres_url,
-                "zotero_linking_enabled": self.zotero_linking_enabled,
-                "zotero_linking_on_import": self.zotero_linking_on_import,
-                "pdf_evidence_enabled": self.pdf_evidence_enabled,
-                "pdf_evidence_render_pages": self.pdf_evidence_render_pages,
-                "pdf_evidence_max_pages_per_document": self.pdf_evidence_max_pages_per_document,
-                "structure_recognition_manual_enabled": self.structure_recognition_manual_enabled,
-                "pdf_only_candidates_enabled": self.pdf_only_candidates_enabled,
-                "pdf_only_low_confidence_enabled": self.pdf_only_low_confidence_enabled,
-                "structure_recognition_auto_on_pdf_evidence": self.structure_recognition_auto_on_pdf_evidence,
-                "ai_evidence_review_enabled": self.ai_evidence_review_enabled,
-                "ai_evidence_review_provider_id": self.ai_evidence_review_provider_id,
-                "ai_evidence_review_model": self.ai_evidence_review_model,
-                "ai_evidence_review_schema_version": self.ai_evidence_review_schema_version,
-                "ai_evidence_review_prompt_profile": self.ai_evidence_review_prompt_profile,
-                "zotero_extraction_strategy": self.zotero_extraction_strategy,
-                "zotero_llm_priority_terms": list(self.zotero_llm_priority_terms),
-            },
-            "extraction": {
-                "llm_schema_version": self.llm_schema_version,
-                "llm_prompt_profile": self.llm_prompt_profile,
-                "llm_cost_limit_usd": self.llm_cost_limit_usd,
-            },
-            "thresholds": {
-                "verification_confidence_threshold": self.verification_confidence_threshold,
-            },
-            "retention": {
-                "evidence_retention_days": self.evidence_retention_days,
-                "cache_retention_days": self.cache_retention_days,
-            },
+            "data_dir": str(self.data_dir),
+            "inbox_dir": str(self.inbox_dir),
+            "upload_dir": str(self.upload_dir),
+            "evidence_dir": str(self.evidence_dir),
+            "database_path": str(self.database_path),
+            "config_path": str(self.config_path),
+            "webui_config_path": str(self.webui_config_path or self.data_dir / "webui-config.yaml"),
+        }
+
+    def _server_config(self) -> dict[str, Any]:
+        return {
+            "async_jobs": self.async_jobs,
+            "max_workers": self.max_workers,
+            "storage_backend": self.storage_backend,
+        }
+
+    def _security_config(self, *, include_secrets: bool = False) -> dict[str, Any]:
+        return {
+            "allow_external_paths": self.allow_external_paths,
+            "token": self.auth_token if include_secrets else mask_secret(self.auth_token),
+            "users": [user.__dict__ if include_secrets else user.masked() for user in self.users],
+            "upload_av_scan_enabled": self.upload_av_scan_enabled,
+            "upload_av_engine": self.upload_av_engine,
+            "upload_av_endpoint": self.upload_av_endpoint if include_secrets else mask_secret(self.upload_av_endpoint),
+            "upload_av_fail_closed": self.upload_av_fail_closed,
+        }
+
+    def _ingest_config(self) -> dict[str, Any]:
+        return {
+            "scan_extensions": list(self.scan_extensions),
+            "upload_extensions": list(self.upload_extensions),
+            "upload_max_bytes": self.upload_max_bytes,
+            "reject_file_type_mismatch": self.reject_file_type_mismatch,
+            "extract_visual_evidence": self.extract_visual_evidence,
+            "render_visual_pages": self.render_visual_pages,
+            "visual_page_dpi": self.visual_page_dpi,
+            "max_visual_pages_per_document": self.max_visual_pages_per_document,
+            "max_embedded_images_per_document": self.max_embedded_images_per_document,
+        }
+
+    def _queue_config(self, *, include_secrets: bool = False) -> dict[str, Any]:
+        return {
+            "backend": self.queue_backend,
+            "redis_url": self.redis_url if include_secrets else mask_secret(self.redis_url),
+        }
+
+    def _integrations_config(self, *, include_secrets: bool = False) -> dict[str, Any]:
+        return {
+            "extraction_provider_id": self.extraction_provider_id,
+            "extraction_model": self.extraction_model,
+            "embedding_provider_id": self.embedding_provider_id,
+            "embedding_model": self.embedding_model,
+            "ocr_provider_id": self.ocr_provider_id,
+            "ocr_provider_ids": list(self.ocr_provider_ids),
+            "ocr_model": self.ocr_model,
+            "document_parser_provider_id": self.document_parser_provider_id,
+            "document_parser_provider_ids": list(self.document_parser_provider_ids),
+            "document_parser_model": self.document_parser_model,
+            "document_parser_fallback": self.document_parser_fallback,
+            "structure_recognition_provider_id": self.structure_recognition_provider_id,
+            "structure_recognition_model": self.structure_recognition_model,
+            "reranker_provider_id": self.reranker_provider_id,
+            "reranker_model": self.reranker_model,
+            "postgres_url": self.postgres_url if include_secrets else mask_secret(self.postgres_url),
+            "zotero_linking_enabled": self.zotero_linking_enabled,
+            "zotero_linking_on_import": self.zotero_linking_on_import,
+            "pdf_evidence_enabled": self.pdf_evidence_enabled,
+            "pdf_evidence_render_pages": self.pdf_evidence_render_pages,
+            "pdf_evidence_max_pages_per_document": self.pdf_evidence_max_pages_per_document,
+            "structure_recognition_manual_enabled": self.structure_recognition_manual_enabled,
+            "pdf_only_candidates_enabled": self.pdf_only_candidates_enabled,
+            "pdf_only_low_confidence_enabled": self.pdf_only_low_confidence_enabled,
+            "structure_recognition_auto_on_pdf_evidence": self.structure_recognition_auto_on_pdf_evidence,
+            "ai_evidence_review_enabled": self.ai_evidence_review_enabled,
+            "ai_evidence_review_provider_id": self.ai_evidence_review_provider_id,
+            "ai_evidence_review_model": self.ai_evidence_review_model,
+            "ai_evidence_review_schema_version": self.ai_evidence_review_schema_version,
+            "ai_evidence_review_prompt_profile": self.ai_evidence_review_prompt_profile,
+            "zotero_extraction_strategy": self.zotero_extraction_strategy,
+            "zotero_llm_priority_terms": list(self.zotero_llm_priority_terms),
+        }
+
+    def _extraction_config(self) -> dict[str, Any]:
+        return {
+            "llm_schema_version": self.llm_schema_version,
+            "llm_prompt_profile": self.llm_prompt_profile,
+            "llm_cost_limit_usd": self.llm_cost_limit_usd,
+        }
+
+    def _thresholds_config(self) -> dict[str, Any]:
+        return {
+            "verification_confidence_threshold": self.verification_confidence_threshold,
+        }
+
+    def _retention_config(self) -> dict[str, Any]:
+        return {
+            "evidence_retention_days": self.evidence_retention_days,
+            "cache_retention_days": self.cache_retention_days,
+        }
+
+    def effective_config(self, *, include_secrets: bool = False) -> dict[str, Any]:
+        return {
+            "paths": self._paths_config(),
+            "server": self._server_config(),
+            "security": self._security_config(include_secrets=include_secrets),
+            "ingest": self._ingest_config(),
+            "queue": self._queue_config(include_secrets=include_secrets),
+            "integrations": self._integrations_config(include_secrets=include_secrets),
+            "extraction": self._extraction_config(),
+            "thresholds": self._thresholds_config(),
+            "retention": self._retention_config(),
         }
 
     def hot_config(self, *, include_secrets: bool = False) -> dict[str, Any]:

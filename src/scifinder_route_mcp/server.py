@@ -494,7 +494,7 @@ def create_mcp(service: RouteService | None = None) -> Any:
     def list_reaction_links(document_id: str = "", limit: int = 100, token: str | None = None) -> list[dict[str, Any]]:
         """List CAS reaction-level evidence links between RDF records and PDF pages."""
         require_role(token, "viewer")
-        return read_list(lambda: get_service().storage.list_reaction_source_links(document_id=document_id, limit=limit))
+        return read_list(lambda: get_service().list_reaction_links(document_id=document_id, limit=limit)["items"])
 
     @mcp.tool()
     def confirm_reaction_link(link_id: str, token: str | None = None) -> dict[str, Any]:

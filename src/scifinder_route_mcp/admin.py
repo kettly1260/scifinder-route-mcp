@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from .auth import authenticate_token, role_allows
@@ -87,6 +87,9 @@ class AdminHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_error_json(exc)
             return
+        if parsed.path.startswith("/api/documents/") and parsed.path.endswith("/reaction_links"):
+            self._send_guarded_json("viewer", lambda: self._document_reaction_links_payload(parsed))
+            return
         if parsed.path == "/api/documents":
             try:
                 self._require_role("viewer")
@@ -117,15 +120,6 @@ class AdminHandler(BaseHTTPRequestHandler):
                             limit=first_int(query, "limit", 50, max_value=500),
                             offset=first_int(query, "offset", 0, max_value=100000),
                         )
-                    )
-                elif parsed.path.endswith("/reaction_links"):
-                    document_id = parsed.path.removeprefix("/api/documents/").removesuffix("/reaction_links")
-                    self._send_json(
-                        self.server.service.list_reaction_links(
-                            document_id=document_id,
-                            needs_review=first_bool(query, "needs_review", None),
-                            limit=first_int(query, "limit", 100, max_value=500),
-                        )["items"]
                     )
                 else:
                     document_id = parsed.path.rsplit("/", 1)[-1]
@@ -244,24 +238,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._send_error_json(exc)
             return
         if parsed.path == "/api/reaction_links":
-            try:
-                self._require_role("viewer")
-                query = parse_qs(parsed.query)
-                links = self.server.service.list_reaction_links(
-                    document_id=first_query(query, "document_id"),
-                    source_mode=first_query(query, "source_mode"),
-                    needs_review=first_bool(query, "needs_review", None),
-                    evidence_kind=first_query(query, "evidence_kind"),
-                    has_conflicts=first_bool(query, "has_conflicts", None),
-                    cas_reaction_number=first_query(query, "cas_reaction_number"),
-                    limit=first_int(query, "limit", 100, max_value=500),
-                    offset=first_int(query, "offset", 0, max_value=100000)
-                )
-                self._send_json(links)
-            except PermissionError as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
-            except Exception as exc:
-                self._send_error_json(exc)
+            self._send_guarded_json("viewer", lambda: self._reaction_links_payload(parsed))
             return
         if parsed.path.startswith("/api/reaction_links/") and not parsed.path.endswith("/confirm") and not parsed.path.endswith("/unlink") and not parsed.path.endswith("/relink") and not parsed.path.endswith("/set_primary_page") and not parsed.path.endswith("/ai_review"):
             # This is a specific reaction link detail GET
@@ -275,22 +252,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self._send_error_json(exc)
             return
         if parsed.path == "/api/pdf_evidence":
-            try:
-                self._require_role("viewer")
-                query = parse_qs(parsed.query)
-                self._send_json(
-                    self.server.service.storage.list_pdf_reaction_evidence(
-                        document_id=first_query(query, "document_id"),
-                        cas_reaction_number=first_query(query, "cas_reaction_number"),
-                        reaction_source_link_id=first_query(query, "reaction_source_link_id"),
-                        limit=first_int(query, "limit", 100, max_value=500),
-                        offset=first_int(query, "offset", 0, max_value=100000)
-                    )
-                )
-            except PermissionError as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
-            except Exception as exc:
-                self._send_error_json(exc)
+            self._send_guarded_json("viewer", lambda: self._pdf_evidence_payload(parsed))
             return
         if not parsed.path.startswith("/api/"):
             if self._send_static_asset("index.html"):
@@ -576,6 +538,47 @@ class AdminHandler(BaseHTTPRequestHandler):
             return parse_multipart_upload(content_type, body)
         filename = safe_upload_name(self.headers.get("X-Filename") or "upload.bin")
         return filename, body
+
+    def _send_guarded_json(self, role: str, producer: Callable[[], Any]) -> None:
+        try:
+            self._require_role(role)
+            self._send_json(producer())
+        except PermissionError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+        except Exception as exc:
+            self._send_error_json(exc)
+
+    def _document_reaction_links_payload(self, parsed: Any) -> list[dict[str, Any]]:
+        query = parse_qs(parsed.query)
+        document_id = parsed.path.removeprefix("/api/documents/").removesuffix("/reaction_links")
+        return self.server.service.list_reaction_links(
+            document_id=document_id,
+            needs_review=first_bool(query, "needs_review", None),
+            limit=first_int(query, "limit", 100, max_value=500),
+        )["items"]
+
+    def _reaction_links_payload(self, parsed: Any) -> dict[str, Any]:
+        query = parse_qs(parsed.query)
+        return self.server.service.list_reaction_links(
+            document_id=first_query(query, "document_id"),
+            source_mode=first_query(query, "source_mode"),
+            needs_review=first_bool(query, "needs_review", None),
+            evidence_kind=first_query(query, "evidence_kind"),
+            has_conflicts=first_bool(query, "has_conflicts", None),
+            cas_reaction_number=first_query(query, "cas_reaction_number"),
+            limit=first_int(query, "limit", 100, max_value=500),
+            offset=first_int(query, "offset", 0, max_value=100000),
+        )
+
+    def _pdf_evidence_payload(self, parsed: Any) -> list[dict[str, Any]]:
+        query = parse_qs(parsed.query)
+        return self.server.service.storage.list_pdf_reaction_evidence(
+            document_id=first_query(query, "document_id"),
+            cas_reaction_number=first_query(query, "cas_reaction_number"),
+            reaction_source_link_id=first_query(query, "reaction_source_link_id"),
+            limit=first_int(query, "limit", 100, max_value=500),
+            offset=first_int(query, "offset", 0, max_value=100000),
+        )
 
     def _send_json(self, payload: Any, *, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")

@@ -80,6 +80,93 @@ def test_pdf_reaction_evidence_crud(storage: RouteStorage):
     evidences = storage.list_pdf_reaction_evidence(cas_reaction_number="31-123-CAS-2")
     assert len(evidences) == 1
 
+def test_enriched_reaction_source_links_are_paged_and_batched(storage: RouteStorage):
+    pdf_doc = storage.upsert_document(
+        file_path="exports/example.pdf",
+        file_hash="pdf-hash",
+        file_type="pdf",
+        title="Example PDF",
+        doi=None,
+        ingest_status="parsed",
+    )
+    rdf_doc = storage.upsert_document(
+        file_path="exports/example.rdf",
+        file_hash="rdf-hash",
+        file_type="rdf",
+        title="Example RDF",
+        doi=None,
+        ingest_status="parsed",
+    )
+    storage.update_document_scifinder_metadata(
+        pdf_doc.id,
+        {
+            "evidence_kind": "readable_pdf",
+            "evidence_priority": 70,
+            "label": "Readable PDF",
+            "provenance_warning": "Use page evidence.",
+        },
+    )
+    first = storage.create_reaction_source_link(
+        {
+            "cas_reaction_number": "31-123-CAS-1",
+            "source_mode": "rdf_pdf_linked",
+            "rdf_document_id": rdf_doc.id,
+            "pdf_document_id": pdf_doc.id,
+            "link_confidence": 0.9,
+            "link_method": "cas_reaction_number",
+            "needs_review": 1,
+            "conflict_flags_json": {"yield": True},
+        }
+    )
+    storage.create_pdf_reaction_evidence(
+        {
+            "source_document_id": pdf_doc.id,
+            "reaction_source_link_id": first["id"],
+            "cas_reaction_number": "31-123-CAS-1",
+            "page_number": 2,
+            "page_text": "CAS Reaction Number: 31-123-CAS-1.",
+            "extraction_method": "cas_anchor",
+        }
+    )
+    storage.create_pdf_reaction_evidence(
+        {
+            "source_document_id": pdf_doc.id,
+            "reaction_source_link_id": first["id"],
+            "cas_reaction_number": "31-123-CAS-1",
+            "page_number": 4,
+            "page_text": "CAS Reaction Number: 31-123-CAS-1 continued.",
+            "extraction_method": "cas_anchor",
+        }
+    )
+    storage.create_reaction_source_link(
+        {
+            "cas_reaction_number": "31-123-CAS-2",
+            "source_mode": "rdf_only",
+            "rdf_document_id": rdf_doc.id,
+            "link_confidence": 1.0,
+            "link_method": "rdf_import",
+            "needs_review": 0,
+        }
+    )
+
+    page = storage.list_enriched_reaction_source_links(limit=1)
+    assert page["total"] == 2
+    assert len(page["items"]) == 1
+
+    enriched = storage.get_enriched_reaction_source_link(first["id"])
+    assert enriched is not None
+    assert enriched["pdf_file_name"] == "example.pdf"
+    assert enriched["rdf_file_name"] == "example.rdf"
+    assert enriched["evidence_kind"] == "readable_pdf"
+    assert enriched["pdf_evidence_count"] == 2
+    assert enriched["pdf_evidence_pages"] == [2, 4]
+    assert enriched["has_conflicts"] is True
+    assert enriched["conflict_flags"] == {"yield": True}
+
+    filtered = storage.list_enriched_reaction_source_links(evidence_kind="readable_pdf")
+    assert filtered["total"] == 1
+    assert filtered["items"][0]["id"] == first["id"]
+
 def test_structure_evidence_candidate_crud(storage: RouteStorage):
     data = {
         "pdf_evidence_id": "ev_1",
